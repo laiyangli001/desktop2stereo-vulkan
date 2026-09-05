@@ -52,6 +52,15 @@ def configure_rocm_environment(os_name: str, rocm_path: str | os.PathLike[str] |
             "PATH", [_libraries / "bin", _libraries / "lib"]
         )
         _prepend_env_paths("LIBRARY_PATH", [_libraries / "lib"])
+    # Portable MSVC/SDK-free triton JIT: the bundled clang compiles
+    # hip_utils against project-local stub headers (msvcstub/) instead of the
+    # Windows SDK + MSVC vcruntime (not installed on this machine). INCLUDE
+    # and TRITON_NO_WINSDK are process-local; nothing is written to the
+    # user/system environment.
+    _msvcstub = Path(__file__).resolve().parent.parent / "msvcstub"
+    if _msvcstub.is_dir():
+        os.environ["INCLUDE"] = str(_msvcstub)
+        os.environ.setdefault("TRITON_NO_WINSDK", "1")
     return str(root)
 
 
