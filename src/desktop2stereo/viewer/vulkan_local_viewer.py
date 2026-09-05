@@ -693,6 +693,19 @@ class VulkanLocalViewer:
         self._last_presentation_geometry = None
 
     def initialize(self) -> None:
+        # Without DPI awareness the OS scales the fullscreen window's
+        # framebuffer down (e.g. 1920x1200 -> 1280x800 at 150%), leaving the
+        # swapchain at the scaled extent and the image in the top-left corner.
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
         import glfw
         try:
             import vulkan as vk
