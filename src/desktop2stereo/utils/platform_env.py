@@ -60,6 +60,9 @@ def configure_rocm_environment(os_name: str, rocm_path: str | os.PathLike[str] |
     _msvcstub = Path(__file__).resolve().parent.parent / "msvcstub"
     if _msvcstub.is_dir():
         os.environ["INCLUDE"] = str(_msvcstub)
+        _msvcstub_lib = _msvcstub / "lib"
+        if _msvcstub_lib.is_dir():
+            os.environ["LIB"] = str(_msvcstub_lib)
         os.environ.setdefault("TRITON_NO_WINSDK", "1")
     return str(root)
 
