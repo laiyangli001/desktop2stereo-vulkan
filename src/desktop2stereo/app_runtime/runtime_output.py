@@ -298,11 +298,7 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 rocm_torch_glow_default_on,
             )
 
-            if rocm_torch_glow_default_on():
-                self._set_glow_gpu_status(
-                    f"torch_compute_external_image backend={self.backend_name}"
-                )
-            else:
+            if not rocm_torch_glow_default_on():
                 self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
                 return {}
         # The source image is produced by the Vulkan Glow worker.  Do not use
@@ -326,6 +322,9 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
 
                         self._glow_gpu_backend = RocmTorchGlowSource(
                             self.presenter.vulkan
+                        )
+                        self._set_glow_gpu_status(
+                            "torch_compute_external_image backend=rocm"
                         )
                 else:
                     from stereo_runtime.vulkan_glow_source import (

@@ -1279,13 +1279,7 @@ class VulkanContext:
                 raise VulkanCapabilityError("Vulkan image belongs to a different context")
         if source.image is destination.image:
             raise VulkanCapabilityError("source and destination Vulkan images must differ")
-        dimensions_match = (
-            int(source.width) == int(destination.width)
-            and int(source.height) == int(destination.height)
-        )
-        if not dimensions_match and not resize:
-            raise ValueError("Vulkan image copy dimensions must match")
-        if int(source_array_layer) < 0 or int(destination_array_layer) < 0:
+        if source_array_layer < 0 or destination_array_layer < 0:
             raise ValueError("image array layers must not be negative")
         if destination_rect is None:
             destination_x0, destination_y0 = 0, 0
@@ -1301,6 +1295,16 @@ class VulkanContext:
                 and 0 <= destination_y0 < destination_y1 <= int(destination.height)
             ):
                 raise ValueError("destination_rect must be inside the destination image")
+        dimensions_match = (
+            int(source.width) == int(destination.width)
+            and int(source.height) == int(destination.height)
+        )
+        # An explicit destination rect converts the copy into a blit and is
+        # allowed to differ from both image extents (the rect is validated
+        # against the destination above; the source side is checked in the
+        # blit path below).
+        if not dimensions_match and not resize and destination_rect is None:
+            raise ValueError("Vulkan image copy dimensions must match")
         if source_rect is None:
             source_x0, source_y0 = 0, 0
             source_x1, source_y1 = int(source.width), int(source.height)

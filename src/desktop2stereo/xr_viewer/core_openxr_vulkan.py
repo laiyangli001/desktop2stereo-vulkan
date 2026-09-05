@@ -833,6 +833,7 @@ class OpenXrVulkanPresenter(
         self._quad_swapchains: list[_EyeSwapchain] = []
         self._quad_swapchain_format: int | None = None
         self._tool_quad_swapchain_format: int | None = None
+        self._tool_quads_dead = False
         self._quad_swapchain_extent: tuple[int, int] | None = None
         self.filament_bridge: Any | None = None
         self._filament_depth_attachments: list[VulkanDepthAttachment] = []
@@ -4804,7 +4805,30 @@ class OpenXrVulkanPresenter(
             while not shutdown_event.is_set() and not self.exit_requested:
                 try:
                     if not self._initialized:
-                        self.initialize()
+                        try:
+                            self.initialize()
+                        except Exception as exc:
+                            if type(exc).__name__ in {
+                                "LimitReachedError",
+                                "InstanceLostError",
+                            }:
+                                # The previous session's XrInstance may still
+                                # be releasing inside the runtime; back off
+                                # hard instead of hammering xrCreateInstance
+                                # into a dead retry loop.
+                                self.close()
+                                retry_count += 1
+                                if retry_count >= 4:
+                                    raise RuntimeError(
+                                        "OpenXR runtime cannot create a new "
+                                        "instance after repeated session "
+                                        "reconnects; restart the app (or the "
+                                        "Virtual Desktop streamer) to recover"
+                                    ) from exc
+                                time.sleep(2.0 * retry_count)
+                                self._notify_headset_waiting()
+                                continue
+                            raise
                     retry_count = 0
                     while not shutdown_event.is_set() and not self.exit_requested:
                         if not self.run_frame():
@@ -4819,15 +4843,35 @@ class OpenXrVulkanPresenter(
                         self.exit_requested = False
                         self._notify_headset_waiting()
                 except Exception as exc:
-                    if not self._is_no_headset_error(exc):
+                    if self._is_no_headset_error(exc):
+                        print(
+                            "[OpenXRViewer] OpenXR HMD form factor unavailable; "
+                            "Vulkan/Filament initialization deferred until headset wake-up",
+                            flush=True,
+                        )
+                        self.close()
+                        self._notify_headset_waiting()
+                    elif type(exc).__name__ == "RuntimeFailureError":
+                        # VDXR rejects frames/composition while its client is
+                        # on an OS interstitial (app-launch loading loop on
+                        # the headset). The failure is transient: tear the
+                        # session down, wait, and re-create it when the
+                        # client stream is back. Killing the presenter thread
+                        # here would leave the headset stuck on the last
+                        # frame ("all dark") until manual restart.
+                        error = f"{type(exc).__name__}: {exc}"
+                        if error != getattr(self, "_last_transient_runtime_error", None):
+                            self._last_transient_runtime_error = error
+                            print(
+                                "[OpenXRViewer] Runtime rejected a frame "
+                                f"(client interstitial?): {error}; "
+                                "session will be re-created",
+                                flush=True,
+                            )
+                        self.close()
+                        self._notify_headset_waiting()
+                    else:
                         raise
-                    print(
-                        "[OpenXRViewer] OpenXR HMD form factor unavailable; "
-                        "Vulkan/Filament initialization deferred until headset wake-up",
-                        flush=True,
-                    )
-                    self.close()
-                    self._notify_headset_waiting()
 
                 if shutdown_event.is_set() or self.exit_requested:
                     break
@@ -5107,6 +5151,7 @@ class OpenXrVulkanPresenter(
         self.system_id = None
         self.swapchain_format = None
         self._tool_quad_swapchain_format = None
+        self._tool_quads_dead = False
         self._graphics_binding = None
         self._initialized = False
         self._last_screen_resolution_status = None
@@ -5327,8 +5372,18 @@ class OpenXrVulkanPresenter(
                     )
                     prewarm_backend.release_frame(0)
                     self._prewarmed_glow_backend = prewarm_backend
+                    # Auto-enable Filament glow when ROCm glow is active.
+                    # Use the setter: it also arms the intensity multiplier
+                    # (default 1.5) — a bare mode assignment leaves it 0.0 and
+                    # _projection_glow_state() returns None (no glow draw).
+                    # Re-apply after environment loads: _reset_environment_
+                    # profile_state() resets glow mode to "off" post-prewarm.
+                    if self._normalize_filament_glow_mode(
+                        self._filament_glow_mode
+                    ) == "off":
+                        self._set_filament_glow_mode("glow")
                     print(
-                        "[OpenXRViewer] ROCm torch glow pre-warmed",
+                        "[OpenXRViewer] ROCm torch glow pre-warmed, Filament glow auto-enabled",
                         flush=True,
                     )
             except Exception as exc:
@@ -5447,6 +5502,92 @@ class OpenXrVulkanPresenter(
                     self._destroy_projection_swapchain(eye)
                 self._vulkan_controller_proxy_swapchains.clear()
                 raise
+        # VDXR/AMD rejects xrCreateSwapchain/xrEnumerateSwapchainImages once
+        # the frame loop is active (RuntimeFailureError), while the identical
+        # create/enumerate succeeds at session start (probed: warm OK at
+        # 512x128 fmt=43 vs mid-frame fail at 786x58). Pre-create one pooled
+        # swapchain per overlay key here; mid-frame upload paths then only
+        # reuse. Unknown keys created mid-frame are skipped on VDXR.
+
+    def _precreate_tool_quad_swapchains(self) -> None:
+        """Create the pooled tool-quad swapchains before the frame loop starts."""
+        if self.xr is None or self.session is None or self.vulkan is None:
+            return
+        if os.environ.get("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+            return
+        keys = (
+            "screen_osd",
+            "depth_osd",
+            "screen_fps",
+            "hand_fps",
+            "hand_help",
+            "screen_help",
+            "aperture",
+            "keyboard",
+            "settings_menu",
+            "controller_proxy_callout",
+            "laser_cursor_0",
+            "laser_cursor_1",
+        )
+        pool_size = self._tool_quad_pool_size()
+        format_value = self._tool_quad_format()
+        created = 0
+        for key in keys:
+            if key in self._overlay_quad_entries:
+                continue
+            try:
+                swapchain = self.xr.create_swapchain(
+                    self.session,
+                    self.xr.SwapchainCreateInfo(
+                        # SAMPLED_BIT required: the compositor samples quad-layer
+                        # images (OpenXR usage contract).
+                        usage_flags=(
+                            self.xr.SwapchainUsageFlags.COLOR_ATTACHMENT_BIT
+                            | self.xr.SwapchainUsageFlags.SAMPLED_BIT
+                            | self.xr.SwapchainUsageFlags.TRANSFER_DST_BIT
+                        ),
+                        format=format_value,
+                        sample_count=1,
+                        width=pool_size[0],
+                        height=pool_size[1],
+                        face_count=1,
+                        array_size=1,
+                        mip_count=1,
+                    ),
+                )
+                images = list(
+                    self.xr.enumerate_swapchain_images(
+                        swapchain, self.xr.SwapchainImageVulkan2KHR
+                    )
+                )
+                self._overlay_quad_entries[key] = {
+                    "swapchain": swapchain,
+                    "size": pool_size,
+                    "swap_size": pool_size,
+                    "format": format_value,
+                    "resources": self._register_swapchain_images(
+                        images, pool_size[0], pool_size[1], format_value
+                    ),
+                    "staging": None,
+                    "image_index": None,
+                    "content": None,
+                }
+                created += 1
+            except Exception as exc:
+                print(
+                    f"[OpenXRViewer] pooled tool-quad swapchain '{key}' failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                self._tool_quads_dead = True
+                break
+        print(
+            "[OpenXRViewer] pooled tool-quad swapchains: "
+            f"created={created} size={pool_size[0]}x{pool_size[1]} "
+            f"fmt={format_value} dead={self._tool_quads_dead}",
+            flush=True,
+        )
+
 
     def _release_projection_render_targets(self) -> None:
         if self.vulkan is None:
@@ -6684,6 +6825,16 @@ class OpenXrVulkanPresenter(
             )
         return int(timeline)
 
+    @staticmethod
+    def _is_rocm_backend() -> bool:
+        """Return whether the torch compute backend is ROCm/HIP."""
+        try:
+            import torch
+
+            return bool(getattr(torch.version, "hip", None))
+        except Exception:
+            return False
+
     def _render_vulkan_projection_composer(
         self,
         frame: VulkanStereoOutputFrame,
@@ -6879,10 +7030,18 @@ class OpenXrVulkanPresenter(
                 projection_draws, panorama_source, wait_for_timeline=0
             )
         filament_hdr_timeline = 0
+        # AMD/ROCm: the deferred (LOAD) resolve overwrites the composed SBS
+        # screen with an empty/black Filament slot pass -> all-black picture
+        # (bisected: glow off = resolve-first = picture OK; glow on +
+        # resolve-first needs to be tested). NVIDIA keeps the formal
+        # controller/env -> glow -> SBS order; ROCm resolves first and draws
+        # glow+SBS over it.
+        rocm_resolve_first = bool(self._is_rocm_backend())
         defer_filament_resolve = bool(
             filament_hdr_sources
             and all("glow_source" in draw for draw in projection_draws)
             and not self._filament_projection_only
+            and not rocm_resolve_first
         )
         if filament_hdr_sources and not defer_filament_resolve:
             # A live GLB -> panorama switch keeps the Filament engine for
@@ -7146,6 +7305,33 @@ class OpenXrVulkanPresenter(
                         self._on_breakdown_inc(metric, submit_profile[stage])
         self._vulkan_projection_composer_frame_id = int(frame.frame_id)
         self._vulkan_projection_composer_active = True
+        # Visual regression: one shot, capture the composed swapchain target
+        # plus its source right after the final submission, before the frame
+        # is released. Armed only when the runtime metadata requests a dump.
+        if (
+            not self._visual_regression_capture_failed
+            and (frame.metadata or {}).get("visual_regression_dir")
+            and not self._visual_regression_capture_eyes
+        ):
+            for draw in projection_draws:
+                eye_index = int(draw.get("eye_index", 0))
+                if eye_index in self._visual_regression_capture_eyes:
+                    continue
+                source_resource = draw.get("source")
+                projection_resource = draw.get("target")
+                if source_resource is None or projection_resource is None:
+                    continue
+                state = self.vulkan.image_state(source_resource.image)
+                self._maybe_capture_visual_regression_frame(
+                    frame,
+                    eye_index=eye_index,
+                    source_resource=source_resource,
+                    projection_resource=projection_resource,
+                    projection_array_layer=int(draw.get("array_layer", 0)),
+                    source_layout=int(state.layout),
+                    source_access_mask=int(state.access_mask),
+                    source_stage_mask=int(state.stage_mask),
+                )
         return int(timeline)
 
     def _try_enable_filament_multiview(self, bridge: Any) -> bool:
@@ -7387,6 +7573,32 @@ class OpenXrVulkanPresenter(
             self._vulkan_msdf_quad_renderer = VulkanMsdfQuadRenderer(
                 self.vulkan, self._msdf_font_atlas
             )
+            # Prewarm render-target images here (after the renderer exists;
+            # still at session start before the frame loop). The first
+            # mid-frame allocation+transition stalled on VDXR/AMD
+            # (vkWaitSemaphores VkTimeout) while this identical submission
+            # completes instantly at session start.
+            if os.environ.get("D2S_OPENXR_DISABLE_TOOL_QUADS"):
+                pass
+            else:
+                try:
+                    self._vulkan_msdf_quad_renderer.prewarm_outputs(
+                        (
+                            (256, 64), (512, 64), (1024, 64), (512, 256),
+                            (1024, 512), (1024, 1024),
+                        )
+                    )
+                    print(
+                        "[OpenXRViewer] MSDF render targets prewarmed: "
+                        f"{len(self._vulkan_msdf_quad_renderer.outputs)} sizes",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        "[OpenXRViewer] MSDF render-target prewarm failed: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
             print(
                 "[OpenXRViewer] Vulkan MSDF Quad renderer active: "
                 "atlas_gpu=True output=storage_image",
@@ -9496,7 +9708,10 @@ class OpenXrVulkanPresenter(
         handle = self.xr.create_swapchain(
             self.session,
             self.xr.SwapchainCreateInfo(
+                # SAMPLED_BIT required for compositor-sampled quad layers
+                # (VDXR/AMD rejects the swapchain without it).
                 usage_flags=(self.xr.SwapchainUsageFlags.COLOR_ATTACHMENT_BIT
+                             | self.xr.SwapchainUsageFlags.SAMPLED_BIT
                              | self.xr.SwapchainUsageFlags.TRANSFER_DST_BIT),
                 format=quad_format, sample_count=1, width=width, height=height,
                 face_count=1, array_size=2, mip_count=1,
@@ -10831,15 +11046,31 @@ class OpenXrVulkanPresenter(
             }
             self._overlay_quad_entries[key] = entry
         if entry.get("content") is not request or entry.get("image_index") is None:
+            # MSDF panels that exceed the glyph budget (or any other render
+            # failure) must not raise every frame: rasterize on the CPU and
+            # push through the legacy path instead.
+            try:
+                rendered = renderer.render(
+                    request, destination_format=int(entry["format"])
+                )
+            except Exception as exc:
+                if not getattr(self, "_msdf_fallback_logged", False):
+                    self._msdf_fallback_logged = True
+                    print(
+                        "[OpenXRViewer] MSDF render failed "
+                        f"({type(exc).__name__}: {exc}); CPU raster fallback",
+                        flush=True,
+                    )
+                rgba = self._upload_tool_quad_fallback(key, request)
+                if rgba is None:
+                    return None
+                return self._upload_tool_quad(key, rgba, position, size, rotation)
             with _acquired_swapchain_image(
                 self.xr,
                 _EyeSwapchain(
                     entry["swapchain"], [], width, height, entry["resources"]
                 ),
             ) as image_index:
-                rendered = renderer.render(
-                    request, destination_format=int(entry["format"])
-                )
                 timeline = self.vulkan.copy_image(
                     rendered, entry["resources"][image_index]
                 )
@@ -10961,6 +11192,330 @@ def _acquired_swapchain_image(xr: Any, eye: _EyeSwapchain):
             eye.handle,
             xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION),
         )
+        yield image_index
+    finally:
+        xr.release_swapchain_image(eye.handle)
+
+
+def _xr_view_pose_to_model_mat4(pose: Any) -> np.ndarray:
+    matrix = _xr_quat_to_mat4(pose.orientation).astype(np.float32)
+    matrix[:3, 3] = (
+        float(pose.position.x),
+        float(pose.position.y),
+        float(pose.position.z),
+    )
+    return matrix
+
+
+def _euler_degrees_to_quaternion(rotation: tuple[float, float, float]) -> tuple[float, float, float, float]:
+    """Convert legacy profile yaw/pitch/roll degrees to OpenXR xyzw."""
+    yaw, pitch, roll = (
+        math.radians(float(value)) for value in rotation[:3]
+    )
+    matrix = euler_to_mat4(yaw, pitch, roll)
+    return tuple(float(value) for value in _mat3_to_quat_xyzw(matrix[:3, :3]))
+
+
+def _update_filament_camera(
+    bridge: Any,
+    view: Any,
+    *,
+    near_plane: float = 0.05,
+    far_plane: float = 1000.0,
+) -> None:
+    pose = view.pose
+    rotation = _xr_quat_to_mat4(pose.orientation)[:3, :3]
+    position = (
+        float(pose.position.x),
+        float(pose.position.y),
+        float(pose.position.z),
+    )
+    forward = rotation @ (0.0, 0.0, -1.0)
+    up = rotation @ (0.0, 1.0, 0.0)
+    center = tuple(position[index] + float(forward[index]) for index in range(3))
+    bridge.set_camera_look_at(position, center, tuple(float(value) for value in up))
+
+    fov = view.fov
+    left = math.tan(float(fov.angle_left)) * near_plane
+    right = math.tan(float(fov.angle_right)) * near_plane
+    bottom = math.tan(float(fov.angle_down)) * near_plane
+    top = math.tan(float(fov.angle_up)) * near_plane
+    if hasattr(bridge, "set_camera_projection_frustum"):
+        bridge.set_camera_projection_frustum(
+            left, right, bottom, top,
+            near_plane=near_plane,
+            far_plane=far_plane,
+        )
+        return
+    horizontal = max(0.01, abs(float(fov.angle_right) - float(fov.angle_left)))
+    vertical = max(0.01, abs(float(fov.angle_up) - float(fov.angle_down)))
+    aspect = math.tan(horizontal * 0.5) / max(math.tan(vertical * 0.5), 1e-6)
+    bridge.set_camera_projection(
+        math.degrees(vertical),
+        aspect,
+        near_plane=near_plane,
+        far_plane=far_plane,
+    )
+
+
+def _update_filament_stereo_camera(
+    bridge: Any,
+    views: list[Any],
+    *,
+    near_plane: float = 0.05,
+    far_plane: float = 1000.0,
+) -> None:
+    eye_models = [
+        _xr_view_pose_to_model_mat4(view.pose) for view in views[:2]
+    ]
+    head_model = eye_models[0].copy()
+    head_model[:3, 3] = 0.5 * (
+        eye_models[0][:3, 3] + eye_models[1][:3, 3]
+    )
+    head_inverse = np.linalg.inv(head_model).astype(np.float32)
+    position = tuple(float(value) for value in head_model[:3, 3])
+    forward = head_model[:3, :3] @ (0.0, 0.0, -1.0)
+    up = head_model[:3, :3] @ (0.0, 1.0, 0.0)
+    center = tuple(position[index] + float(forward[index]) for index in range(3))
+    bridge.set_camera_look_at(
+        position, center, tuple(float(value) for value in up)
+    )
+
+    matrices: list[float] = []
+    frustums: list[float] = []
+    for view, eye_model in zip(views[:2], eye_models):
+        matrices.extend(
+            float(value)
+            for value in (head_inverse @ eye_model).reshape(-1, order="F")
+        )
+        fov = view.fov
+        frustums.extend(
+            (
+                math.tan(float(fov.angle_left)) * near_plane,
+                math.tan(float(fov.angle_right)) * near_plane,
+                math.tan(float(fov.angle_down)) * near_plane,
+                math.tan(float(fov.angle_up)) * near_plane,
+            )
+        )
+    bridge.set_stereo_camera(
+        matrices,
+        frustums,
+        near_plane=near_plane,
+        far_plane=far_plane,
+    )
+
+
+def _import_openxr() -> Any:
+    try:
+        import xr
+    except (ImportError, OSError) as exc:
+        raise OpenXrVulkanUnavailableError(
+            "pyopenxr or the OpenXR loader is unavailable"
+        ) from exc
+    return xr
+
+
+def _get_vulkan_graphics_requirements2(
+    xr: Any, instance: Any, system_id: Any
+) -> Any:
+    function = ctypes.cast(
+        xr.get_instance_proc_addr(
+            instance.instance, "xrGetVulkanGraphicsRequirements2KHR"
+        ),
+        xr.platform.PFN_xrGetVulkanGraphicsRequirements2KHR,
+    )
+    requirements = xr.GraphicsRequirementsVulkan2KHR()
+    result = xr.check_result(function(instance, system_id, ctypes.byref(requirements)))
+    if result.is_exception():
+        raise result
+    return requirements
+
+
+def _select_vulkan_api_version(requirements: Any, requested: int) -> int:
+    minimum = make_vulkan_version(
+        requirements.min_api_version_supported.major,
+        requirements.min_api_version_supported.minor,
+        requirements.min_api_version_supported.patch,
+    )
+    maximum = make_vulkan_version(
+        requirements.max_api_version_supported.major,
+        requirements.max_api_version_supported.minor,
+        requirements.max_api_version_supported.patch,
+    )
+    if minimum > maximum:
+        raise OpenXrVulkanUnavailableError(
+            "OpenXR runtime returned an invalid Vulkan API version range"
+        )
+    if maximum < MIN_VULKAN_API_VERSION:
+        raise OpenXrVulkanUnavailableError(
+            "OpenXR runtime does not support the required Vulkan 1.2 minimum"
+        )
+    selected = max(minimum, min(int(requested), maximum))
+    if selected < MIN_VULKAN_API_VERSION:
+        raise OpenXrVulkanUnavailableError(
+            "Negotiated Vulkan API version is below the required Vulkan 1.2 minimum"
+        )
+    return selected
+
+
+def _select_swapchain_format(
+    vk: Any, available_formats: list[int], color_mode: str = "srgb"
+) -> int:
+    mode = str(color_mode or "srgb").strip().lower()
+    if mode not in {"srgb", "auto"}:
+        raise ValueError(
+            "OpenXR projection swapchain must use sRGB; "
+            "linear UNORM output is not supported"
+        )
+
+    srgb = (
+        vk.VK_FORMAT_R8G8B8A8_SRGB,
+        vk.VK_FORMAT_B8G8R8A8_SRGB,
+    )
+    preferred = srgb
+    for candidate in preferred:
+        if int(candidate) in available_formats:
+            return int(candidate)
+    if available_formats:
+        raise OpenXrVulkanUnavailableError(
+            "OpenXR runtime exposes no sRGB projection swapchain format; "
+            "refusing a color-space-changing UNORM fallback"
+        )
+    if not available_formats:
+        raise OpenXrVulkanUnavailableError(
+            "OpenXR runtime returned no swapchain formats"
+        )
+    return int(available_formats[0])
+
+
+def _vulkan_format_name(vk: Any, value: int) -> str:
+    names = {
+        int(vk.VK_FORMAT_R8G8B8A8_SRGB): "R8G8B8A8_SRGB",
+        int(vk.VK_FORMAT_B8G8R8A8_SRGB): "B8G8R8A8_SRGB",
+        int(vk.VK_FORMAT_R8G8B8A8_UNORM): "R8G8B8A8_UNORM",
+        int(vk.VK_FORMAT_B8G8R8A8_UNORM): "B8G8R8A8_UNORM",
+    }
+    return names.get(int(value), "runtime-preferred")
+
+
+def _scaled_dimension(recommended: int, maximum: int, scale: float) -> int:
+    return max(1, min(int(maximum), round(int(recommended) * float(scale))))
+
+
+def _openxr_platform_module(xr: Any) -> Any:
+    return importlib.import_module(xr.VulkanInstanceCreateInfoKHR.__module__)
+
+
+def _load_vulkan_proc_addr(xr: Any) -> tuple[Any, Any]:
+    if sys.platform == "win32":
+        candidates = ["vulkan-1.dll"]
+    elif sys.platform == "darwin":
+        candidates = ["libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib"]
+    else:
+        candidates = ["libvulkan.so.1", "libvulkan.so"]
+    discovered = ctypes.util.find_library("vulkan")
+    if discovered:
+        candidates.append(discovered)
+
+    platform = _openxr_platform_module(xr)
+    errors: list[str] = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            loader = (
+                ctypes.WinDLL(candidate)
+                if sys.platform == "win32"
+                else ctypes.CDLL(candidate)
+            )
+            function = ctypes.cast(
+                loader.vkGetInstanceProcAddr, platform.PFN_vkGetInstanceProcAddr
+            )
+            return loader, function
+        except (AttributeError, OSError) as exc:
+            errors.append(f"{candidate}: {exc}")
+    raise OpenXrVulkanUnavailableError(
+        "Unable to load vkGetInstanceProcAddr: " + "; ".join(errors)
+    )
+
+
+def _cffi_struct_pointer(vk: Any, value: Any, ctypes_type: Any) -> Any:
+    address = int(vk.ffi.cast("uintptr_t", vk.ffi.addressof(value)))
+    return ctypes.cast(ctypes.c_void_p(address), ctypes.POINTER(ctypes_type))
+
+
+def _ctypes_handle_to_cffi(vk: Any, type_name: str, handle: Any) -> Any:
+    address = _ctypes_handle_address(handle)
+    if not address:
+        raise OpenXrVulkanUnavailableError(f"OpenXR returned a null {type_name}")
+    return vk.ffi.cast(type_name, address)
+
+
+def _ctypes_handle_address(handle: Any) -> int:
+    return int(ctypes.cast(handle, ctypes.c_void_p).value or 0)
+
+
+def _check_vulkan_result(result: Any, operation: str) -> None:
+    value = int(result.value if hasattr(result, "value") else result)
+    if value != 0:
+        raise OpenXrVulkanUnavailableError(f"{operation} returned VkResult {value}")
+
+
+def _decode_name(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+    return str(value)
+
+    def _upload_tool_quad_fallback(self, key: str, request: Any):
+        """Handle an overlay whose pooled MSDF slot is missing/oversized.
+
+        MSDF canvases are rasterized on the CPU and re-run through the legacy
+        pooled path; if that pool slot is also missing/oversized the quad is
+        dropped (mid-session swapchain creation fails on VDXR/AMD).
+        """
+        if not isinstance(request, VulkanMsdfQuadRequest):
+            return None
+        from .overlay_textures import build_msdf_text_osd_rgba
+
+        if self._msdf_font_atlas is None:
+            return None
+        rgba = build_msdf_text_osd_rgba(
+            self._msdf_font_atlas,
+            size=(int(request.width), int(request.height)),
+            runs=request.runs,
+            background=request.background,
+            radius=int(request.radius),
+        )
+        return rgba
+
+
+@contextmanager
+def _acquired_swapchain_image(xr: Any, eye: _EyeSwapchain, *, tool_quad: bool = False):
+    """Guarantee release after every successful acquire, including wait errors.
+
+    ``tool_quad=True`` replaces the infinite compositor wait with a short
+    timeout: VDXR never releases images of quad swapchains that are not yet
+    part of a submitted frame, so the first uploads of a pooled overlay would
+    block forever (VkTimeout observed with INFINITE_DURATION).
+    """
+
+    image_index = xr.acquire_swapchain_image(eye.handle)
+    try:
+        if not tool_quad:
+            xr.wait_swapchain_image(
+                eye.handle,
+                xr.SwapchainImageWaitInfo(timeout=xr.INFINITE_DURATION),
+            )
+        else:
+            # VDXR does not signal quad-swapchain images promptly. The
+            # acquire already transfers image ownership to the app, so a
+            # short wait is only a courtesy; proceed and write after 5ms
+            # instead of stalling the presenter per overlay per frame.
+            try:
+                xr.wait_swapchain_image(
+                    eye.handle,
+                    xr.SwapchainImageWaitInfo(timeout=5_000_000),
+                )
+            except Exception:
+                pass
         yield image_index
     finally:
         xr.release_swapchain_image(eye.handle)
