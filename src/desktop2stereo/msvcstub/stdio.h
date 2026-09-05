@@ -6,13 +6,24 @@
 typedef struct _iobuf FILE;
 extern FILE *stdin, *stdout, *stderr;
 #define EOF (-1)
+#if defined(_MSC_VER) || 1
+static __inline int __crt_snprintf(char *b, size_t n, const char *fmt, ...) {
+  int r; __builtin_va_list ap; __builtin_va_start(ap, fmt);
+  extern int __stdio_common_vsnprintf_s(unsigned __int64 opt, char *b, size_t n, const char *fmt, void *loc, __builtin_va_list ap);
+  r = __stdio_common_vsnprintf_s(0, b, n, fmt, 0, ap);
+  __builtin_va_end(ap); return r;
+}
+#define snprintf __crt_snprintf
+#else
+int snprintf(char *b, size_t n, const char *fmt, ...);
+#endif
 int printf(const char *fmt, ...);
 int fprintf(FILE *f, const char *fmt, ...);
-int sprintf(char *b, const char *fmt, ...);
+#define sprintf __crt_snprintf
 int snprintf(char *b, size_t n, const char *fmt, ...);
-int vprintf(const char *fmt, va_list ap);
-int vfprintf(FILE *f, const char *fmt, va_list ap);
-int vsnprintf(char *b, size_t n, const char *fmt, va_list ap);
+
+
+
 FILE *fopen(const char *p, const char *m);
 int fclose(FILE *f);
 size_t fread(void *d, size_t s, size_t n, FILE *f);

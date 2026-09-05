@@ -63,6 +63,8 @@ def configure_rocm_environment(os_name: str, rocm_path: str | os.PathLike[str] |
         _msvcstub_lib = _msvcstub / "lib"
         if _msvcstub_lib.is_dir():
             os.environ["LIB"] = str(_msvcstub_lib)
+            os.environ["LIBPATH"] = str(_msvcstub_lib)
+            _prepend_env_paths("LIBPATH", [_msvcstub_lib])
         os.environ.setdefault("TRITON_NO_WINSDK", "1")
     return str(root)
 
