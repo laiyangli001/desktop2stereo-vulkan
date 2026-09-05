@@ -501,11 +501,27 @@ class GUIProcessMixin:
         control = getattr(self, "backend_status_text", None)
         if control is None or not isinstance(payload, dict):
             return
+        # Store payload for language switch refresh
+        self._backend_status_payload = payload
+        self._refresh_backend_status_display()
+
+    def _refresh_backend_status_display(self):
+        """Refresh the backend status display with current locale."""
+        control = getattr(self, "backend_status_text", None)
+        payload = getattr(self, "_backend_status_payload", None)
+        if control is None:
+            return
+        # Show placeholder when no payload is available (before runtime starts)
+        if payload is None:
+            control.value = ""
+            self._safe_update(control)
+            return
+        t = UI_MESSAGES.get(self.locale, UI_MESSAGES["EN"])
         depth = payload.get("depth_backend") or "unknown"
         stereo = payload.get("stereo_backend") or "unknown"
-        fallback = "是" if payload.get("fallback") else "否"
-        gpu_to_cpu = "是" if payload.get("gpu_to_cpu") else "否"
-        zero_copy = "是" if payload.get("zero_copy") else "否"
+        fallback = t.get("Status Yes", "Yes") if payload.get("fallback") else t.get("Status No", "No")
+        gpu_to_cpu = t.get("Status Yes", "Yes") if payload.get("gpu_to_cpu") else t.get("Status No", "No")
+        zero_copy = t.get("Status Yes", "Yes") if payload.get("zero_copy") else t.get("Status No", "No")
         copies = payload.get("gpu_copy_count", 0)
         resource_kind = payload.get("resource_kind") or "unknown"
         resource_format = payload.get("resource_format") or "unknown"
@@ -514,15 +530,25 @@ class GUIProcessMixin:
         reason_text = "; ".join(str(item) for item in reasons if item)
         if len(reason_text) > 220:
             reason_text = reason_text[:217] + "..."
+        # Get localized labels
+        lbl_depth = t.get("Status Depth", "Depth")
+        lbl_stereo = t.get("Status Stereo", "Stereo")
+        lbl_fallback = t.get("Status Fallback", "Fallback")
+        lbl_gpu_to_cpu = t.get("Status CPU Readback", "CPU readback")
+        lbl_copies = t.get("Status GPU Copies", "GPU copies")
+        lbl_zero_copy = t.get("Status Zero Readback", "Zero readback")
+        lbl_resource = t.get("Status Resource", "Resource")
+        lbl_directml = t.get("Status DirectML", "DirectML")
+        lbl_reason = t.get("Status Reason", "Reason")
         text = (
-            f"深度={depth} | 合成={stereo} | 回退={fallback} | "
-            f"CPU回读={gpu_to_cpu} | GPU复制={copies} | 零回读={zero_copy} | "
-            f"资源={resource_kind}/{resource_format}"
+            f"{lbl_depth}={depth} | {lbl_stereo}={stereo} | {lbl_fallback}={fallback} | "
+            f"{lbl_gpu_to_cpu}={gpu_to_cpu} | {lbl_copies}={copies} | {lbl_zero_copy}={zero_copy} | "
+            f"{lbl_resource}={resource_kind}/{resource_format}"
         )
         if directml_mode:
-            text += f" | DirectML资源={directml_mode}"
+            text += f" | {lbl_directml}={directml_mode}"
         if reason_text:
-            text += f" | 原因={reason_text}"
+            text += f" | {lbl_reason}={reason_text}"
         control.value = text
         control.visible = True
         bar = getattr(self, "_backend_status_bar", None)
@@ -1335,6 +1361,8 @@ class GUIProcessMixin:
         self._cancel_starting = False
         self._esc_stopped = False
         self._stopping = False
+        # A manual Start resets the OpenXR fatal auto-relaunch budget.
+        self._auto_relaunch_count = 0
         # Re-attach the file handler (append mode) for this run's log output;
         # it was released after the previous run so the file stayed free.
         _setup_file_log_handler()
@@ -1565,13 +1593,52 @@ class GUIProcessMixin:
                     self._restore_precalibration_target()
                     self._close_stream_calibration_dialog()
             code = proc.returncode if proc else None
-            if code and code != 0:
+            if code == 77:
+                # Terminal OpenXR failure (device loss / exhausted reconnects):
+                # VDXR cannot re-create an instance in-process, so relaunch the
+                # runtime in a fresh process (bounded to avoid a crash loop).
+                relaunches = int(getattr(self, "_auto_relaunch_count", 0))
+                if relaunches < 2:
+                    self._auto_relaunch_count = relaunches + 1
+                    self._diag(
+                        "child exited rc=77 (OpenXR fatal); auto-relaunching "
+                        f"runtime ({self._auto_relaunch_count}/2)",
+                        error=True,
+                    )
+                    _set_console_quick_edit(True)
+                    self._set_running_ui(True)
+                    self.set_status(
+                        UI_MESSAGES[self.locale].get(
+                            "Auto Restart",
+                            "OpenXR failure - restarting runtime...",
+                        ),
+                        key="Running",
+                    )
+                    asyncio.create_task(self._countdown_and_run(2.0))
+                    self._diag("auto-relaunch scheduled")
+                else:
+                    self._diag(
+                        "child exited rc=77 twice; auto-relaunch budget "
+                        "exhausted - manual restart required",
+                        error=True,
+                    )
+                    self.set_status(
+                        UI_MESSAGES[self.locale].get(
+                            "Auto Restart Failed",
+                            "OpenXR failure repeated - press Start to retry",
+                        )
+                    )
+                    _set_console_quick_edit(True)
+                    self._set_running_ui(False)
+            elif code and code != 0:
                 self._diag(f"child exited rc={code}; see {LOG_FILE} for details", error=True)
                 self.set_status(UI_MESSAGES[self.locale]["exited_with_code"].format(code))
+                _set_console_quick_edit(True)
+                self._set_running_ui(False)
             else:
                 self.set_status(UI_MESSAGES[self.locale]["Stopped"], key="Stopped")
-            _set_console_quick_edit(True)
-            self._set_running_ui(False)
+                _set_console_quick_edit(True)
+                self._set_running_ui(False)
             self._diag("monitor_task done, status updated")
 
     # ── stop ──
@@ -1781,7 +1848,8 @@ class GUIProcessMixin:
 
     async def _resize_window_after_log_visibility_change(self):
         await asyncio.sleep(0)
-        self._fit_window_to_content(update=True, resize_window=True)
+        # Resize width only, keep height stable
+        self._fit_window_to_content(update=True, resize_window=True, resize_height=False)
         await asyncio.sleep(0.5)
         self.page.window.max_width = None
         try:

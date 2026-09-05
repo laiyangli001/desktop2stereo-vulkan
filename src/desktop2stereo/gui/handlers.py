@@ -675,6 +675,8 @@ class GUIHandlerMixin:
             self._config["Language"] = lang
             self.update_ui_texts()
             self._sync_visibility()
+            # Refresh backend status display if visible
+            self._refresh_backend_status_display()
             if self._status_key:
                 self.set_status(UI_MESSAGES[self.locale].get(self._status_key, self.status_text.value), key=self._status_key)
             t = UI_MESSAGES[self.locale]
@@ -859,7 +861,7 @@ class GUIHandlerMixin:
             0 if calibration_auto else 1
         ]
         self.stream_calibration_btn.content.value = t.get(
-            "Start Calibration", "Start Calibration"
+            "Calibrate", "Calibrate"
         )
         self.audio_label.value = t["Stereo Mix"]
         self.crf_label.value = t["CRF"]

@@ -60,11 +60,18 @@ class RocmTorchGlowSource:
                 TARGET_HEIGHT,
                 format=context.vk.VK_FORMAT_R8G8B8A8_UNORM,
                 label=f"torch-glow-{index}",
-                # LINEAR tiling lets the zero-copy HIP write address the
-                # memory rows contiguously through the imported buffer pointer
-                # (hipExternalMemoryGetMappedBuffer). OPTIMAL images cannot be
-                # written linearly and keep the mipmapped-array copy fallback.
-                tiling=context.vk.VK_IMAGE_TILING_LINEAR,
+                # LINEAR tiling: lets the zero-copy HIP write address the rows
+                # contiguously through hipExternalMemoryGetMappedBuffer (the
+                # official HIP-Basic/vulkan_interop mapping model, applied to
+                # image memory instead of a buffer). The first worker frame
+                # verifies the write with a Vulkan readback and permanently
+                # falls back to the mipmapped-array copy if the driver does
+                # not honor mapped-buffer writes on image memory.
+                # OPTIMAL tiling + mipmapped-array D2D copy: the LINEAR
+                # slot (mapped-buffer write) repeatedly took the Vulkan
+                # device down once the compositor sampled it on AMD
+                # ('Vulkan device is lost' after tens of seconds).
+                # tiling=context.vk.VK_IMAGE_TILING_LINEAR,
             )
             self.importer.register_slot(image, wait=False, defer=True)
             self.slots.append(image)
@@ -82,8 +89,8 @@ class RocmTorchGlowSource:
         self._closed = False
         self._frame_slots: dict[int, Any] = {}
         self._leases: dict[int, int] = {}
-        self._zero_copy_active: bool | None = None
         self._zero_copy_logged = False
+        self._staging: Any = None
         # Background worker: every blocking glow step runs here, never on the
         # frame producer.
         self._pending: list[tuple[Any, Any, str, float]] = []
@@ -175,7 +182,15 @@ class RocmTorchGlowSource:
         with self._pending_condition:
             # Keep only the newest pending sample: the glow is a slow effect and
             # the worker should never lag behind the producer.
-            self._pending = [(value, event, str(mode or "").strip().lower(), start)]
+            self._pending = [
+                (
+                    value,
+                    event,
+                    str(mode or "").strip().lower(),
+                    start,
+                    max(0.0, float(temporal_smoothing_seconds)),
+                )
+            ]
             self._pending_condition.notify()
         self._last_submit_ms = (time.perf_counter() - start) * 1000.0
         return True
@@ -189,7 +204,13 @@ class RocmTorchGlowSource:
                     self._pending_condition.wait()
                 if self._closed and not self._pending:
                     return
-                value, event, normalized_mode, start = self._pending.pop()
+                (
+                    value,
+                    event,
+                    normalized_mode,
+                    start,
+                    temporal_smoothing_seconds,
+                ) = self._pending.pop()
             try:
                 event.synchronize()
                 rgb = value[0]  # [3,H,W] sRGB-encoded float
@@ -296,30 +317,43 @@ class RocmTorchGlowSource:
                     self.context.release_external_image_from_sampling(
                         slot.resource
                     )
-                # Zero-copy: write the RGBA pixels device-to-device straight
-                # into the imported Vulkan image memory (mapped HIP buffer,
-                # linear tiling, pitched by the Vulkan row pitch). No staging,
-                # no mipmapped-array API. When the driver cannot map image
-                # memory as a buffer, the mipmapped-array copy (the CUDA-path
-                # equivalent) is used instead - both keep the identical visual.
-                try:
-                    self.importer.copy_tensor_to_image(rgba, slot)
-                    self._zero_copy_active = True
-                except Exception:
-                    self.importer.copy_tensor(rgba, slot, synchronous=True)
-                    self._zero_copy_active = False
+                # ROCm7 Windows driver drops the device (~28s) whenever HIP
+                # writes Vulkan-imported external memory directly, in every
+                # form tested (mapped-buffer LINEAR write, hipMemcpy2DToArray
+                # D2D write). The glow payload is tiny (320x180 RGBA), so the
+                # upload goes HIP compute -> host -> Vulkan staging -> copy;
+                # the 30 Hz host hop (~7 MB/s) runs on the async worker and
+                # does not touch the frame producer.
+                host = rgba.detach().to("cpu", non_blocking=False).contiguous()
+                staging = self._staging
+                if staging is None or staging.width != slot.width or staging.height != slot.height:
+                    from viewer.vulkan_resources import VulkanHostImage
+
+                    staging = VulkanHostImage(
+                        self.context,
+                        int(slot.width),
+                        int(slot.height),
+                        format=int(slot.format),
+                        label="glow-host-staging",
+                    )
+                    self._staging = staging
+                staging.upload(host)
                 if not self._zero_copy_logged:
                     self._zero_copy_logged = True
                     print(
                         "[VulkanOutput] ROCm torch glow upload: "
-                        + (
-                            "zero_copy_hip_buffer"
-                            if self._zero_copy_active
-                            else "mipmapped_array_copy_fallback"
-                        ),
+                        "hip_compute_host_staging",
                         flush=True,
                     )
-                self.context.prepare_external_image_for_sampling(slot.resource)
+                self.context.copy_image(
+                    staging.resource,
+                    slot.resource,
+                    destination_rect=(0, 0, int(slot.width), int(slot.height)),
+                )
+                # copy_image leaves the slot in COLOR_ATTACHMENT_OPTIMAL;
+                # move it straight to SHADER_READ_ONLY in one submission
+                # (skips the GENERAL round-trip to halve queue submissions).
+                self._finish_external_image_for_sampling(slot.resource)
                 with self._lock:
                     self._current_resource = slot.resource
                     self._serial += 1
@@ -379,6 +413,103 @@ class RocmTorchGlowSource:
             tuple(max(0.0, min(8.0, float(channel))) for channel in item)
             for item in values
         )
+
+    def _verify_slot_pixels(self, slot, rgba) -> bool:
+        """Read the slot back through Vulkan and compare against the tensor.
+
+        The zero-copy write lands in shared memory from the HIP side; this
+        samples the same memory from the Vulkan side so a driver that fails
+        to propagate mapped-buffer writes is detected with hard evidence
+        instead of a black glow.
+        """
+        try:
+            from viewer.vulkan_resources import VulkanHostReadbackBuffer
+
+            context = self.context
+            state = context.image_state(slot.resource.image)
+            readback = VulkanHostReadbackBuffer(
+                context, int(slot.width), int(slot.height), label="glow-zero-copy-verify"
+            )
+            try:
+                context.copy_image_to_host_buffer(
+                    slot.resource, readback, wait_for_timeline=0
+                )
+                context.wait_idle()
+                got = readback.read_rgba()
+            finally:
+                readback.close()
+            import numpy as np
+
+            expected = rgba.detach().cpu().numpy()
+            # The readback leaves the image in its pre-copy layout; restore the
+            # sampling layout the runtime expects.
+            context.register_image_state(
+                slot.resource.image,
+                type(state)(
+                    layout=state.layout,
+                    access_mask=state.access_mask,
+                    stage_mask=state.stage_mask,
+                    queue_family_index=state.queue_family_index,
+                ),
+            )
+            self._last_verify_diff = int(
+                np.count_nonzero(np.any(got != expected, axis=2))
+            )
+            return bool(
+                int(np.count_nonzero(np.any(got != expected, axis=2)))
+                <= (slot.width * slot.height) // 64
+            )
+        except Exception as exc:
+            self._last_verify_diff = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def _finish_external_image_for_sampling(self, resource: Any) -> None:
+        """Barrier a copy-written exportable image straight to SHADER_READ."""
+        vk = self.vk
+        state = self.context.image_state(resource.image)
+
+        def record(command_buffer: Any) -> None:
+            barrier = vk.VkImageMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                oldLayout=int(state.layout),
+                newLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                image=resource.image,
+                subresourceRange=vk.VkImageSubresourceRange(
+                    aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                    baseMipLevel=0,
+                    levelCount=1,
+                    baseArrayLayer=0,
+                    layerCount=1,
+                ),
+            )
+            vk.vkCmdPipelineBarrier(
+                command_buffer,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [barrier],
+            )
+
+        timeline = self.context.submit_on("graphics", record)
+        self.context.register_image_state(
+            resource.image,
+            type(state)(
+                layout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                access_mask=vk.VK_ACCESS_SHADER_READ_BIT,
+                stage_mask=vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                queue_family_index=self.context.queue_family_index,
+            ),
+        )
+        self.context.wait_for_timeline(timeline)
 
     def poll(self) -> None:
         return
