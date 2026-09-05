@@ -15,6 +15,10 @@ char *strcat(char *d, const char *s);
 char *strncat(char *d, const char *s, size_t n);
 char *strchr(const char *s, int c);
 char *strstr(const char *h, const char *n);
+char *strrchr(const char *s, int c);
+char *strpbrk(const char *s, const char *a);
+size_t strspn(const char *s, const char *a);
+char *strtok(char *s, const char *d);
 size_t strcspn(const char *s, const char *r);
 char *strerror(int e);
 
