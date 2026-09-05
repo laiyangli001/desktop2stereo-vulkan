@@ -43,7 +43,27 @@ def configure_rocm_environment(os_name: str, rocm_path: str | os.PathLike[str] |
     _prepend_env_paths("CPATH", [root / "include"])
     _prepend_env_paths("LIBRARY_PATH", [root / "lib", root / "lib64"])
     _prepend_env_paths("PKG_CONFIG_PATH", [root / "lib" / "pkgconfig"])
+    # The HIP runtime libs (rocblas.dll / libhipblaslt.dll) ship in the
+    # sibling _rocm_sdk_libraries package; torch must resolve them from PATH
+    # or large GEMMs fall back to slow kernels (40x slowdown observed).
+    _libraries = _resolve_rocm_libraries_path(root)
+    if _libraries is not None:
+        _prepend_env_paths(
+            "PATH", [_libraries / "bin", _libraries / "lib"]
+        )
+        _prepend_env_paths("LIBRARY_PATH", [_libraries / "lib"])
     return str(root)
+
+
+def _resolve_rocm_libraries_path(root: Path) -> Path | None:
+    for candidate in (root.parent / "_rocm_sdk_libraries",):
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        if resolved.is_dir() and (resolved / "bin").is_dir():
+            return resolved
+    return None
 
 
 def _resolve_rocm_sdk_path(rocm_path: str | os.PathLike[str] | None = None) -> Path | None:
