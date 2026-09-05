@@ -1,13 +1,15 @@
 """Torch-computed Glow source for AMD ROCm (no Vulkan compute queue).
 
 Computes the screen-light reduction and the glow texture with torch on the HIP
-stream and uploads the RGBA8 texture into a Vulkan image via the working
-external-memory image import (``hipMemcpy2DToArray``).
+stream, then uploads the small RGBA8 result through host staging into a Vulkan
+image. The AMD driver drops the Vulkan device when HIP writes imported image
+memory directly under sustained compositing; frame leases keep published
+images immutable until OpenXR releases them.
 
 The producer path is NON-BLOCKING: ``submit`` only enqueues the source downsample
 (interpolate) and hands the small tensor to a background worker thread. The
 worker performs every blocking step (event wait, gather/reduction, screen-light
-readback, synchronous HIP copy, and the GENERAL<->SHADER_READ layout
+readback, HIP copy/synchronization, and the GENERAL<->SHADER_READ layout
 transitions) so the OpenXR frame producer is never stalled — stalling the
 producer on the glow dropped the Virtual Desktop session after the first frames.
 
@@ -53,28 +55,6 @@ class RocmTorchGlowSource:
         self.slot_count = 3
         self.importer = RocmVulkanImageImporter()
         self.slots: list[VulkanExportableImage] = []
-        for index in range(self.slot_count):
-            image = VulkanExportableImage(
-                context,
-                TARGET_WIDTH,
-                TARGET_HEIGHT,
-                format=context.vk.VK_FORMAT_R8G8B8A8_UNORM,
-                label=f"torch-glow-{index}",
-                # LINEAR tiling: lets the zero-copy HIP write address the rows
-                # contiguously through hipExternalMemoryGetMappedBuffer (the
-                # official HIP-Basic/vulkan_interop mapping model, applied to
-                # image memory instead of a buffer). The first worker frame
-                # verifies the write with a Vulkan readback and permanently
-                # falls back to the mipmapped-array copy if the driver does
-                # not honor mapped-buffer writes on image memory.
-                # OPTIMAL tiling + mipmapped-array D2D copy: the LINEAR
-                # slot (mapped-buffer write) repeatedly took the Vulkan
-                # device down once the compositor sampled it on AMD
-                # ('Vulkan device is lost' after tens of seconds).
-                # tiling=context.vk.VK_IMAGE_TILING_LINEAR,
-            )
-            self.importer.register_slot(image, wait=False, defer=True)
-            self.slots.append(image)
         self._ring = 0
         self._lock = threading.Lock()
         self._current_resource: Any = None
@@ -88,13 +68,28 @@ class RocmTorchGlowSource:
         self._reuse_count = 0
         self._closed = False
         self._frame_slots: dict[int, Any] = {}
+        self._frame_serials: dict[int, int] = {}
         self._leases: dict[int, int] = {}
-        self._zero_copy_logged = False
         self._staging: Any = None
+        self._upload_logged = False
+        self._worker_error: Exception | None = None
         # Background worker: every blocking glow step runs here, never on the
         # frame producer.
-        self._pending: list[tuple[Any, Any, str, float]] = []
+        self._pending: list[tuple[Any, Any, str, float, float]] = []
         self._pending_condition = threading.Condition()
+        self._worker = None
+        try:
+            for index in range(self.slot_count):
+                image = VulkanExportableImage(
+                    context, TARGET_WIDTH, TARGET_HEIGHT,
+                    format=context.vk.VK_FORMAT_R8G8B8A8_UNORM,
+                    label=f"torch-glow-{index}",
+                )
+                self.slots.append(image)
+                self.importer.register_slot(image)
+        except Exception:
+            self.close()
+            raise
         self._worker = threading.Thread(
             target=self._worker_loop, name="rocm-torch-glow", daemon=True
         )
@@ -154,11 +149,18 @@ class RocmTorchGlowSource:
         return value.contiguous()
 
     def _pick_slot(self):
-        for _ in range(self.slot_count):
-            slot = self.slots[self._ring]
-            self._ring = (self._ring + 1) % self.slot_count
-            if self._leases.get(id(slot), 0) == 0:
-                return slot
+        with self._lock:
+            if self._closed:
+                return None
+            for _ in range(self.slot_count):
+                slot = self.slots[self._ring]
+                self._ring = (self._ring + 1) % self.slot_count
+                resource = slot.resource
+                # acquire() leases resources, not their owning image wrappers.
+                # Also reserve the published image even between frame leases:
+                # acquire() may hand it to the presenter at any moment.
+                if resource is not self._current_resource and self._leases.get(id(resource), 0) == 0:
+                    return slot
         return None
 
     def submit(
@@ -171,6 +173,7 @@ class RocmTorchGlowSource:
     ) -> bool:
         if self._closed:
             return False
+        self.poll()
         import torch
 
         start = time.perf_counter()
@@ -180,6 +183,8 @@ class RocmTorchGlowSource:
         event = torch.cuda.Event()
         event.record()
         with self._pending_condition:
+            if self._closed:
+                return False
             # Keep only the newest pending sample: the glow is a slow effect and
             # the worker should never lag behind the producer.
             self._pending = [
@@ -202,7 +207,7 @@ class RocmTorchGlowSource:
             with self._pending_condition:
                 while not self._pending and not self._closed:
                     self._pending_condition.wait()
-                if self._closed and not self._pending:
+                if self._closed:
                     return
                 (
                     value,
@@ -309,51 +314,14 @@ class RocmTorchGlowSource:
                 slot = self._pick_slot()
                 if slot is None:
                     continue
-                state = self.context.image_state(slot.resource.image)
-                if (
-                    state.layout
-                    == self.vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                ):
-                    self.context.release_external_image_from_sampling(
-                        slot.resource
-                    )
-                # ROCm7 Windows driver drops the device (~28s) whenever HIP
-                # writes Vulkan-imported external memory directly, in every
-                # form tested (mapped-buffer LINEAR write, hipMemcpy2DToArray
-                # D2D write). The glow payload is tiny (320x180 RGBA), so the
-                # upload goes HIP compute -> host -> Vulkan staging -> copy;
-                # the 30 Hz host hop (~7 MB/s) runs on the async worker and
-                # does not touch the frame producer.
-                host = rgba.detach().to("cpu", non_blocking=False).contiguous()
-                staging = self._staging
-                if staging is None or staging.width != slot.width or staging.height != slot.height:
-                    from viewer.vulkan_resources import VulkanHostImage
-
-                    staging = VulkanHostImage(
-                        self.context,
-                        int(slot.width),
-                        int(slot.height),
-                        format=int(slot.format),
-                        label="glow-host-staging",
-                    )
-                    self._staging = staging
-                staging.upload(host)
-                if not self._zero_copy_logged:
-                    self._zero_copy_logged = True
+                self._upload_host_staging(slot, rgba)
+                if not self._upload_logged:
+                    self._upload_logged = True
                     print(
                         "[VulkanOutput] ROCm torch glow upload: "
                         "hip_compute_host_staging",
                         flush=True,
                     )
-                self.context.copy_image(
-                    staging.resource,
-                    slot.resource,
-                    destination_rect=(0, 0, int(slot.width), int(slot.height)),
-                )
-                # copy_image leaves the slot in COLOR_ATTACHMENT_OPTIMAL;
-                # move it straight to SHADER_READ_ONLY in one submission
-                # (skips the GENERAL round-trip to halve queue submissions).
-                self._finish_external_image_for_sampling(slot.resource)
                 with self._lock:
                     self._current_resource = slot.resource
                     self._serial += 1
@@ -361,107 +329,50 @@ class RocmTorchGlowSource:
                         time.perf_counter() - start
                     ) * 1000.0
             except Exception as exc:  # pragma: no cover - defensive
+                with self._lock:
+                    self._worker_error = exc
                 if os.environ.get("D2S_GLOW_DIAGNOSTIC"):
+                    import traceback as _tb
+
                     print(
                         "[VulkanOutput] torch glow worker error: "
-                        f"{type(exc).__name__}: {exc}",
+                        f"{type(exc).__name__}: {exc}\n"
+                        + _tb.format_exc().rstrip(),
                         flush=True,
                     )
+                # Let poll() notify the adapter's fallback machinery. Never
+                # continue writing or submitting to a potentially lost device.
+                return
 
-    def _compute_edge_lights(self, rgb, device):
-        height, width = int(rgb.shape[-2]), int(rgb.shape[-1])
-        band = max(4.0, min(16.0, round(min(height, width) / 270.0)))
-        band = int(band)
-        values: list[tuple[float, float, float]] = []
-        top = rgb[:, :band, :]
-        for index in range(8):
-            segment = top[:, :, index * width // 8 : (index + 1) * width // 8]
-            values.append(
-                tuple(
-                    float(v)
-                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
-                )
+    def _upload_host_staging(self, slot: VulkanExportableImage, rgba: Any) -> None:
+        """Upload one completed glow image through small host staging."""
+        state = self.context.image_state(slot.resource.image)
+        if state.layout == self.vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            self.context.release_external_image_from_sampling(slot.resource)
+        host = rgba.detach().to("cpu", non_blocking=False).contiguous()
+        staging = self._staging
+        if (
+            staging is None
+            or staging.width != slot.width
+            or staging.height != slot.height
+        ):
+            from viewer.vulkan_resources import VulkanHostImage
+
+            staging = VulkanHostImage(
+                self.context,
+                int(slot.width),
+                int(slot.height),
+                format=int(slot.format),
+                label="glow-host-staging",
             )
-        right = rgb[:, :, width - band :]
-        for index in range(4):
-            segment = right[:, index * height // 4 : (index + 1) * height // 4, :]
-            values.append(
-                tuple(
-                    float(v)
-                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
-                )
-            )
-        bottom = rgb[:, height - band :, :]
-        for index in range(8):
-            segment = bottom[:, :, index * width // 8 : (index + 1) * width // 8]
-            values.append(
-                tuple(
-                    float(v)
-                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
-                )
-            )
-        left = rgb[:, :, :band]
-        for index in range(4):
-            segment = left[:, index * height // 4 : (index + 1) * height // 4, :]
-            values.append(
-                tuple(
-                    float(v)
-                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
-                )
-            )
-        return tuple(
-            tuple(max(0.0, min(8.0, float(channel))) for channel in item)
-            for item in values
+            self._staging = staging
+        staging.upload(host)
+        self.context.copy_image(
+            staging.resource,
+            slot.resource,
+            destination_rect=(0, 0, int(slot.width), int(slot.height)),
         )
-
-    def _verify_slot_pixels(self, slot, rgba) -> bool:
-        """Read the slot back through Vulkan and compare against the tensor.
-
-        The zero-copy write lands in shared memory from the HIP side; this
-        samples the same memory from the Vulkan side so a driver that fails
-        to propagate mapped-buffer writes is detected with hard evidence
-        instead of a black glow.
-        """
-        try:
-            from viewer.vulkan_resources import VulkanHostReadbackBuffer
-
-            context = self.context
-            state = context.image_state(slot.resource.image)
-            readback = VulkanHostReadbackBuffer(
-                context, int(slot.width), int(slot.height), label="glow-zero-copy-verify"
-            )
-            try:
-                context.copy_image_to_host_buffer(
-                    slot.resource, readback, wait_for_timeline=0
-                )
-                context.wait_idle()
-                got = readback.read_rgba()
-            finally:
-                readback.close()
-            import numpy as np
-
-            expected = rgba.detach().cpu().numpy()
-            # The readback leaves the image in its pre-copy layout; restore the
-            # sampling layout the runtime expects.
-            context.register_image_state(
-                slot.resource.image,
-                type(state)(
-                    layout=state.layout,
-                    access_mask=state.access_mask,
-                    stage_mask=state.stage_mask,
-                    queue_family_index=state.queue_family_index,
-                ),
-            )
-            self._last_verify_diff = int(
-                np.count_nonzero(np.any(got != expected, axis=2))
-            )
-            return bool(
-                int(np.count_nonzero(np.any(got != expected, axis=2)))
-                <= (slot.width * slot.height) // 64
-            )
-        except Exception as exc:
-            self._last_verify_diff = f"{type(exc).__name__}: {exc}"
-            return False
+        self._finish_external_image_for_sampling(slot.resource)
 
     def _finish_external_image_for_sampling(self, resource: Any) -> None:
         """Barrier a copy-written exportable image straight to SHADER_READ."""
@@ -511,16 +422,75 @@ class RocmTorchGlowSource:
         )
         self.context.wait_for_timeline(timeline)
 
+    def _compute_edge_lights(self, rgb, device):
+        height, width = int(rgb.shape[-2]), int(rgb.shape[-1])
+        band = max(4.0, min(16.0, round(min(height, width) / 270.0)))
+        band = int(band)
+        values: list[tuple[float, float, float]] = []
+        top = rgb[:, :band, :]
+        for index in range(8):
+            segment = top[:, :, index * width // 8 : (index + 1) * width // 8]
+            values.append(
+                tuple(
+                    float(v)
+                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
+                )
+            )
+        right = rgb[:, :, width - band :]
+        for index in range(4):
+            segment = right[:, index * height // 4 : (index + 1) * height // 4, :]
+            values.append(
+                tuple(
+                    float(v)
+                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
+                )
+            )
+        bottom = rgb[:, height - band :, :]
+        for index in range(8):
+            segment = bottom[:, :, index * width // 8 : (index + 1) * width // 8]
+            values.append(
+                tuple(
+                    float(v)
+                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
+                )
+            )
+        left = rgb[:, :, :band]
+        for index in range(4):
+            segment = left[:, index * height // 4 : (index + 1) * height // 4, :]
+            values.append(
+                tuple(
+                    float(v)
+                    for v in self._srgb_to_linear(segment.mean(dim=(1, 2))).tolist()
+                )
+            )
+        return tuple(
+            tuple(max(0.0, min(8.0, float(channel))) for channel in item)
+            for item in values
+        )
+
     def poll(self) -> None:
-        return
+        with self._lock:
+            error = self._worker_error
+        if error is not None:
+            raise RuntimeError(f"ROCm glow worker failed: {error}") from error
 
     def acquire(self, frame_id: int) -> dict[str, object]:
         with self._lock:
             screen_light = self._screen_light_rgb
             edge_light = self._edge_light_rgb
-            resource = self._current_resource
-            serial = self._serial
+            frame_key = int(frame_id)
+            resource = self._frame_slots.get(frame_key, self._current_resource)
+            serial = self._frame_serials.get(frame_key, self._serial)
             submit_ms = self._last_submit_ms
+            if self._closed:
+                resource = None
+            if resource is not None:
+                if frame_key not in self._frame_slots:
+                    self._frame_slots[frame_key] = resource
+                    self._frame_serials[frame_key] = serial
+                    self._leases[id(resource)] = self._leases.get(id(resource), 0) + 1
+                self._reuse_count += 1
+            reuse_count = self._reuse_count
         metadata: dict[str, object] = {
             "screen_light_linear_rgb": screen_light,
             "screen_light_sample_path": "torch_compute_reduction",
@@ -529,50 +499,58 @@ class RocmTorchGlowSource:
         }
         if resource is None:
             return metadata
-        frame_key = int(frame_id)
-        existing = self._frame_slots.get(frame_key)
-        if existing is None:
-            self._frame_slots[frame_key] = resource
-            self._leases[id(resource)] = self._leases.get(id(resource), 0) + 1
-        self._reuse_count += 1
         metadata.update(
             {
                 "glow_vulkan_image": resource,
                 "glow_vulkan_serial": serial,
                 "glow_source_path": "torch_compute_external_image",
                 "glow_gpu_submit_ms": submit_ms,
-                "glow_reuse": self._reuse_count,
+                "glow_reuse": reuse_count,
             }
         )
         return metadata
 
     def release_frame(self, frame_id: int) -> None:
-        resource = self._frame_slots.pop(int(frame_id), None)
-        if resource is None:
-            return
-        remaining = self._leases.get(id(resource), 1) - 1
-        if remaining > 0:
-            self._leases[id(resource)] = remaining
-        else:
-            self._leases.pop(id(resource), None)
+        with self._lock:
+            resource = self._frame_slots.pop(int(frame_id), None)
+            self._frame_serials.pop(int(frame_id), None)
+            if resource is None:
+                return
+            remaining = self._leases.get(id(resource), 1) - 1
+            if remaining > 0:
+                self._leases[id(resource)] = remaining
+            else:
+                self._leases.pop(id(resource), None)
 
     def close(self) -> None:
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
+        with self._pending_condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._pending.clear()
+            self._pending_condition.notify_all()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            # Never free VkImages after an arbitrary two-second timeout while
+            # this thread may still be copying to or transitioning them.
+            worker.join()
         try:
-            with self._pending_condition:
-                self._pending_condition.notify_all()
-            worker = getattr(self, "_worker", None)
-            if worker is not None and worker.is_alive():
-                worker.join(timeout=2.0)
+            self.context.wait_idle()
             importer = getattr(self, "importer", None)
             if importer is not None:
                 importer.close()
+            staging = getattr(self, "_staging", None)
+            if staging is not None:
+                staging.close()
             for slot in getattr(self, "slots", ()):
                 if slot is not None:
                     slot.close()
         finally:
             self.slots = []
-            self._frame_slots = {}
-            self._current_resource = None
+            self._staging = None
+            with self._lock:
+                self._frame_slots.clear()
+                self._frame_serials.clear()
+                self._leases.clear()
+                self._current_resource = None
+                self._history = None

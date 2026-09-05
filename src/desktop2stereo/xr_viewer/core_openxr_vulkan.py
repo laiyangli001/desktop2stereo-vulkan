@@ -2046,6 +2046,12 @@ class OpenXrVulkanPresenter(
         } else "off"
 
     def _apply_filament_glow_profile_fields(self, values: dict[str, Any]) -> None:
+        env_glow_mode = os.environ.get("D2S_OPENXR_GLOW_MODE")
+        if env_glow_mode:
+            values = {
+                **dict(values or {}),
+                "glow_mode": env_glow_mode,
+            }
         if "glow_mode" in values:
             self._filament_glow_mode = self._normalize_filament_glow_mode(
                 values.get("glow_mode")
@@ -2069,6 +2075,8 @@ class OpenXrVulkanPresenter(
                 setattr(self, attribute, number)
             except (TypeError, ValueError):
                 continue
+        if env_glow_mode and self._normalize_filament_glow_mode(env_glow_mode) != "off":
+            self._set_filament_glow_mode(env_glow_mode)
 
     def _cycle_filament_glow_mode(self) -> None:
         modes = ("surround", "glow", "veil", "off")
@@ -2442,14 +2450,18 @@ class OpenXrVulkanPresenter(
                 float(values.get("vertical", 0.0)),
                 float(values.get("dt", self._last_frame_dt)),
             )
-        elif action == "copy":
-            _send_key(0x43, ctrl=True)
-        elif action == "cut":
-            _send_key(0x58, ctrl=True)
-        elif action == "paste":
-            _send_key(0x56, ctrl=True)
-        elif action == "enter":
-            _send_key(0x0D)
+        elif action in {"copy", "cut", "paste", "enter"}:
+            # The hardware keyboard has priority over shortcut injection:
+            # clipboard gestures are dropped while the user types on the
+            # physical keyboard.
+            if not _physical_keyboard_active():
+                shortcut_vk, shortcut_ctrl = {
+                    "copy": (0x43, True),
+                    "cut": (0x58, True),
+                    "paste": (0x56, True),
+                    "enter": (0x0D, False),
+                }[action]
+                _send_key(shortcut_vk, ctrl=shortcut_ctrl)
         else:
             handled = bool(
                 self._on_controller_shortcut
@@ -3817,10 +3829,14 @@ class OpenXrVulkanPresenter(
                 laser_hit=hits[1],
             )
         touch_active = self._update_touch_contacts(inputs, hits)
-        # Physical mouse takes priority over the controller beam: while the real
-        # mouse was moved/clicked recently, the beam neither moves the OS cursor
-        # nor sends clicks (the injected input is released and ignored).
+        # Hardware input takes priority over the controller beam: while the
+        # real mouse was moved/clicked — or the physical keyboard was typed —
+        # recently, the beam neither moves the OS cursor nor sends clicks
+        # (any beam-injected button is released and ignored).
         physical_mouse_active = bool(_physical_mouse_active())
+        physical_input_active = physical_mouse_active or bool(
+            _physical_keyboard_active()
+        )
         for name, hand, hit, down_flag, up_flag in (
             ("left", inputs[0], hits[0], _MOUSEEVENTF_RIGHTDOWN, _MOUSEEVENTF_RIGHTUP),
             ("right", inputs[1], hits[1], _MOUSEEVENTF_LEFTDOWN, _MOUSEEVENTF_LEFTUP),
@@ -3846,9 +3862,9 @@ class OpenXrVulkanPresenter(
                     _set_cursor_pos(*self._cursor_pixel_for_screen_uv(hit[0], hit[1]))
                 self._pointer_state[name] = "idle"
                 continue
-            if physical_mouse_active:
-                # The hardware mouse owns the cursor now; release any beam-held
-                # button and ignore the beam for this frame.
+            if physical_input_active:
+                # The hardware mouse/keyboard owns the input now; release any
+                # beam-held button and ignore the beam for this frame.
                 if state != "idle":
                     _send_mouse_flags(up_flag)
                 self._pointer_state[name] = "idle"
@@ -4255,10 +4271,27 @@ class OpenXrVulkanPresenter(
             and self._settings_menu_grab_relative is not None
             and grip_matrices[hand] is not None
         ):
-            self._set_settings_menu_matrix(
+            target = (
                 np.asarray(grip_matrices[hand], dtype=np.float64)
                 @ self._settings_menu_grab_relative
             )
+            current = self._settings_menu_matrix()
+            if current is None:
+                self._set_settings_menu_matrix(target)
+                return
+            # Panel-drag debounce (same spirit as the screen-drag deadzone):
+            # follow the grip with an exponential filter whose strength grows
+            # with the requested displacement. A steady hand's mm-scale jitter
+            # is attenuated frame over frame instead of vibrating the panel,
+            # while a deliberate fast move stays near rigid. Only the
+            # translation is filtered; the grip orientation tracks rigidly.
+            delta = float(np.linalg.norm(target[:3, 3] - current[:3, 3]))
+            follow = min(1.0, 0.3 + delta / 0.04)
+            smoothed = target.copy()
+            smoothed[:3, 3] = (
+                current[:3, 3] + (target[:3, 3] - current[:3, 3]) * follow
+            )
+            self._set_settings_menu_matrix(smoothed)
 
     def _refresh_settings_menu_values(self) -> None:
         snapshot = None
@@ -5024,6 +5057,16 @@ class OpenXrVulkanPresenter(
                 pass
             self._output_adapter = None
 
+        # ROCm prewarm starts a worker before an output adapter exists. If
+        # session startup fails, it still must stop before its VkDevice closes.
+        prewarmed_glow = getattr(self, "_prewarmed_glow_backend", None)
+        if prewarmed_glow is not None:
+            self._prewarmed_glow_backend = None
+            try:
+                prewarmed_glow.close()
+            except Exception:
+                pass
+
         if self._vulkan_msdf_quad_renderer is not None:
             try:
                 self._vulkan_msdf_quad_renderer.close()
@@ -5141,11 +5184,17 @@ class OpenXrVulkanPresenter(
         self._provisional_vk_instance = None
 
         if xr is not None and self.instance is not None:
-            if not vulkan_device_lost:
-                try:
-                    xr.destroy_instance(self.instance)
-                except Exception:
-                    pass
+            # Destroy the XR instance even when the Vulkan device was
+            # lost: the OpenXR loader (VDXR) refuses to create a second
+            # XrInstance while the old one lives, so a leaked instance
+            # after a device-lost session would make every reconnect fail
+            # with LimitReachedError and force an app restart. The runtime
+            # may still fail to destroy it (dead VkDevice) - that is
+            # caught below and the reconnect simply retries later.
+            try:
+                xr.destroy_instance(self.instance)
+            except Exception:
+                pass
             self.instance = None
 
         self.system_id = None
@@ -5349,20 +5398,35 @@ class OpenXrVulkanPresenter(
         # kernel JIT + first-transition cost. The GPU torch glow is the ROCm
         # default; D2S_ROCm_TORCH_GLOW=0 reverts to the stable cpu_fallback.
         self._prewarmed_glow_backend = None
-        if os.environ.get("D2S_ROCm_TORCH_GLOW", "1").strip().lower() not in {
-            "0", "false", "off", "no", "disabled",
-        }:
+        vulkan_compute_glow = bool(
+            os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "auto").strip().lower()
+            not in {"0", "false", "off", "no", "disabled"}
+            and int(getattr(self.vulkan, "compute_queue_index", 0) or 0) != 0
+        )
+        torch_glow_default = (
+            os.environ.get("D2S_ROCm_TORCH_GLOW", "1").strip().lower()
+            not in {"0", "false", "off", "no", "disabled"}
+        )
+        if vulkan_compute_glow or torch_glow_default:
             try:
                 import torch
 
                 if getattr(torch.version, "hip", None):
-                    from stereo_runtime.rocm_torch_glow_source import (
-                        RocmTorchGlowSource,
-                    )
+                    if vulkan_compute_glow:
+                        from stereo_runtime.vulkan_glow_source import (
+                            VulkanGlowSourceComputeBackend,
+                        )
 
-                    prewarm_backend = RocmTorchGlowSource(self.vulkan)
+                        prewarm_backend = VulkanGlowSourceComputeBackend(self.vulkan)
+                    else:
+                        from stereo_runtime.rocm_torch_glow_source import (
+                            RocmTorchGlowSource,
+                        )
+
+                        prewarm_backend = RocmTorchGlowSource(self.vulkan)
+                    self._prewarmed_glow_backend = prewarm_backend
                     warm = torch.zeros(
-                        (1, 3, 2160, 3840), dtype=torch.float32, device="cuda"
+                        (1, 3, 288, 512), dtype=torch.float32, device="cuda"
                     )
                     prewarm_backend.submit(
                         warm,
@@ -5370,8 +5434,11 @@ class OpenXrVulkanPresenter(
                         screen_light_only=False,
                         temporal_smoothing_seconds=1.0,
                     )
-                    prewarm_backend.release_frame(0)
-                    self._prewarmed_glow_backend = prewarm_backend
+                    if vulkan_compute_glow:
+                        prewarm_backend.acquire(0)
+                        prewarm_backend.release_frame(0)
+                    else:
+                        prewarm_backend.release_frame(0)
                     # Auto-enable Filament glow when ROCm glow is active.
                     # Use the setter: it also arms the intensity multiplier
                     # (default 1.5) — a bare mode assignment leaves it 0.0 and
@@ -5383,10 +5450,22 @@ class OpenXrVulkanPresenter(
                     ) == "off":
                         self._set_filament_glow_mode("glow")
                     print(
-                        "[OpenXRViewer] ROCm torch glow pre-warmed, Filament glow auto-enabled",
+                        "[OpenXRViewer] ROCm "
+                        + (
+                            "Vulkan compute glow pre-warmed"
+                            if vulkan_compute_glow
+                            else "torch glow pre-warmed"
+                        )
+                        + ", Filament glow auto-enabled",
                         flush=True,
                     )
             except Exception as exc:
+                prewarm_backend = self._prewarmed_glow_backend
+                if prewarm_backend is not None:
+                    try:
+                        prewarm_backend.close()
+                    except Exception:
+                        pass
                 self._prewarmed_glow_backend = None
                 print(
                     "[OpenXRViewer] ROCm torch glow pre-warm skipped: "
@@ -6262,6 +6341,7 @@ class OpenXrVulkanPresenter(
             self._release_output_frame(rendering)
 
     def _commit_output_frame(self, frame: VulkanStereoOutputFrame) -> None:
+        self._sync_screen_aspect_to_frame(frame)
         with self._output_lock:
             previous = self._displayed_output
             if self._pending_output is frame:
@@ -7465,6 +7545,65 @@ class OpenXrVulkanPresenter(
             f"distance_range={atlas.distance_range:g}",
             flush=True,
         )
+
+    def _sync_screen_aspect_to_frame(self, output_frame: Any) -> None:
+        """Auto-fit the screen quad height to the content aspect ratio.
+
+        The screen quad defaults to a 16:9 height; sources with any other
+        aspect (16:10 windows, ultrawide, portrait) would be stretched to fill
+        it. Width (user-adjustable) is kept; only the height follows the
+        actual frame aspect.
+        """
+        if self._filament_screen is None or output_frame is None:
+            return
+        metadata = dict(getattr(output_frame, "metadata", None) or {})
+
+        def metadata_size(value: Any) -> tuple[int, int] | None:
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                try:
+                    width, height = int(value[0]), int(value[1])
+                except (TypeError, ValueError):
+                    return None
+                return (width, height) if width > 0 and height > 0 else None
+            text = str(value or "").strip().lower()
+            if "x" not in text:
+                return None
+            left, right = text.split("x", 1)
+            try:
+                width, height = int(left), int(right)
+            except ValueError:
+                return None
+            return (width, height) if width > 0 and height > 0 else None
+
+        size = next(
+            (
+                metadata_size(metadata.get(key))
+                for key in ("render_size", "source_size", "input_size", "capture_size")
+                if metadata_size(metadata.get(key)) is not None
+            ),
+            None,
+        )
+        if size is None:
+            eye = getattr(output_frame, "left_eye", None)
+            if eye is not None:
+                try:
+                    size = (int(eye.width), int(eye.height))
+                except (AttributeError, TypeError, ValueError):
+                    size = None
+        if size is None or size[0] <= 0 or size[1] <= 0:
+            return
+        aspect = float(size[0]) / float(size[1])
+        position, width, height, rotation = self._filament_screen
+        if width <= 0.0:
+            return
+        fitted = float(width) / aspect
+        if abs(fitted - height) / max(float(height), 1e-6) > 0.005:
+            self._filament_screen = (
+                position,
+                float(width),
+                fitted,
+                rotation,
+            )
 
     def _apply_screen_sampling_policy(
         self,
@@ -10318,6 +10457,7 @@ class OpenXrVulkanPresenter(
                     if self._vulkan_msdf_quad_renderer is not None
                     else ("cpu-msdf" if msdf_atlas is not None else "legacy"),
                     round(width, 2),
+                    round(height, 2),
                     round(screen_distance, 2),
                 )
                 osd_rgba = self._tool_quad_texture_cache.get("screen_osd")
@@ -10329,7 +10469,7 @@ class OpenXrVulkanPresenter(
                         runs = (
                             ("Size", (150, 158, 185, 255)),
                             (
-                                f"{width:.2f} x {width * 9.0 / 16.0:.2f} m",
+                                f"{width:.2f} x {height:.2f} m",
                                 (0, 210, 230, 255),
                             ),
                             ("Dist", (150, 158, 185, 255)),

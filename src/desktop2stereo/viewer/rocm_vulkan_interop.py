@@ -128,6 +128,7 @@ class RocmVulkanImageImporter:
 
     _HIP_MEM_HANDLE_OPAQUE_FD = 1
     _HIP_MEM_HANDLE_OPAQUE_WIN32 = 2
+    _HIP_MEM_HANDLE_OPAQUE_WIN32_KMT = 3
     _HIP_ARRAY_COLOR_ATTACHMENT = 0x20
     _HIP_MEMCPY_DEVICE_TO_DEVICE = 3
 
@@ -157,6 +158,18 @@ class RocmVulkanImageImporter:
                 and getattr(self._hip, "hipMemcpy2D", None)
             ),
         )
+
+    def _memory_handle_type(self, target: Any) -> int:
+        if os.name != "nt":
+            return self._HIP_MEM_HANDLE_OPAQUE_FD
+        try:
+            if int(getattr(target, "handle_type", 0)) == int(
+                target.vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT
+            ):
+                return self._HIP_MEM_HANDLE_OPAQUE_WIN32_KMT
+        except Exception:
+            pass
+        return self._HIP_MEM_HANDLE_OPAQUE_WIN32
 
     @staticmethod
     def _load_hip_runtime(path: str | None):
@@ -337,11 +350,7 @@ class RocmVulkanImageImporter:
         prepare(target.resource, **prepare_kwargs)
         handle = target.export_handle
         desc = _ExternalMemoryHandleDesc(
-            type=(
-                self._HIP_MEM_HANDLE_OPAQUE_WIN32
-                if os.name == "nt"
-                else self._HIP_MEM_HANDLE_OPAQUE_FD
-            ),
+            type=self._memory_handle_type(target),
             size=int(target.allocation_size),
             flags=0,
         )
@@ -525,11 +534,7 @@ class RocmVulkanImageImporter:
                 "exportable Vulkan buffer has no memory handle"
             )
         desc = _ExternalMemoryHandleDesc(
-            type=(
-                self._HIP_MEM_HANDLE_OPAQUE_WIN32
-                if os.name == "nt"
-                else self._HIP_MEM_HANDLE_OPAQUE_FD
-            ),
+            type=self._memory_handle_type(target),
             size=allocation_size,
             flags=0,
         )
@@ -568,7 +573,7 @@ class RocmVulkanImageImporter:
     def copy_tensor_to_buffer(
         self, tensor: Any, target: Any, *, stream=None
     ) -> None:
-        """Copy a contiguous HIP float tensor into an imported Vulkan buffer."""
+        """Copy a contiguous HIP tensor into an imported Vulkan buffer."""
         self.register_buffer(target)
         if (
             getattr(tensor, "device", None) is None
@@ -577,15 +582,19 @@ class RocmVulkanImageImporter:
             raise RocmVulkanInteropError(
                 "HIP Vulkan buffer copy requires a HIP tensor"
             )
-        if str(getattr(tensor, "dtype", "")) != "torch.float32":
+        if str(getattr(tensor, "dtype", "")) not in {
+            "torch.float32",
+            "torch.uint8",
+            "torch.float16",
+        }:
             raise RocmVulkanInteropError(
-                "HIP Vulkan buffer copy requires torch.float32"
+                "HIP Vulkan buffer copy requires a supported HIP tensor dtype"
             )
         if not bool(tensor.is_contiguous()):
             raise RocmVulkanInteropError(
                 "HIP Vulkan buffer copy requires a contiguous tensor"
             )
-        byte_count = int(tensor.numel()) * 4
+        byte_count = int(tensor.numel()) * int(tensor.element_size())
         if byte_count > int(getattr(target, "size", 0)):
             raise RocmVulkanInteropError(
                 "HIP tensor does not fit in the Vulkan buffer"
@@ -665,7 +674,9 @@ class RocmVulkanImageImporter:
         target.close_export_handle()
         self._semaphores[key] = _HipSemaphore(target, external)
 
-    def signal_semaphore(self, target: VulkanExportableSemaphore, *, stream=None) -> None:
+    def signal_semaphore(self, target: VulkanExportableSemaphore, *, stream=None, value=None) -> None:
+        # The shared output adapter supplies counters for CUDA timelines. HIP
+        # imports binary semaphores only, so these counters have no meaning here.
         if stream is None:
             import torch
 
@@ -684,7 +695,7 @@ class RocmVulkanImageImporter:
             "hipSignalExternalSemaphoresAsync",
         )
 
-    def wait_semaphore(self, target: VulkanExportableSemaphore, *, stream=None) -> None:
+    def wait_semaphore(self, target: VulkanExportableSemaphore, *, stream=None, value=None) -> None:
         if stream is None:
             import torch
 

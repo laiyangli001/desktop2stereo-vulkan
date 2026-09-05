@@ -567,12 +567,14 @@ class VulkanHostImage:
         try:
             row_pitch = int(self._layout.rowPitch)
             row_bytes = self.width * 4
-            for row in range(self.height):
-                start = int(self._layout.offset) + row * row_pitch
-                # PyVulkan exposes mapped host memory as a writable buffer.
-                # Keep the write on that buffer; casting the returned cffi
-                # object as an integer pointer fails on current PyVulkan.
-                mapped[start:start + row_bytes] = pixels[row].tobytes()
+            start = int(self._layout.offset)
+            if row_pitch == row_bytes:
+                mapped[start:start + row_bytes * self.height] = pixels.tobytes()
+            else:
+                for row in range(self.height):
+                    mapped[start + row * row_pitch:start + row * row_pitch + row_bytes] = (
+                        pixels[row].tobytes()
+                    )
         finally:
             vk.vkUnmapMemory(self.context.device, self.memory)
 
@@ -676,7 +678,15 @@ class VulkanHostReadbackBuffer:
 class VulkanExportableBuffer:
     """Own a Vulkan storage buffer whose memory can be imported by a GPU producer."""
 
-    def __init__(self, context: Any, size: int, *, label: str) -> None:
+    def __init__(
+        self,
+        context: Any,
+        size: int,
+        *,
+        label: str,
+        usage: int | None = None,
+        memory_handle_type: int | None = None,
+    ) -> None:
         if int(size) < 1:
             raise ValueError("exportable buffer size must be positive")
         if not str(label).strip():
@@ -685,11 +695,16 @@ class VulkanExportableBuffer:
         self.vk = context.vk
         self.size = int(size)
         self.label = str(label)
+        self._usage = usage
         self.buffer = None
         self.memory = None
         self.allocation_size = 0
         self._export_handle = None
-        self._handle_type = self._resolve_handle_type()
+        self._handle_type = (
+            int(memory_handle_type)
+            if memory_handle_type is not None
+            else self._resolve_handle_type()
+        )
         self._create()
 
     def _resolve_handle_type(self) -> int:
@@ -724,7 +739,11 @@ class VulkanExportableBuffer:
                 sType=vk.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 pNext=external_buffer,
                 size=self.size,
-                usage=vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                usage=(
+                    int(self._usage)
+                    if self._usage is not None
+                    else vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                ),
                 sharingMode=sharing_mode,
                 queueFamilyIndexCount=len(sharing_families) if len(sharing_families) > 1 else 0,
                 pQueueFamilyIndices=sharing_families if len(sharing_families) > 1 else None,
@@ -813,6 +832,20 @@ class VulkanExportableBuffer:
     def close_export_handle(self) -> None:
         if self._export_handle is None:
             return
+        if (
+            os.name == "nt"
+            and int(self._handle_type)
+            == int(
+                getattr(
+                    self.vk,
+                    "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT",
+                    0,
+                )
+            )
+        ):
+            # KMT handles are driver-owned and must not be passed to CloseHandle.
+            self._export_handle = None
+            return
         if os.name == "nt":
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(int(self._export_handle)))
         else:
@@ -849,6 +882,7 @@ class VulkanExportableImage:
         label: str,
         format: int | None = None,
         tiling: int | None = None,
+        memory_handle_type: int | None = None,
     ) -> None:
         if int(width) < 1 or int(height) < 1:
             raise ValueError("exportable image dimensions must be positive")
@@ -860,6 +894,7 @@ class VulkanExportableImage:
         self.height = int(height)
         self.label = str(label)
         self.format = int(format or self.vk.VK_FORMAT_R8G8B8A8_UNORM)
+        self._requested_handle_type = memory_handle_type
         self.tiling = int(
             tiling or self.vk.VK_IMAGE_TILING_OPTIMAL
         )
@@ -887,7 +922,11 @@ class VulkanExportableImage:
         self.view = None
         self.resource: VulkanImageResource | None = None
         self._export_handle = None
-        self._handle_type = self._resolve_handle_type()
+        self._handle_type = (
+            int(memory_handle_type)
+            if memory_handle_type is not None
+            else self._resolve_handle_type()
+        )
         self._create()
 
     @staticmethod
@@ -916,6 +955,10 @@ class VulkanExportableImage:
         if os.name == "nt":
             return int(self.vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT)
         return int(self.vk.VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)
+
+    @property
+    def handle_type(self) -> int:
+        return int(self._handle_type)
 
     def _create(self) -> None:
         vk = self.vk
@@ -1140,6 +1183,20 @@ class VulkanExportableImage:
 
     def close_export_handle(self) -> None:
         if self._export_handle is None:
+            return
+        if (
+            os.name == "nt"
+            and int(self._handle_type)
+            == int(
+                getattr(
+                    self.vk,
+                    "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT",
+                    0,
+                )
+            )
+        ):
+            # KMT handles are driver-owned and must not be passed to CloseHandle.
+            self._export_handle = None
             return
         if os.name == "nt":
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(int(self._export_handle)))

@@ -1670,6 +1670,142 @@ class VulkanContext:
             wait_semaphore=wait_semaphore,
         )
 
+    def copy_buffer_to_image(
+        self,
+        source: Any,
+        destination: Any,
+        *,
+        wait_for_timeline: int | None = None,
+        wait_semaphore: Any | None = None,
+        wait_semaphore_value: int | None = None,
+        signal_semaphore: Any | None = None,
+        signal_semaphore_value: int | None = None,
+    ) -> int:
+        """Copy a tightly packed RGBA buffer into a Vulkan image."""
+        self._ensure_open()
+        if getattr(source, "context", self) is not self:
+            raise VulkanCapabilityError("Vulkan buffer belongs to a different context")
+        if getattr(destination, "context", self) is not self:
+            raise VulkanCapabilityError("Vulkan image belongs to a different context")
+        if int(source.size) < int(destination.width) * int(destination.height) * 4:
+            raise VulkanCapabilityError(
+                "Vulkan buffer is too small for the destination image"
+            )
+        vk = self.vk
+        destination_key = _cffi_handle_address(vk, destination.image)
+        destination_state = self._image_states.get(
+            destination_key, undefined_layout=vk.VK_IMAGE_LAYOUT_UNDEFINED
+        )
+        self._image_states.require_owner(destination_key, self.queue_family_index)
+        if destination_state.layout not in (
+            vk.VK_IMAGE_LAYOUT_GENERAL,
+            vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        ):
+            raise VulkanCapabilityError(
+                "buffer copy destination must be GENERAL or UNDEFINED"
+            )
+
+        def record(command_buffer: Any) -> None:
+            vk.vkCmdPipelineBarrier(
+                command_buffer,
+                vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        srcAccessMask=destination_state.access_mask
+                        or vk.VK_ACCESS_MEMORY_READ_BIT,
+                        dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        oldLayout=destination_state.layout,
+                        newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=destination.image,
+                        subresourceRange=_color_subresource_range(vk),
+                    )
+                ],
+            )
+            vk.vkCmdCopyBufferToImage(
+                command_buffer,
+                source.buffer,
+                destination.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                [
+                    vk.VkBufferImageCopy(
+                        bufferOffset=0,
+                        bufferRowLength=0,
+                        bufferImageHeight=0,
+                        imageSubresource=vk.VkImageSubresourceLayers(
+                            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                            mipLevel=0,
+                            baseArrayLayer=0,
+                            layerCount=1,
+                        ),
+                        imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                        imageExtent=vk.VkExtent3D(
+                            width=int(destination.width),
+                            height=int(destination.height),
+                            depth=1,
+                        ),
+                    )
+                ],
+            )
+            vk.vkCmdPipelineBarrier(
+                command_buffer,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                        oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        newLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=destination.image,
+                        subresourceRange=_color_subresource_range(vk),
+                    )
+                ],
+            )
+
+        timeline_value = self.submit_on(
+            "graphics",
+            record,
+            wait_for_timeline=wait_for_timeline,
+            wait_semaphore=wait_semaphore,
+            wait_semaphore_value=wait_semaphore_value,
+            signal_semaphore=signal_semaphore,
+            signal_semaphore_value=signal_semaphore_value,
+        )
+        self._image_states.update(
+            destination_key,
+            ImageState(
+                layout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                access_mask=vk.VK_ACCESS_SHADER_READ_BIT,
+                stage_mask=(
+                    vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                    | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                ),
+                queue_family_index=self.queue_family_index,
+            ),
+        )
+        return timeline_value
+
     def submit(self, record: Callable[[Any], None]) -> None:
         self.submit_on("graphics", record)
 
