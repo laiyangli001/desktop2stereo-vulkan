@@ -54,3 +54,18 @@ def test_local_output_quality_uses_the_same_selected_headset_target() -> None:
     )
 
     assert config.output_headset_tier_k == 4
+
+
+def test_openxr_keeps_native_source_for_runtime_projection_resolution() -> None:
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "Distill-Any-Depth-Base",
+            "Run Mode": "OpenXR Link",
+            "XR Headset Model": "Meta Quest 2",
+        },
+        cache_dir="models",
+        device="cpu",
+        depth_only=False,
+    )
+
+    assert config.output_quality_enabled is False

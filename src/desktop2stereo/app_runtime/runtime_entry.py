@@ -40,7 +40,11 @@ from utils import (
 )
 from utils.display_info import resolve_windows_fullscreen_policy
 from utils.run_mode import normalize_run_mode, target_fps_for_run_mode
-from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL
+from utils.xr_headset_presets import (
+    DEFAULT_XR_HEADSET_MODEL,
+    resolve_xr_headset_preset,
+)
+from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 from streaming.stream_session import (
     CALIBRATABLE_STREAM_MODES,
     NetworkStreamSessionConfig,
@@ -156,22 +160,60 @@ def _resolve_openxr_render_scale(
     ``processing_size`` remains accepted for compatibility with callers and
     tests, but is intentionally not used for projection sizing.
     """
-    env_value = os.environ.get("D2S_OPENXR_RENDER_SCALE")
+    # This is the OpenXR projection resolution multiplier, expressed as a
+    # percentage in the GUI.  Keep the old name as a compatibility alias for
+    # existing settings files and launch scripts.
+    env_value = os.environ.get("D2S_OPENXR_RENDER_RESOLUTION")
+    if not env_value:
+        env_value = os.environ.get("D2S_OPENXR_RENDER_SCALE")
     if env_value:
         try:
-            return max(0.5, min(2.0, float(env_value)))
+            text = str(env_value).strip()
+            value = float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+            return max(OPENXR_RENDER_SCALE_MIN, min(OPENXR_RENDER_SCALE_MAX, value))
         except ValueError:
             pass
-    try:
-        return max(0.5, min(2.0, float(settings.get("OpenXR Render Scale", 1.0))))
-    except (TypeError, ValueError):
-        return 1.0
+    if _openxr_render_scale_is_auto(settings):
+        return max(
+            OPENXR_RENDER_SCALE_MIN,
+            min(
+                OPENXR_RENDER_SCALE_MAX,
+                float(resolve_xr_headset_preset(settings.get("XR Headset Model")).recommended_render_scale),
+            ),
+        )
+    for key in ("XR Render", "OpenXR Render Resolution", "OpenXR Render Scale"):
+        if key not in settings:
+            continue
+        try:
+            raw = settings[key]
+            text = str(raw).strip()
+            value = float(text[:-1]) / 100.0 if text.endswith("%") else float(raw)
+            return max(OPENXR_RENDER_SCALE_MIN, min(OPENXR_RENDER_SCALE_MAX, value))
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def _openxr_render_scale_is_auto(settings: dict) -> bool:
+    mode = str(settings.get("XR Render Mode", "")).strip().lower()
+    if mode in {"auto", "headset", "headset optimized", "headset optimized mode"}:
+        return True
+    for key in ("XR Render", "OpenXR Render Resolution", "OpenXR Render Scale"):
+        value = settings.get(key)
+        if isinstance(value, str) and value.strip().lower() in {
+            "auto",
+            "auto (headset)",
+            "headset optimized",
+        }:
+            return True
+    return False
 
 
 def _openxr_projection_config(settings: dict) -> dict[str, object]:
     """Resolve OpenXR presentation settings independently of Filament."""
     return {
         "render_scale": _resolve_openxr_render_scale(settings),
+        "render_scale_auto": _openxr_render_scale_is_auto(settings),
         "swapchain_color_mode": str(
             settings.get("OpenXR Color Mode", "sRGB")
         ).strip().lower(),
@@ -180,6 +222,17 @@ def _openxr_projection_config(settings: dict) -> dict[str, object]:
             settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
         ),
         "monitor_index": max(1, int(settings.get("Monitor Index", 1) or 1)),
+    }
+
+
+def _openxr_glow_modes(settings: dict) -> dict[str, object]:
+    """Load glow modes while handling YAML 1.1's ``off`` boolean alias."""
+    modes = settings.get("OpenXR Glow Modes", {})
+    if not isinstance(modes, dict):
+        return {}
+    return {
+        str(environment): ("off" if value is False else value)
+        for environment, value in modes.items()
     }
 
 
@@ -209,6 +262,22 @@ def _openxr_filament_config(
     )
     configured_glb = os.environ.get("D2S_FILAMENT_GLB")
     configured_profile = os.environ.get("D2S_FILAMENT_PROFILE")
+    saved_transparency = settings.get("OpenXR Glow Transparency")
+    if not isinstance(saved_transparency, dict):
+        # Migrate the previous opacity-oriented setting without changing its
+        # visual result: transparency is the inverse of opacity.
+        saved_opacity = settings.get("OpenXR Glow Opacity")
+        if isinstance(saved_opacity, dict):
+            saved_transparency = {}
+            for environment, opacity in saved_opacity.items():
+                try:
+                    saved_transparency[str(environment)] = 1.0 - min(
+                        1.0, max(0.0, float(opacity))
+                    )
+                except (TypeError, ValueError):
+                    continue
+        else:
+            saved_transparency = {}
     return {
         "filament_bridge_path": bridge_path,
         "filament_glb_path": configured_glb or (
@@ -335,6 +404,13 @@ def _openxr_filament_config(
         # exported through utils; keep the Vulkan entrypoint as a consumer.
         "filament_screen_width": float(OPENXR_SCREEN_WIDTH),
         "filament_screen_distance": float(OPENXR_SCREEN_DISTANCE),
+        "filament_screen_states": (
+            dict(settings.get("OpenXR Screen States", {}))
+            if isinstance(settings.get("OpenXR Screen States", {}), dict)
+            else {}
+        ),
+        "filament_glow_modes": _openxr_glow_modes(settings),
+        "filament_glow_transparencies": dict(saved_transparency),
     }
 
 
@@ -419,6 +495,19 @@ def _wait_for_runtime_ready(
 
 def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     """Run capture, inference, and pipeline threads until shutdown is requested."""
+
+    if platform.system() == "Windows":
+        # DPI awareness is first-wins per process: later calls silently
+        # return E_ACCESSDENIED, so the window can be created unaware while
+        # whatever raced ahead is already set. An unaware/system-aware
+        # process on a scaled (e.g. 150%) monitor gets a DWM-virtualized
+        # framebuffer (1920x1200 -> 1280x800), putting the fullscreen SBS
+        # image in the monitor's top-left instead of covering it. main.py
+        # already requests per-monitor v2 before any import; keep the
+        # first-wins-safe guard here for direct/non-main callers.
+        from windows_dpi import set_per_monitor_dpi_v2
+
+        set_per_monitor_dpi_v2()
 
     shutdown_event.clear()
     stop_request_thread = None
@@ -762,6 +851,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     main_thread_job = None
     nvfruc_stage = None
     nvfruc_thread = None
+    fatal_openxr_device_loss = False
     presentation_q = context.runtime_q
     if context.nvfruc_frame_generation:
         nvfruc_stage = NvFrucStage(
@@ -1186,6 +1276,11 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 window_preview=bool(settings.get("Window Preview", False)),
                 preview_monitor_index=max(0, int(MONITOR_INDEX)),
                 exclude_from_capture=exclude_from_capture,
+                show_taskbar_button=(
+                    OS_NAME == "Windows"
+                    and configured_run_mode in {"Local Viewer", "3D Monitor"}
+                    and bool(settings.get("LSFG Support", False))
+                ),
                 cursor_passthrough=cursor_passthrough,
                 input_size=input_size,
                 capture_mode=str(settings.get("Capture Mode", "Monitor")),
@@ -1352,6 +1447,10 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             # run_until owns Filament/Vulkan teardown on the Presenter thread.
             # Do not let the main thread race that teardown after a timeout.
             presenter_thread.join()
+        fatal_openxr_device_loss = bool(
+            presenter is not None
+            and getattr(presenter, "fatal_device_loss", False)
+        )
         if local_viewer_thread is not None:
             local_viewer_thread.join(timeout=2.0)
         if presenter is not None:
@@ -1359,4 +1458,6 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         close = getattr(context.stereo_runtime, "close", None)
         if callable(close):
             close()
-    return 0
+    # rc=77 is handled by the GUI with a bounded fresh-process relaunch.  A
+    # dead Vulkan device cannot be repaired by in-process OpenXR reconnects.
+    return 77 if fatal_openxr_device_loss else 0

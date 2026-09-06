@@ -514,7 +514,10 @@ def synthesize_stereo(
 
     stage_start = time.perf_counter()
     if direct_sbs is None:
-        left, right, quality_debug = apply_output_quality(left, right, config)
+        if os.environ.get("D2S_OPENXR_NO_EYE_QUALITY"):
+            left, right, quality_debug = left, right, {"output_quality_mode": "skipped_env"}
+        else:
+            left, right, quality_debug = apply_output_quality(left, right, config)
     else:
         plan = output_sampling_plan_for_config(
             config, int(left.shape[-1]), int(left.shape[-2])

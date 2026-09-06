@@ -282,3 +282,174 @@ Session: get local viewer + OpenXR running on AMD (ROCm) with GPU zero-copy (esp
   capture display must exist (currently only a VITURE/MTT display present,
   Dell U2410 disconnected -> Monitor Index/Identity had to be pointed at the
   VITURE for the diagnosis; .tmp/settings.yaml.bak holds the previous file).
+
+- AMD ROCm OpenXR glow device-drop saga (2026-09-04/05, Quest 2 + VDXR):
+  * USER finding (in rocm_torch_glow_source comment): ROCm7 Windows driver
+    drops the Vulkan device (~28s) whenever HIP writes Vulkan-imported
+    external memory directly (mapped-buffer LINEAR, hipMemcpy2DToArray D2D
+    all tested). Glow upload moved to host-staging path
+    (hip_compute_host_staging: HIP->host->VulkanHostImage->vkCmdCopy) - the
+    direct zero-copy hipMemcpy2D path was additionally REJECTED by a
+    readback verifier (readback_mismatch=57600 = whole image -> pitch wrong).
+  * A/B isolation on Quest 2: glow OFF (D2S_ROCm_TORCH_GLOW=0 cpu_fallback)
+    stable 180s; glow ON -> VDXR xr.end_frame RuntimeFailureError ~30-40s
+    into sustained ~70fps presentation (NOT device-lost-initiated; device
+    lost is the aftermath of VDXR tearing the session). Glow worker errors
+    surface after the runtime failure.
+  * Reconnect robustness fixes applied (core_openxr_vulkan.py):
+    (1) run_until now tolerates RuntimeFailureError (recreate session) instead
+    of letting it kill the presenter thread;
+    (2) close() destroys the XrInstance even on device lost - previously the
+    instance leaked and every reconnect failed with LimitReachedError
+    "loader does not support simultaneous XrInstances".
+    Result: app survives the failure + reconnects, but VDXR then refuses
+    re-init with "device or resource busy" (streamer holds session resources
+    ~6-24s+); full app restart still needed for a clean session.
+  * Tool-quad VDXR RuntimeFailureError on enumerate_swapchain_images fixed by
+    user (pooled tool-quad swapchains, SAMPLED_BIT, destination_rect).
+  * Log noise: Filament "Descriptor bindings updated between render-pass
+    begin/end" spam every frame at 70fps (bindings 0-63) - validation-level
+    concern, suspect for sustained-load driver faults but unproven.
+  * Headset: Quest 2 adb 1WMHHB650V2013; keep-awake (stay_on=7,
+    screen_off_timeout=max); Quest OS shows VD client interstitial broadcast
+    loop when stream drops ("sendExtendedInterstitialBroadcast
+    secondsSinceDetection=N"). Quest 3 proximity sensor never registers worn
+    (mProximityPositive=false) - VDXR refuses eye frames; must wear/cover.
+
+## TDR root-cause: undocumented cross-API ordering on ROCm (official HIP doc)
+  * Diagnosis grounded in official HIP 7.2.1 "External resource interoperability"
+    (rocm.docs.amd.com/projects/HIP/en/docs-7.2.1/how-to/hip_runtime_api/external_interop.html):
+    **"access to the buffer should be synchronized between the APIs, e.g. queue
+    syncs or semaphores."** The sample signals/walts binary external semaphores
+    (hipWaitExternalSemaphoresAsync before the kernel, hipSignalExternalSemaphoresAsync
+    after). It also imports the memory with 
+    hipExternalMemoryHandleTypeOpaqueWin32Kmt paired to
+    VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT.
+  * The AMD/HIP eye path VIOLATED this: runtime_output created TIMELINE external
+    semaphores, but hipImportExternalSemaphore is binary-only -> the ROCm importer
+    threw "HIP timeline external semaphore is not implemented" -> the whole
+    semaphore path fell back to a HIP-only `hipStreamSynchronize` with NO
+    Vulkan-side ordering. HIP wrote the imported eye images every frame while the
+    Vulkan composer sampled them, unconordinated -> the AMD driver TDR'd
+    (~30-40s of sustained presentation; independent of depth-model size because
+    the eye upload is still full 4K RGBA at Render Scale 100%).
+  * FIX (implemented, not committed): on ROCm the eye path now uses BINARY
+    external semaphores (timeline=False) exactly per the doc: HIP waits the
+    Vulkan release semaphore -> copy_tensor -> HIP signals the ready semaphore ->
+    Vulkan waits ready, samples -> Vulkan signals release. Gated by
+    importer.capabilities.producer == "amd-rocm-hip" (_binary_external_semaphores).
+    CUDA/NVIDIA path untouched (keeps timeline + wait/signal values).
+    Files: runtime_output.py (semaphore type + wait/signal value gating + HIP
+    stream drain after the ready signal, mirroring the proven-stable local-viewer
+    copy->signal->synchronize pattern so a later depth-frame torch.cuda.synchronize
+    does not stall on an in-flight eye copy), rocm_vulkan_interop.py (signal/wait
+    accept + ignore timeline-style value=).
+  * OPT-IN, AMD-only, DEFAULT OFF: D2S_ROCM_KMT_EXTERNAL_MEMORY=1 switches the
+    eye image to VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT +
+    hipExternalMemoryHandleTypeOpaqueWin32Kmt (per the HIP sample). Inert unless
+    set; NVIDIA path never selects it.
+  * Test plan: with D2S_ROCM_TORCH_GLOW=0 AND keep D2S_OPENXR_DISABLE_GLOW_DRAW=1,
+    run OpenXR continuous wear 2-3 min. If the TDR is GONE, the missing cross-API
+    ordering was the cause. Then re-enable glow (clear DISABLE_GLOW_DRAW, leave
+    D2S_ROCm_TORCH_GLOW=1) and confirm glow renders + no crash.
+  * Consistency verified headless: rocm_torch_glow_source.py math == shaders/
+    d2s_glow_source.comp (8x8 stratified screen-light reduction; glow sample
+    y-mirror + max(base_footprint, prefilter_scale=256 glow/surround, 1 veil);
+    320x180 RGBA8; temporal mix; 24-value edge lights top8/right4/bottom8/left4).
+    Only transport differs (host-staging vs Vulkan compute) - output is
+    pixel-equivalent, so visible glow matches NVIDIA path.
+  * GLOW transport is already safe: rocm_torch_glow_source.py:320-326 documents
+    the AMD "driver drops ~28s on any direct HIP write to Vulkan-imported memory"
+    and moved the glow to HIP->host->Vulkan staging->copy_image. The EYES were the
+    remaining direct HIP->imported write; the binary-semaphore fix now orders it
+    like the proven local viewer (copy->signal->synchronize at ~58 FPS stable).
+  * **Live validation (main.py --runtime, OpenXR Link, headset on):** the TDR is
+    GONE. Test A (D2S_ROCm_TORCH_GLOW=0, DISABLE_GLOW_DRAW=1): "External binary
+    semaphore cross-API sync: active=True", 71-71.2 FPS sustained, rt_depth
+    14.9-23.4ms, NO TDR / no 2446ms stall / no device loss. Test B (glow ON,
+    DISABLE_GLOW_DRAW cleared, D2S_GLOW_DIAGNOSTIC=1): "Glow draw: surround pass
+    executed mode=3 draws=2" 2637 times (glow rendered continuously), last FPS
+    sample present_fps=71.8 rt_depth=15.12ms rt_model=7.10ms rt_gpu_depth=17.61ms,
+    NO TDR. The run only ended via VDXR "Runtime rejected a frame (client
+    interstitial?)" -> session-recreate -> reconnect "device or resource busy",
+    which is the HEADSET-STANDBY path ("Headset not detected or in standby"),
+    not a glow/crash defect.
+  * STARTUP blocker fixed (headless --runtime): settings.yaml had EMPTY
+    "Monitor Identity:" and "Stereo Output Identity:" (both nested blocks), and
+    the stereo output (Dell U2410 DELF017) is no longer connected. Pointed
+    Stereo Output Identity at the current index-2 VITURE (MTT1337, 3840x2160)
+    virtual display. Verify with display_info.enumerate_displays().
+  * Remaining for completion: user must keep the headset screen awake (Quest
+    auto-sleep ~45-60s triggers the VDXR interstitial) and visually confirm the
+    glow matches the NVIDIA path (math is identical, but eyeball confirm pending).
+  * Model can no longer read images (read_image fails) - verify visuals via logs.
+
+- ROCm OpenXR eye handoff follow-up (2026-09-05, after user "glow not visible"
+  report): RocmVulkanOutputAdapter previously inherited the CUDA adapter's
+  timeline-semaphore setup, so every AMD session logged "HIP timeline external
+  semaphore is not implemented", fell back to synchronized copies, and (in the
+  report process) inherited a stale D2S_OPENXR_DISABLE_GLOW_DRAW=1 that made
+  glow upload work but never draw. The adapter now creates binary HIP/Vulkan
+  semaphores per eye slot, drains HIP before Vulkan waits (same proven pattern
+  as the glow worker), consumes ready signals when a frame is dropped before
+  sampling, and clears the stale legacy draw-disable while keeping an explicit
+  AMD-only D2S_ROCM_DISABLE_GLOW_DRAW=1 switch. Prewarm workers are closed on
+  presenter shutdown even when OpenXR never initializes.
+  Validation on RX 9060 XT: nine-frame real-GPU eye handoff probe with binary
+  semaphores passed; ROCm glow smoke (25s/530 uploads) and 286 focused tests
+  passed. OpenXR headset validation still requires a connected/worn headset;
+  last attempt reported "HMD form factor unavailable".
+
+- ROCm glow device-loss root confirmed with Virtual Desktop's OpenXR.log
+  (2026-09-05 16:46:59): xrEndFrame failed with `VkStatus failure [-4]`
+  (VK_ERROR_DEVICE_LOST) at vkQueueSubmit inside the VDXR runtime ~12s after
+  the session started with direct HIP->Vulkan glow image copies. Direct HIP
+  writes into Vulkan-imported image memory are therefore NOT safe for the glow
+  even with binary semaphores and HIP drain on this driver. RocmTorchGlowSource
+  now defaults to the small host-staging transport (HIP compute -> CPU ->
+  VulkanHostImage -> vkCmdCopy) again, while keeping the locking/lease/shutdown
+  fixes from the earlier work. The eye adapter keeps the binary-semaphore
+  HIP/Vulkan path (previously stable for 180s with glow off). Smoke on RX 9060
+  XT: 424 host-staging glow publications / 46 lease checks / exact readbacks
+  over 20s. NVIDIA path untouched.
+
+- ROCm eye memory now uses the official HIP interop KMT handle pair by default
+  (Vulkan `OPAQUE_WIN32_KMT_BIT` + `hipExternalMemoryHandleTypeOpaqueWin32Kmt`)
+  when the ROCm output adapter creates eye images. D2S_ROCM_KMT_EXTERNAL_MEMORY=0
+  reverts to the previous opaque Win32 handle. KMT export handles are not passed
+  to CloseHandle. Headless RX 9060 XT probe: 36-frame binary-semaphore eye
+  handoff with exact Vulkan readback passed; log shows
+  `memory=kmt_win32`. OpenXR headset validation with this handle pair is pending.
+
+- ROCm eye upload switched from HIP->imported-image memory to HIP->exported
+  staging buffers + vkCmdCopyBufferToImage (Vulkan owns all image writes). KMT
+  handle pair is used for both the image and the transfer buffers; direct HIP
+  image writes still lost the Vulkan device after ~35s even with KMT +
+  binary semaphores in the 17:00 run. New path logs
+  `hip_staging_buffer_to_vulkan_image` and passed 36 real-GPU frames with exact
+  Vulkan readback on RX 9060 XT. Headset validation pending.
+
+- Buffer staging also lost the device (17:14 run survived ~3 minutes at 70 FPS
+  before VkStatus -4). No HIP/Vulkan shared-memory variant is durable on this
+  AMD/VDXR combination. Host staging (17:23) crashed after only ~20 seconds and
+  slowed conversion to 26ms/frame, so the default is back to the HIP staging
+  buffer path that sustained ~3 minutes. Pure Vulkan host staging is retained
+  behind `D2S_ROCM_EYE_HOST_STAGING=1`.
+
+- Direct A/B on VDXR, 1.0 supersampling, controller=none + tool quads disabled:
+  no glow -> stable for the full 240s. Re-enabling ROCm torch glow (even with
+  draw disabled) crashes within tens of seconds with VkStatus -4 / native
+  exception. CPU fallback is stable but does not produce a Projection Composer
+  glow image. Conclusion: the ROCm torch glow source/draw path itself is not
+  stable on this AMD 26.8.1 + VDXR combination; transport changes do not fix it.
+  Recommended temporary stable run:
+  D2S_ROCm_TORCH_GLOW=0, D2S_ROCM_DISABLE_GLOW_DRAW=1,
+  D2S_CONTROLLER_MODEL=none, D2S_OPENXR_DISABLE_TOOL_QUADS=1.
+
+- ROCm glow now defaults to VulkanGlowSourceComputeBackend when the Vulkan
+  context exposes compute queue 1 (D2S_ROCM_GLOW_VULKAN_COMPUTE=auto). HIP only
+  feeds an exported buffer; Vulkan compute generates the glow image. Direct
+  VDXR run at 1.0 supersampling: visible mode-1 glow drew continuously and no
+  device loss occurred for ~2 minutes until the headset session ended. This is
+  the first glow-on ROCm path without VkStatus -4. Full 4-minute validation
+  with the headset kept awake is still pending.

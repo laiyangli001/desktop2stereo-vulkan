@@ -44,10 +44,11 @@ if OS_NAME == "Windows":
     import win32con
     import win32gui
 
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        ctypes.windll.user32.SetProcessDPIAware()
+    from windows_dpi import set_per_monitor_dpi_v2
+
+    # Per-monitor v2 keeps the borderless SBS window at the target monitor's
+    # native resolution even when it differs from the primary/system scale.
+    set_per_monitor_dpi_v2()
 
     user32 = ctypes.windll.user32
     SetWindowDisplayAffinity = user32.SetWindowDisplayAffinity

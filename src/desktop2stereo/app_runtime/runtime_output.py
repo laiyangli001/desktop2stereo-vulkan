@@ -24,7 +24,7 @@ from .output_contract import VulkanStereoOutputFrame
 
 def _rocm_glow_vulkan_compute_enabled(context: Any) -> bool:
     """Whether ROCm glow should use the Vulkan compute backend."""
-    value = os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "auto")
+    value = os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "1")
     if value.strip().lower() in {"0", "false", "off", "no", "disabled"}:
         return False
     return int(getattr(context, "compute_queue_index", 0) or 0) != 0
@@ -45,8 +45,10 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
 
     @staticmethod
     def _external_semaphore_requested() -> bool:
-        # Cross-API synchronization uses exportable timeline semaphores. The
-        # Vulkan-only semaphore handed to Filament remains binary.
+        # NVIDIA keeps the verified 41d asynchronous GPU handoff by default.
+        # The synchronized-copy path remains an explicit diagnostic override;
+        # cudaStreamSynchronize stalls the presenter and can make the XR
+        # screen appear frozen on slower GPUs. No image data crosses CPU.
         value = os.environ.get("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", "1")
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -78,18 +80,17 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         self._active_leases: dict[int, int] = {}
         self._closed = False
         self._screen_light_rgb = (0.18, 0.18, 0.18)
-        self._screen_light_sample_path = "cuda_tensor_reduction_fallback"
+        self._screen_light_sample_path = "vulkan_compute_reduction"
         self._screen_light_pending = None
-        self._glow_cpu_pending = None
-        self._glow_cpu_rgba: bytes | None = None
-        self._glow_cpu_size = (0, 0)
-        self._glow_cpu_serial = 0
-        self._glow_cpu_last_submit = 0.0
         self._glow_gpu_backend = None
         self._glow_gpu_last_submit = 0.0
         self._glow_gpu_status: str | None = None
         self._glow_gpu_submission_disabled = False
         self._release_signaled: set[tuple[int, int]] = set()
+        # Only CUDA's semaphore-disabled GPU-copy path uses this. Vulkan's
+        # release barrier is asynchronous, so CUDA must wait before rewriting
+        # a recycled external image slot.
+        self._cuda_release_timelines: list[int] = []
         self._source_frames: dict[int, tuple[object, object, int]] = {}
         self._released_source_frames: set[int] = set()
         self._prepared_source_eyes: set[tuple[int, int]] = set()
@@ -171,108 +172,6 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             )
         )
 
-    def _update_glow_cpu_source(self, source) -> None:
-        """Build a small CPU RGBA reference texture without reading back VkImage."""
-        if not self._glow_environment_enabled():
-            return
-        pending = self._glow_cpu_pending
-        if pending is not None:
-            host, event, width, height = pending
-            if event.query():
-                self._glow_cpu_rgba = host.numpy().tobytes()
-                self._glow_cpu_size = (int(width), int(height))
-                self._glow_cpu_serial += 1
-                self._glow_cpu_pending = None
-
-        mode = str(
-            getattr(self.presenter, "_filament_glow_mode", "off") or "off"
-        ).strip().lower()
-        if mode in {"off", "none", "false", "0"}:
-            return
-
-        now = time.monotonic()
-        if self._glow_cpu_pending is not None or now - self._glow_cpu_last_submit < (1.0 / 12.0):
-            return
-        try:
-            import torch
-            import torch.nn.functional as functional
-
-            if not isinstance(source, torch.Tensor) or not source.is_cuda:
-                return
-            value = source
-            if value.ndim == 4:
-                value = value[0]
-            if value.ndim != 3:
-                return
-            if int(value.shape[-1]) in (3, 4):
-                value = value[..., :3].permute(2, 0, 1)
-            elif int(value.shape[0]) in (3, 4):
-                value = value[:3]
-            else:
-                return
-            source_height, source_width = int(value.shape[1]), int(value.shape[2])
-            target_width = min(320, max(1, source_width))
-            target_height = max(1, int(round(source_height * target_width / source_width)))
-            if target_height > 180:
-                target_height = 180
-                target_width = max(1, int(round(source_width * target_height / source_height)))
-            float_value = value.unsqueeze(0).to(dtype=torch.float32)
-            if mode == "surround":
-                # Match the Vulkan surround contract: each of the 4 x 3
-                # screen regions contributes its area-average color. Expand
-                # the twelve averages without inventing intermediate colors;
-                # the hemisphere shader performs the final smooth blend.
-                region_average = functional.adaptive_avg_pool2d(
-                    float_value, output_size=(6, 8)
-                )
-                sample = functional.interpolate(
-                    region_average,
-                    size=(target_height, target_width),
-                    mode="nearest",
-                )[0]
-            else:
-                sample = functional.interpolate(
-                    float_value,
-                    size=(target_height, target_width),
-                    mode="area",
-                )[0]
-            if source.dtype == torch.uint8:
-                sample = sample.clamp(0.0, 255.0)
-            else:
-                sample = sample.clamp(0.0, 1.0).mul(255.0)
-            rgb = sample.round().to(torch.uint8).permute(1, 2, 0)
-            rgba = torch.empty(
-                (target_height, target_width, 4),
-                dtype=torch.uint8,
-                device=source.device,
-            )
-            rgba[..., :3].copy_(rgb)
-            rgba[..., 3].fill_(255)
-            host = torch.empty(
-                (target_height, target_width, 4),
-                dtype=torch.uint8,
-                pin_memory=True,
-            )
-            host.copy_(rgba, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream(source.device))
-            self._glow_cpu_pending = (
-                host, event, target_width, target_height
-            )
-            self._glow_cpu_last_submit = now
-        except Exception:
-            self._glow_cpu_pending = None
-
-    def _glow_cpu_metadata(self) -> dict[str, object]:
-        if not self._glow_environment_enabled():
-            return {}
-        return {
-            "glow_cpu_rgba": self._glow_cpu_rgba,
-            "glow_cpu_size": self._glow_cpu_size,
-            "glow_cpu_serial": self._glow_cpu_serial,
-            "glow_source_path": "cpu_uploaded_reference",
-        }
-
     def _set_glow_gpu_status(self, status: str) -> None:
         normalized = str(status or "unknown")
         if normalized == self._glow_gpu_status:
@@ -298,21 +197,22 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             and getattr(self.presenter.config, "filament_glb_path", None)
         )
         if self.backend_name != "cuda":
-            # AMD ROCm default: torch-computed glow on the HIP stream (GPU
-            # path) with automatic fallback to cpu_fallback on failure. The
-            # CPU reference remains the safety net; D2S_ROCm_TORCH_GLOW=0
-            # explicitly reverts to it (Virtual Desktop sessions that cannot
-            # keep the glow active fall back automatically as well).
+            # AMD ROCm must use the Vulkan compute glow path. HIP writes only
+            # exported staging buffers; Vulkan compute produces the sampled
+            # glow image. ROCm must not route glow through a CPU readback when
+            # the dedicated Vulkan compute queue is unavailable.
             vulkan_compute_glow = _rocm_glow_vulkan_compute_enabled(
                 self.presenter.vulkan
             )
             if not vulkan_compute_glow:
-                from stereo_runtime.rocm_torch_glow_source import (
-                    rocm_torch_glow_default_on,
+                unavailable_callback = getattr(
+                    self.presenter, "_screen_crop_detection_unavailable", None
                 )
-
-            if not vulkan_compute_glow and not rocm_torch_glow_default_on():
-                self._set_glow_gpu_status(f"cpu_fallback backend={self.backend_name}")
+                if callable(unavailable_callback):
+                    unavailable_callback()
+                self._set_glow_gpu_status(
+                    f"vulkan_compute_unavailable backend={self.backend_name}"
+                )
                 return {}
         # The source image is produced by the Vulkan Glow worker.  Do not use
         # the removed Filament screen/Glow ABI as a capability gate: the
@@ -328,7 +228,7 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     if prewarmed is not None:
                         self._glow_gpu_backend = prewarmed
                         self.presenter._prewarmed_glow_backend = None
-                    elif vulkan_compute_glow:
+                    else:
                         from stereo_runtime.vulkan_glow_source import (
                             VulkanGlowSourceComputeBackend,
                         )
@@ -338,17 +238,6 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                         )
                         self._set_glow_gpu_status(
                             "vulkan_compute_external_image backend=rocm"
-                        )
-                    else:
-                        from stereo_runtime.rocm_torch_glow_source import (
-                            RocmTorchGlowSource,
-                        )
-
-                        self._glow_gpu_backend = RocmTorchGlowSource(
-                            self.presenter.vulkan
-                        )
-                        self._set_glow_gpu_status(
-                            "torch_compute_external_image backend=rocm"
                         )
                 else:
                     from stereo_runtime.vulkan_glow_source import (
@@ -360,14 +249,9 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     )
             if gpu_glow_active:
                 if self.backend_name != "cuda":
-                    if _rocm_glow_vulkan_compute_enabled(self.presenter.vulkan):
-                        self._set_glow_gpu_status(
-                            "vulkan_compute_external_image async_queue=True"
-                        )
-                    else:
-                        self._set_glow_gpu_status(
-                            "torch_compute_external_image async_queue=True"
-                        )
+                    self._set_glow_gpu_status(
+                        "vulkan_compute_external_image async_queue=True"
+                    )
                 else:
                     self._set_glow_gpu_status(
                         "vulkan_compute_external_image async_queue=True"
@@ -384,6 +268,11 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 )
             backend = self._glow_gpu_backend
             backend.poll()
+            crop_request = getattr(self.presenter, "_screen_crop_source_request", None)
+            if callable(crop_request):
+                source_crop_uv, detect_crop = crop_request()
+            else:
+                source_crop_uv, detect_crop = ((0.0, 0.0, 1.0, 1.0), False)
             now = time.monotonic()
             sample_hz = max(1.0, float(getattr(
                 self.presenter,
@@ -402,6 +291,8 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     "mode": mode if gpu_glow_active else (
                         "surround" if edge_light_active else "screen_light"
                     ),
+                    "source_crop_uv": source_crop_uv,
+                    "detect_crop": bool(detect_crop),
                 }
                 if gpu_glow_active or edge_light_active:
                     submit_kwargs["temporal_smoothing_seconds"] = max(
@@ -419,7 +310,21 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                 submitted = backend.submit(source, **submit_kwargs)
                 if submitted:
                     self._glow_gpu_last_submit = now
+                    if detect_crop:
+                        submitted_callback = getattr(
+                            self.presenter, "_screen_crop_detection_submitted", None
+                        )
+                        if callable(submitted_callback):
+                            submitted_callback()
             metadata = backend.acquire(frame_id)
+            detection_callback = getattr(
+                self.presenter, "_apply_screen_crop_detection", None
+            )
+            if callable(detection_callback) and metadata.get("crop_detection_uv") is not None:
+                detection_callback(
+                    metadata.get("crop_detection_uv"),
+                    metadata.get("crop_detection_serial"),
+                )
             if not gpu_glow_active:
                 metadata = {
                     key: value
@@ -428,6 +333,8 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                         "screen_light_linear_rgb",
                         "screen_light_sample_path",
                         "screen_edge_light_linear_rgb",
+                        "crop_detection_uv",
+                        "crop_detection_serial",
                         "_vulkan_glow_release",
                     }
                 }
@@ -454,6 +361,12 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             return metadata
         except Exception as exc:
             import traceback as _tb
+
+            unavailable_callback = getattr(
+                self.presenter, "_screen_crop_detection_unavailable", None
+            )
+            if callable(unavailable_callback):
+                unavailable_callback()
 
             self._set_glow_gpu_status(
                 f"reuse_last_completed reason={type(exc).__name__}: {exc}"
@@ -491,6 +404,39 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         if len(shape) != 3 or shape[-1] != 4:
             raise ValueError("runtime eye must be an HxWx4 tensor")
         return shape[1], shape[0]
+
+    def _wait_for_runtime_cuda_event(self, runtime_result, tensor) -> None:
+        """Enqueue producer completion on CUDA's consumer stream.
+
+        Runtime inference and output conversion use different Python threads.
+        Host polling a torch event can keep the latest-frame queue blocked even
+        though the GPU can make progress.  Wait on the CUDA stream instead;
+        this remains entirely GPU-side and is intentionally CUDA-only so the
+        validated ROCm staging path is unchanged.
+        """
+        if self.backend_name != "cuda":
+            return
+        event = getattr(runtime_result, "cuda_ready_event", None)
+        if event is None:
+            return
+        wait_event = getattr(event, "wait", None)
+        if not callable(wait_event):
+            raise RuntimeError("CUDA runtime result has no GPU-waitable ready event")
+        device = getattr(tensor, "device", None)
+        try:
+            import torch
+
+            if getattr(device, "type", None) == "cuda":
+                with torch.cuda.device(device):
+                    torch.cuda.current_stream(device=device).wait_event(event)
+                return
+        except Exception:
+            # ``Event.wait()`` is still a CUDA stream enqueue.  Keep this
+            # narrow fallback for torch/runtime versions without the explicit
+            # Stream.wait_event route; never synchronize the host or copy pixels
+            # through CPU memory.
+            pass
+        wait_event()
 
     def _claim_slot(self, slot_index: int, frame_id: int) -> None:
         while True:
@@ -630,7 +576,22 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     # convert(); return the image to producer-writable GENERAL
                     # so the next frame's sampling transition sees GENERAL,
                     # otherwise the composer raises "must be in GENERAL".
-                    context.release_external_image_from_sampling(resource)
+                    release_timeline = context.release_external_image_from_sampling(
+                        resource,
+                        wait_for_timeline=wait_for_timeline,
+                        wait_semaphore=(
+                            waits[eye_index] if eye_index < len(waits) else None
+                        ),
+                    )
+                    if (
+                        self.backend_name == "cuda"
+                        and release_timeline is not None
+                        and slot_index < len(self._cuda_release_timelines)
+                    ):
+                        self._cuda_release_timelines[slot_index] = max(
+                            int(self._cuda_release_timelines[slot_index]),
+                            int(release_timeline),
+                        )
                     self._prepared_source_eyes.discard((frame_key, eye_index))
                     continue
                 release_values = (
@@ -709,6 +670,8 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         try:
             if not external_semaphore_requested:
                 self._extent = (width, height)
+                if self.backend_name == "cuda":
+                    self._cuda_release_timelines = [0] * self.ring_size
                 return
             self.left_ready_semaphores = [
                 VulkanExportableSemaphore(
@@ -796,6 +759,8 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
             self.right_release_values = []
             self.external_semaphore_enabled = False
         self._extent = (width, height)
+        if self.backend_name == "cuda":
+            self._cuda_release_timelines = [0] * self.ring_size
 
     def convert(self, runtime_result, *, frame_id: int, timestamp: float):
         left = getattr(runtime_result, "left_eye", None)
@@ -803,6 +768,7 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         width, height = self._tensor_extent(left)
         if self._tensor_extent(right) != (width, height):
             raise ValueError("left/right runtime eye dimensions differ")
+        self._wait_for_runtime_cuda_event(runtime_result, left)
         self._ensure_slots(width, height)
         slot_index = int(frame_id) % self.ring_size
         self._claim_slot(slot_index, frame_id)
@@ -825,9 +791,6 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                         "screen_light_sample_path", "vulkan_compute_reduction"
                     )
                 )
-            if "glow_vulkan_image" not in glow_metadata:
-                self._update_glow_cpu_source(glow_source)
-                glow_metadata = {**glow_metadata, **self._glow_cpu_metadata()}
             left_ready = None
             right_ready = None
             use_external_semaphore = bool(
@@ -887,6 +850,13 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                     stream=stream,
                 )
             if not use_external_semaphore:
+                if self.backend_name == "cuda" and slot_index < len(
+                    self._cuda_release_timelines
+                ):
+                    release_timeline = int(self._cuda_release_timelines[slot_index])
+                    if release_timeline > 0:
+                        self.presenter.vulkan.wait_for_timeline(release_timeline)
+                        self._cuda_release_timelines[slot_index] = 0
                 self.importer.copy_tensor(left, self.left_slot)
                 self.importer.copy_tensor(right, self.right_slot)
                 self.importer.synchronize()
@@ -1009,9 +979,8 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
         self.right_slot = None
         self._extent = None
         self._screen_light_pending = None
-        self._glow_cpu_pending = None
-        self._glow_cpu_rgba = None
         self._release_signaled.clear()
+        self._cuda_release_timelines = []
         self._source_frames.clear()
         self._released_source_frames.clear()
         self._prepared_source_eyes.clear()
@@ -1043,7 +1012,11 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
 
     @staticmethod
     def _external_semaphore_requested() -> bool:
-        value = os.environ.get("D2S_ENABLE_ROCM_EXTERNAL_SEMAPHORE", "auto")
+        # ROCm external binary-semaphore cleanup can leave a dropped frame
+        # waiting forever on some Windows/AMD driver combinations. The
+        # buffer-staging + Vulkan copy path is the stable default; retain an
+        # explicit opt-in for driver/interoperability experiments.
+        value = os.environ.get("D2S_ENABLE_ROCM_EXTERNAL_SEMAPHORE", "0")
         normalized = value.strip().lower()
         if normalized in {"", "auto", "default"}:
             return True
@@ -1061,7 +1034,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
 
     @staticmethod
     def _rocm_glow_vulkan_compute_enabled(context: Any) -> bool:
-        value = os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "0")
+        value = os.environ.get("D2S_ROCM_GLOW_VULKAN_COMPUTE", "1")
         if value.strip().lower() in {"0", "false", "off", "no", "disabled"}:
             return False
         return int(getattr(context, "compute_queue_index", 0) or 0) != 0
@@ -1283,9 +1256,6 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                         "screen_light_sample_path", "vulkan_compute_reduction"
                     )
                 )
-            if "glow_vulkan_image" not in glow_metadata:
-                self._update_glow_cpu_source(glow_source)
-                glow_metadata = {**glow_metadata, **self._glow_cpu_metadata()}
             if len(self._host_eye_slots) <= slot_index:
                 raise RuntimeError("ROCm host eye staging slots are unavailable")
             left_host, right_host = self._host_eye_slots[slot_index]
@@ -1390,9 +1360,6 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                         "screen_light_sample_path", "vulkan_compute_reduction"
                     )
                 )
-            if "glow_vulkan_image" not in glow_metadata:
-                self._update_glow_cpu_source(glow_source)
-                glow_metadata = {**glow_metadata, **self._glow_cpu_metadata()}
             left_ready = None
             right_ready = None
             if not self._eye_buffers:
@@ -1432,8 +1399,9 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                     right_ready,
                     value=self.right_ready_values[slot_index],
                 )
-                # ROCm Windows needs the HIP signal drained before Vulkan
-                # queues its wait, matching the glow worker.
+                # Keep the HIP signal completion explicit before Vulkan queues
+                # its wait; host-side hipMemcpy completion alone does not
+                # establish the cross-API visibility handoff on AMD Windows.
                 self.importer.synchronize()
                 self._rocm_ready_pending.update(
                     ((int(frame_id), 0), (int(frame_id), 1))
@@ -1694,14 +1662,20 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             slot_index = entry[2]
             pending = [
                 semaphores[slot_index].semaphore
-                for eye, semaphores in enumerate((self.left_ready_semaphores, self.right_ready_semaphores))
+                for eye, semaphores in enumerate(
+                    (self.left_ready_semaphores, self.right_ready_semaphores)
+                )
                 if (frame_key, eye) in self._rocm_ready_pending
             ]
-            if pending and not bool(getattr(self.presenter.vulkan, "device_lost", False)):
-                # A dropped frame never reaches prepare_source_for_sampling.
-                # Consume its binary ready signals before that slot is reused.
+            if pending and not bool(
+                getattr(self.presenter.vulkan, "device_lost", False)
+            ):
+                # A dropped frame may never reach prepare_source_for_sampling;
+                # consume its binary ready signals before reusing the slot.
                 timeline = self.presenter.vulkan.submit_on(
-                    "graphics", lambda _command_buffer: None, wait_semaphore=tuple(pending),
+                    "graphics",
+                    lambda _command_buffer: None,
+                    wait_semaphore=tuple(pending),
                 )
                 self.presenter.vulkan.wait_for_timeline(timeline)
         self._rocm_ready_pending.difference_update(((frame_key, 0), (frame_key, 1)))
@@ -2052,7 +2026,6 @@ class VulkanZeroCopyOutputAdapter(CudaVulkanOutputAdapter):
         left_slot = self.left_slots[slot_index]
         right_slot = self.right_slots[slot_index]
         try:
-            self._update_glow_cpu_source(rgb)
             if self._compute_backend is None:
                 raise RuntimeError("Vulkan zero-copy Compute backend is unavailable")
             compute_timeline, backend_debug = self._compute_backend.submit_to_images(
@@ -2112,7 +2085,6 @@ class VulkanZeroCopyOutputAdapter(CudaVulkanOutputAdapter):
                 "_vulkan_source_prepare_for_sampling": self.prepare_source_for_sampling,
                 "_vulkan_source_consumer_release": self.release_consumer_frame,
                 "_vulkan_output_release": self.release_output_frame,
-                **self._glow_cpu_metadata(),
             },
             color_space="srgb",
             image_origin="top_left",
@@ -2154,6 +2126,33 @@ class VulkanRuntimeOutputConsumer:
         self.sink = sink
         self.gpu_adapter = gpu_adapter
         self._next_frame_id = 0
+        self._fatal_error_reported = False
+
+    def _handle_sink_error(self, exc: Exception) -> None:
+        """Fail the child closed when the presenter can no longer be trusted."""
+        self.source_stat_inc(
+            "runtime_output_sink_errors",
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+        context = getattr(self.sink, "vulkan", None)
+        fatal = bool(getattr(context, "device_lost", False)) or type(exc).__name__ in {
+            "VkTimeout",
+            "VkNotReady",
+        }
+        if fatal:
+            # A failed release may still own a producer-ring slot. Continuing
+            # would allow the producer to overwrite an image the GPU may be
+            # waiting on. Stop the child and let the normal teardown path
+            # destroy the adapter/context in order.
+            if not self._fatal_error_reported:
+                self._fatal_error_reported = True
+                print(
+                    "[VulkanOutput] presenter synchronization failed; "
+                    "stopping XR child safely: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            self.shutdown_event.set()
 
     def _take_latest(self):
         try:
@@ -2228,6 +2227,12 @@ class VulkanRuntimeOutputConsumer:
         if callable(release):
             release(frame.frame_id)
 
+    def _safe_release_frame(self, frame) -> None:
+        try:
+            self._release_frame(frame)
+        except Exception as exc:
+            self._handle_sink_error(exc)
+
     def run(self) -> None:
         while not self.shutdown_event.is_set():
             if self.sink is not None:
@@ -2248,10 +2253,14 @@ class VulkanRuntimeOutputConsumer:
                 continue
             submit_runtime_result = getattr(self.sink, "submit_runtime_result", None)
             if callable(submit_runtime_result):
-                submit_runtime_result(
-                    runtime_result,
-                    float(capture_timestamp or time.monotonic()),
-                )
+                try:
+                    submit_runtime_result(
+                        runtime_result,
+                        float(capture_timestamp or time.monotonic()),
+                    )
+                except Exception as exc:
+                    self._handle_sink_error(exc)
+                    continue
                 self.source_stat_inc("runtime_output_frames")
                 continue
             frame = self._to_output_frame(item)
@@ -2259,12 +2268,12 @@ class VulkanRuntimeOutputConsumer:
                 continue
             if self.sink is None:
                 self.source_stat_inc("runtime_output_no_sink")
-                self._release_frame(frame)
+                self._safe_release_frame(frame)
                 continue
             try:
                 self.sink.submit_output(frame)
             except Exception as exc:
-                self._release_frame(frame)
+                self._safe_release_frame(frame)
                 self.source_stat_inc(
                     "runtime_output_submit_errors",
                     last_error=f"{type(exc).__name__}: {exc}",

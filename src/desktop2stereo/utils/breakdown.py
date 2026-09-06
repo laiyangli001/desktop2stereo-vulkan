@@ -54,6 +54,7 @@ LATEST_KEYS = {
     "parallel_inference_pending",
     "parallel_inference_dropped",
     "openxr_vulkan_projection_quality_chain_requested",
+    "openxr_vulkan_projection_quality_chain_active",
 }
 
 
@@ -230,6 +231,10 @@ class FPSBreakdown:
                 self.stats["openxr_vulkan_projection_quality_chain_requested"] = int(
                     bool(debug.get("openxr_vulkan_projection_quality_chain_requested", 0))
                 )
+            if "openxr_vulkan_projection_quality_chain_active" in debug:
+                self.stats["openxr_vulkan_projection_quality_chain_active"] = int(
+                    bool(debug.get("openxr_vulkan_projection_quality_chain_active", 0))
+                )
             if "fast_plus_fused_backend" in debug:
                 self.stats["rt_fast_plus_fused_backend"] = str(debug.get("fast_plus_fused_backend"))
             if "fast_plus_fused_skip" in debug:
@@ -285,6 +290,12 @@ class FPSBreakdown:
         async_validation = self._validate_openxr_async_stats(stats)
         async_missing = ",".join(async_validation.missing) or "none"
         async_failed = ",".join(async_validation.failed) or "none"
+        quality_chain_active = bool(
+            stats.get(
+                "openxr_vulkan_projection_quality_chain_active",
+                stats.get("openxr_vulkan_projection_quality_chain_requested", False),
+            )
+        )
 
         print(
             "[FPSBreakdown] "
@@ -324,7 +335,8 @@ class FPSBreakdown:
             f"screen_quad_fallback={rate('openxr_screen_quad_fallback'):.1f} "
             f"vk_composer_requested={int(bool(stats.get('openxr_vulkan_projection_composer_requested', False)))} "
             f"vk_composer_active={int(bool(stats.get('openxr_vulkan_projection_composer_active', False)))} "
-            f"vk_quality_chain={int(bool(stats.get('openxr_vulkan_projection_quality_chain_requested', False)))} "
+            "vk_quality_chain="
+            f"{int(quality_chain_active)} "
             f"vk_composer_frame={int(stats.get('openxr_vulkan_projection_composer_frame_id', -1))} "
             f"vk_composer_fallback={rate('openxr_vulkan_projection_composer_fallback'):.1f} "
             f"vk_rcas={rate('openxr_vulkan_composer_rcas'):.1f} "

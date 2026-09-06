@@ -1538,6 +1538,17 @@ class StereoRuntime:
         self.load()
         self._reset_cuda_peak_if_needed()
         rgb_frame = _validate_runtime_rgb_frame(rgb_frame)
+        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+            import time as _time
+
+            if getattr(self, "_shape_diag_last", 0.0) == 0.0 or (
+                _time.monotonic() - getattr(self, "_shape_diag_last", 0.0)
+            ) > 2.0:
+                self._shape_diag_last = _time.monotonic()
+                print(
+                    "[FrameShape] rgb_frame=" + str(tuple(rgb_frame.shape)),
+                    flush=True,
+                )
 
         cuda_events: dict[str, Any] = {}
         _record_cuda_event(cuda_events, "start", rgb_frame)
@@ -1661,10 +1672,13 @@ class StereoRuntime:
                     _record_cuda_event(cuda_events, "openxr_render", rgb_frame)
                 elif _is_triton_stereo_compute_backend(self._resolve_stereo_compute_backend(output_rgb)):
                     render_start = time.perf_counter()
-                    if output_quality_requires_eye_images(
-                        openxr_stereo_config,
-                        int(output_rgb.shape[-1]),
-                        int(output_rgb.shape[-2]),
+                    if (
+                        not os.environ.get("D2S_OPENXR_NO_EYE_QUALITY")
+                        and output_quality_requires_eye_images(
+                            openxr_stereo_config,
+                            int(output_rgb.shape[-1]),
+                            int(output_rgb.shape[-2]),
+                        )
                     ):
                         no_fill_fused = None
                         no_fill_fused_reason = "common_output_quality_requires_eyes"
@@ -1679,6 +1693,8 @@ class StereoRuntime:
                         synthesis_left, synthesis_right, fused_debug = no_fill_fused
                         left_eye = synthesis_left
                         right_eye = synthesis_right
+                        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+                            print("[FrameShape] branch=no_fill_fused eye=" + str(tuple(left_eye.shape)), flush=True)
                         if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                             left_eye, right_eye = right_eye, left_eye
                         output_format = "openxr_eye_views"
@@ -1705,6 +1721,8 @@ class StereoRuntime:
 
                         left_eye = triton_stereo.left_eye
                         right_eye = triton_stereo.right_eye
+                        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+                            print("[FrameShape] branch=synthesize eye=" + str(tuple(left_eye.shape)), flush=True)
                         output_format = "openxr_eye_views"
                         render_backend = dict(triton_stereo.debug_info)
                         render_backend["sbs_backend"] = "openxr_triton_eyes_only"
@@ -1741,11 +1759,14 @@ class StereoRuntime:
                     right_eye = openxr.right_eye
                     if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                         left_eye, right_eye = right_eye, left_eye
-                    left_eye, right_eye, quality_debug = apply_output_quality(
-                        left_eye,
-                        right_eye,
-                        openxr_stereo_config,
-                    )
+                    if not os.environ.get("D2S_OPENXR_NO_EYE_QUALITY"):
+                        left_eye, right_eye, quality_debug = apply_output_quality(
+                            left_eye,
+                            right_eye,
+                            openxr_stereo_config,
+                        )
+                    else:
+                        quality_debug = {"output_quality_mode": "skipped_openxr_env"}
                     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye)
                     if _openxr_runtime_output_uint8_enabled():
                         packed_left, left_pack_backend = _pack_openxr_eye_rgba_u8_with_backend(left_eye)
@@ -1852,6 +1873,19 @@ class StereoRuntime:
                 flush=True,
             )
 
+        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+            import time as _time
+
+            if getattr(self, "_shape_diag_last_out", 0.0) == 0.0 or (
+                _time.monotonic() - getattr(self, "_shape_diag_last_out", 0.0)
+            ) > 2.0:
+                self._shape_diag_last_out = _time.monotonic()
+                print(
+                    "[FrameShape] eye_out=" + str(tuple(left_eye.shape))
+                    + " src=" + str(tuple(source_rgb.shape))
+                    + " ofmt=" + str(debug.get("runtime_output_format")),
+                    flush=True,
+                )
         return OpenXRRuntimeResult(
             depth=depth,
             left_eye=left_eye,

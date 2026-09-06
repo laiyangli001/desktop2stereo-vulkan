@@ -209,21 +209,21 @@ def _rgba_u8(value):
 def _sample_two_layers(rgb, channel, y, x, shift, scale0, scale1, width: tl.constexpr, pixels: tl.constexpr, active, w0, w1):
     x0 = x + shift * scale0
     x1 = x + shift * scale1
-    v0 = _sample_reflection_linear(rgb, channel, y, x0, width, pixels, active)
-    v1 = _sample_reflection_linear(rgb, channel, y, x1, width, pixels, active)
+    v0 = _sample_border_linear(rgb, channel, y, x0, width, pixels, active)
+    v1 = _sample_border_linear(rgb, channel, y, x1, width, pixels, active)
     return v0 * w0 + v1 * w1
 
 
 @triton.jit
-def _sample_reflection_linear(rgb, channel, y, sample_x, width: tl.constexpr, pixels: tl.constexpr, active):
-    right_edge = width - 1.0
-    x_reflected = tl.where(sample_x < 0.0, -sample_x, sample_x)
-    x_reflected = tl.where(x_reflected > right_edge, 2.0 * right_edge - x_reflected, x_reflected)
-    x_reflected = tl.minimum(tl.maximum(x_reflected, 0.0), right_edge)
-    x0_float = tl.floor(x_reflected)
+def _sample_border_linear(rgb, channel, y, sample_x, width: tl.constexpr, pixels: tl.constexpr, active):
+    # Reflection mirrors the source at both boundaries and turns a displaced
+    # edge into a visible second edge.  Border sampling extends the nearest
+    # real pixel without introducing that mirrored geometry.
+    x_clamped = tl.minimum(tl.maximum(sample_x, 0.0), width - 1.0)
+    x0_float = tl.floor(x_clamped)
     x0 = x0_float.to(tl.int64)
     x1 = tl.minimum(x0 + 1, width - 1)
-    frac = x_reflected - x0_float
+    frac = x_clamped - x0_float
     base = channel * pixels + y * width
     v0 = tl.load(rgb + base + x0, mask=active, other=0.0)
     v1 = tl.load(rgb + base + x1, mask=active, other=0.0)

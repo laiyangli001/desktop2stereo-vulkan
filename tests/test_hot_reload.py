@@ -92,11 +92,13 @@ def test_hot_reload_value_snapshot_parses_expected_fields():
         "Show FPS": "yes",
         "Display Fit Mode": "cover",
         "Audio Delay": "0.25",
+        "Language": "CN",
     }
 
     values = hot_reload_value_snapshot(settings, config)
 
     assert values["depth_strength"] == 1.25
+    assert values["language"] == "CN"
     assert values["presentation_flags"] == {
         "show_fps": True,
         "display_fit_mode": "cover",

@@ -4,16 +4,22 @@ import threading
 from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 from path_config import APP_ROOT
 
 from path_config import APP_ROOT
 
 from capture.types import CapturedFrame
+from stereo_runtime.render_size import RenderSizeConfig
 
 from stereo_runtime.pipeline import (
     _ParallelDepthScheduler,
     _prepare_frame_input,
     RuntimePipelineLoop,
+    _resolve_pipeline_render_size,
+    _unpack_raw_queue_item,
     _enable_openxr_depth_cuda_graph_if_needed,
     _motion_sample,
     _motion_score,
@@ -22,7 +28,38 @@ from stereo_runtime.pipeline import (
     _runtime_motion_gate_enabled,
     _runtime_pending_depth_limit,
     _runtime_parallel_adaptive_backoff_enabled,
+    _cuda_event_ready,
 )
+
+
+def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
+    captured = CapturedFrame(
+        frame=np.zeros((1200, 1920, 3), dtype=np.uint8),
+        target_height=2160,
+        timestamp=1.0,
+        capture_size=(1920, 1200),
+    )
+    _frame, source_size, _timestamp, _captured = _unpack_raw_queue_item(captured)
+    config = RenderSizeConfig(scale_factor="4K / 100%")
+
+    assert source_size == (1920, 1200)
+    assert _resolve_pipeline_render_size(source_size, config) == (1920, 1200)
+
+
+@pytest.mark.parametrize(
+    ("source_size", "scale", "expected"),
+    [
+        ((1920, 1200), "4K / 100%", (1920, 1200)),
+        ((3840, 2160), "4K / 100%", (3840, 2160)),
+        ((3840, 2160), "1K / 50%", (1920, 1080)),
+        ((3840, 2400), "1K / 50%", (1920, 1200)),
+    ],
+)
+def test_scaled_render_size_preserves_source_aspect_ratio(source_size, scale, expected):
+    assert _resolve_pipeline_render_size(
+        source_size,
+        RenderSizeConfig(scale_factor=scale),
+    ) == expected
 
 
 def test_save_preprocess_image_diagnostic_exports_exact_pre_inference_rgb(tmp_path):
@@ -266,6 +303,24 @@ def test_pending_cuda_retains_latest_raw_frame(monkeypatch):
     assert stats == ["runtime_pending_cuda_inflight"]
     assert breakdown == ["runtime_pending_cuda_inflight"]
     assert sleeps == [0.001]
+
+
+def test_cuda_ready_event_uses_gpu_waitable_event(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: False)
+
+    assert _cuda_event_ready(event) is True
+
+
+def test_rocm_ready_event_keeps_query_pending_path(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", "7.0", raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: False)
+
+    assert _cuda_event_ready(event) is False
 
 
 def _dual_pending_context(

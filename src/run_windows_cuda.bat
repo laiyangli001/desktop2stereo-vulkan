@@ -4,7 +4,7 @@ cls
 title Desktop2Stereo
 set "SRC_DIR=%~dp0"
 set "APP_DIR=%SRC_DIR%desktop2stereo"
-set "PYTHON_EXE=%SRC_DIR%python3\python.exe"
+set "PYTHON_EXE=%SRC_DIR%python3_cuda\python.exe"
 set "LOG_DIR=%APP_DIR%\logs"
 set "GUI_READY_FILE=%LOG_DIR%\gui_ready.flag"
 set "LAUNCH_STDOUT=%LOG_DIR%\launcher_stdout.log"

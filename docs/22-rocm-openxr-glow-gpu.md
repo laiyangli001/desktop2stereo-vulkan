@@ -1,12 +1,10 @@
 # AMD ROCm OpenXR glow GPU path
 
-Glow generation stays in torch on the AMD GPU. The small RGBA8 result is
-transferred HIP -> host -> Vulkan into an optimal-tiling image. Direct HIP
-writes into Vulkan-imported image memory make the AMD driver lose the Vulkan
+Glow generation uses the Vulkan compute backend on the AMD GPU. HIP writes only
+exported staging buffers; Vulkan then produces the sampled glow image. Direct
+HIP writes into Vulkan-imported image memory make the AMD driver lose the Vulkan
 device under sustained OpenXR compositing (Virtual Desktop's OpenXR log reports
-`VkStatus failure [-4]` at `xrEndFrame`); the 320x180 glow payload is tiny, so
-host staging avoids that driver fault while keeping the GPU computation path.
-NVIDIA's implementation is unchanged.
+`VkStatus failure [-4]` at `xrEndFrame`). NVIDIA's implementation is unchanged.
 
 ## Ownership and synchronization
 
@@ -50,3 +48,15 @@ Host staging passed a 36-frame real-GPU handoff with exact Vulkan readback.
 AMD clears this legacy diagnostic automatically and keeps an explicit AMD-only
 `D2S_ROCM_DISABLE_GLOW_DRAW=1` switch; restart any launcher that inherited the
 old setting.
+
+## VDXR stability defaults
+
+The normal ROCm OpenXR path keeps the selected GPU Filament controller model
+and GPU tool-quad menu visible. For A/B diagnosis, set
+`D2S_ROCM_DISABLE_OPENXR_OVERLAYS=1`; this selects the Vulkan controller proxy
+and disables tool-quad swapchains. The isolation mode avoids the optional
+controller/composition paths while investigating AMD device-loss or stale
+layer failures. If an inherited launch environment still sets the isolation
+flag, `D2S_ROCM_ENABLE_OPENXR_OVERLAYS=1` explicitly restores the GPU controller
+callout and controller-anchored tool panels. The projection quality allocation
+remains disabled by default on ROCm; enable it explicitly only for testing.

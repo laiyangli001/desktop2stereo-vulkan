@@ -23,7 +23,7 @@
   "glow_shell_radius": 20.0,
   "glow_shell_height": 9.5,
   "veil_intensity": 1.35,
-  "veil_alpha": 0.4,
+  "veil_alpha": 1.0,
   "lighting_preset_index": 0,
   "lighting_presets": [
     {
@@ -58,7 +58,7 @@
       "glow_intensity_multiplier": 1.85,
       "glow_shell_intensity_multiplier": 0.0,
       "veil_intensity": 1.35,
-      "veil_alpha": 0.4
+      "veil_alpha": 1.0
     }
   ],
   "controller_hdr_lighting": false,

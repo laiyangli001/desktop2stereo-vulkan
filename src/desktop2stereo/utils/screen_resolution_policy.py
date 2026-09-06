@@ -25,6 +25,8 @@ class ScreenSamplingPlan:
     filter_scale: float
     upscale_scale: float
     mode: str
+    quality_width: int | None = None
+    quality_height: int | None = None
 
     @property
     def source_texel_size(self) -> tuple[float, float]:
@@ -36,6 +38,12 @@ class ScreenSamplingPlan:
             f"input_{self.input_tier_k}k->headset_{self.recommended_headset_tier_k}k "
             f"selected={self.headset_tier_k}k effective={self.effective_tier_k}k"
         )
+
+    @property
+    def quality_size(self) -> tuple[int, int] | None:
+        if self.quality_width is None or self.quality_height is None:
+            return None
+        return self.quality_width, self.quality_height
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,4 +151,63 @@ def build_screen_sampling_plan(
         filter_scale=filter_scale,
         upscale_scale=upscale_scale,
         mode=mode,
+    )
+
+
+def build_projection_screen_sampling_plan(
+    source_width: int,
+    source_height: int,
+    footprint_width: float,
+    footprint_height: float,
+    *,
+    oversample: float = 1.0,
+) -> ScreenSamplingPlan:
+    """Choose one GPU quality image from the visible OpenXR screen footprint.
+
+    Unlike the legacy tier matrix, this uses the actual projected screen size
+    in the eye swapchain.  The result remains source-aspect-correct and is
+    deliberately quantized to even dimensions for Vulkan image allocation.
+    """
+    width = int(source_width)
+    height = int(source_height)
+    if width <= 0 or height <= 0:
+        raise ValueError("source resolution must be positive")
+    footprint_width = float(footprint_width)
+    footprint_height = float(footprint_height)
+    if footprint_width <= 0.0 or footprint_height <= 0.0:
+        raise ValueError("screen footprint must be positive")
+    oversample = max(1.0, float(oversample))
+    aspect = width / float(height)
+    quality_width = max(16, int(round(footprint_width * oversample)) & ~1)
+    # Width is authoritative so a curved/oblique projection cannot introduce
+    # a second aspect-ratio conversion in the quality pass.
+    quality_height = max(16, int(round(quality_width / aspect)) & ~1)
+    scale = quality_width / float(width)
+    input_tier = classify_input_resolution(width, height)
+    if scale > 1.01:
+        mode = "upscale_easu"
+        upscale_scale = scale
+        filter_scale = 1.0
+    elif scale < 0.99:
+        mode = "downsample_lanczos_rcas"
+        upscale_scale = 1.0
+        filter_scale = 1.0 / max(scale, 1e-6)
+    else:
+        mode = "native_mip"
+        upscale_scale = 1.0
+        filter_scale = 1.0
+        quality_width = width
+        quality_height = height
+    return ScreenSamplingPlan(
+        source_width=width,
+        source_height=height,
+        input_tier_k=input_tier,
+        headset_tier_k=0,
+        recommended_headset_tier_k=0,
+        effective_tier_k=0,
+        filter_scale=filter_scale,
+        upscale_scale=upscale_scale,
+        mode=mode,
+        quality_width=quality_width,
+        quality_height=quality_height,
     )

@@ -240,14 +240,20 @@ def presentation_blit_regions(
 
         if mode == "contain":
             half_w, half_h = (tw // 2, th) if is_sbs else (tw, th // 2)
-            # Fit the ENCODED (packed) eye into each half. The destination rect
-            # then always has the same aspect as the source crop, so the blit
-            # scales uniformly and the eye content can never be distorted --
-            # even when a startup-captured input_size goes stale (window or
-            # monitor resized mid-stream). With the transport canvas derived
-            # from the packed frame, this is exactly the legacy fill_16_9
-            # pad-then-place geometry (identity 1:1 placement + bars).
-            x, y, w, h = fit_rect(encoded_eye_size, (half_w, half_h))
+            # Mirror the local viewer exactly: derive the per-eye fit size from
+            # the original capture (tex_w,tex_h) so the left/right AOI keeps the
+            # input frame's ratio (Half modes halve the packed width / TAB
+            # height, Full modes keep the full eye). Only fall back to the
+            # encoded (packed) eye when no input_size is available.
+            if input_size is not None:
+                iw, ih = input_size
+                if is_sbs:
+                    eye_fit_size = (max(1, iw // 2), ih) if is_half else (iw, ih)
+                else:
+                    eye_fit_size = (iw, max(1, ih // 2)) if is_half else (iw, ih)
+            else:
+                eye_fit_size = encoded_eye_size
+            x, y, w, h = fit_rect(eye_fit_size, (half_w, half_h))
             if is_sbs:
                 left_dest = (x, y, x + w, y + h)
                 right_dest = (half_w + x, y, half_w + x + w, y + h)

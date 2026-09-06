@@ -13,7 +13,9 @@ from viewer.vulkan_local_viewer import (
     choose_present_mode,
     choose_srgb_surface_format,
     capture_refresh_warning_needed,
+    configure_glfw_taskbar_icon,
     configure_glfw_window_hints,
+    configure_taskbar_window_style,
     direct_display_capability,
     display_refresh_warning_needed,
     full_screen_exclusive_capability,
@@ -286,6 +288,57 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     assert glfw.hints[glfw.DECORATED] == glfw.TRUE
     assert glfw.hints[glfw.FLOATING] == glfw.FALSE
     assert glfw.hints[glfw.FOCUS_ON_SHOW] == glfw.TRUE
+
+
+def test_taskbar_window_style_can_show_or_hide_the_vulkan_viewer() -> None:
+    base_style = 0x00000008 | 0x08000000
+
+    hidden_style = configure_taskbar_window_style(
+        base_style, show_taskbar_button=False
+    )
+    assert hidden_style & 0x00000080
+    assert not hidden_style & 0x00040000
+
+    visible_style = configure_taskbar_window_style(
+        base_style, show_taskbar_button=True
+    )
+    assert not visible_style & 0x00000080
+    assert visible_style & 0x00040000
+
+
+def test_lsfg_taskbar_window_uses_desktop2stereo_icon(monkeypatch) -> None:
+    monkeypatch.setattr(
+        local_viewer_module,
+        "load_glfw_window_icons",
+        lambda: ("icon16", "icon32"),
+    )
+    calls = []
+
+    class FakeGlfw:
+        @staticmethod
+        def set_window_icon(window, count, icons):
+            calls.append((window, count, icons))
+
+    assert configure_glfw_taskbar_icon(
+        FakeGlfw(),
+        "viewer-window",
+        show_taskbar_button=True,
+    )
+    assert calls == [("viewer-window", 2, ("icon16", "icon32"))]
+
+
+def test_hidden_taskbar_window_does_not_apply_an_icon(monkeypatch) -> None:
+    monkeypatch.setattr(
+        local_viewer_module,
+        "load_glfw_window_icons",
+        lambda: (_ for _ in ()).throw(AssertionError("should not load icon")),
+    )
+
+    assert not configure_glfw_taskbar_icon(
+        object(),
+        "viewer-window",
+        show_taskbar_button=False,
+    )
 
 
 def test_local_viewer_reports_unorm_surface_fallback() -> None:

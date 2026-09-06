@@ -11,6 +11,34 @@ from app_runtime.runtime_output import (
 )
 
 
+def test_cuda_runtime_ready_event_uses_gpu_wait_without_host_sync():
+    waits = []
+    event = SimpleNamespace(wait=lambda: waits.append("gpu"))
+    adapter = object.__new__(CudaVulkanOutputAdapter)
+    adapter.backend_name = "cuda"
+
+    adapter._wait_for_runtime_cuda_event(
+        SimpleNamespace(cuda_ready_event=event),
+        SimpleNamespace(device=None),
+    )
+
+    assert waits == ["gpu"]
+
+
+def test_rocm_runtime_ready_event_is_not_touched_by_cuda_wait():
+    waits = []
+    event = SimpleNamespace(wait=lambda: waits.append("unexpected"))
+    adapter = object.__new__(CudaVulkanOutputAdapter)
+    adapter.backend_name = "rocm"
+
+    adapter._wait_for_runtime_cuda_event(
+        SimpleNamespace(cuda_ready_event=event),
+        SimpleNamespace(device=None),
+    )
+
+    assert waits == []
+
+
 def test_cuda_consumer_release_discards_cpu_lease_after_device_loss():
     calls = []
 
@@ -118,6 +146,62 @@ def test_cuda_consumer_release_without_prepared_eyes_needs_no_semaphore_slots():
     assert adapter._released_source_frames == {7}
 
 
+def test_cuda_synchronized_copy_tracks_vulkan_release_timeline():
+    released = []
+    submissions = []
+
+    class Context:
+        device_lost = False
+
+        @staticmethod
+        def release_external_image_from_sampling(resource, **kwargs):
+            submissions.append((resource, kwargs))
+            return 40 if resource == "left" else 42
+
+    adapter = object.__new__(CudaVulkanOutputAdapter)
+    adapter.backend_name = "cuda"
+    adapter.presenter = SimpleNamespace(vulkan=Context())
+    adapter._released_source_frames = set()
+    adapter._prepared_source_eyes = {(7, 0), (7, 1)}
+    adapter._release_signaled = set()
+    adapter._cuda_release_timelines = [0]
+    adapter.left_release_semaphores = []
+    adapter.right_release_semaphores = []
+    adapter._source_frames = {
+        7: (
+            SimpleNamespace(resource="left"),
+            SimpleNamespace(resource="right"),
+            0,
+        )
+    }
+    adapter.release_frame = released.append
+
+    adapter.release_consumer_frame(
+        7,
+        ("left-wait", "right-wait"),
+        wait_for_timeline=39,
+    )
+
+    assert adapter._cuda_release_timelines == [42]
+    assert released == [7]
+    assert submissions == [
+        (
+            "left",
+            {
+                "wait_for_timeline": 39,
+                "wait_semaphore": "left-wait",
+            },
+        ),
+        (
+            "right",
+            {
+                "wait_for_timeline": 39,
+                "wait_semaphore": "right-wait",
+            },
+        ),
+    ]
+
+
 def test_screen_light_sample_completion_is_non_blocking_and_clamped():
     adapter = CudaVulkanOutputAdapter(None)
     adapter._screen_light_pending = (
@@ -217,3 +301,32 @@ def test_consumer_dispatches_raw_result_to_presenter_without_local_conversion():
 
     assert calls == [(runtime_result, 3.5)]
     assert "runtime_output_frames" in stats
+
+
+def test_consumer_stops_cleanly_when_presenter_release_times_out():
+    runtime_q = queue.Queue(maxsize=1)
+    shutdown = threading.Event()
+    stats = []
+
+    class PresenterSink:
+        output_ready = True
+        vulkan = SimpleNamespace(device_lost=True)
+
+        @staticmethod
+        def submit_runtime_result(_result, _timestamp):
+            raise RuntimeError("VkTimeout: timeline wait expired")
+
+    runtime_q.put((SimpleNamespace(left_eye="cuda-left", right_eye="cuda-right"), 1.0))
+    consumer = VulkanRuntimeOutputConsumer(
+        runtime_q=runtime_q,
+        shutdown_event=shutdown,
+        source_stat_inc=lambda name, amount=1, **values: stats.append((name, amount, values)),
+        sink=PresenterSink(),
+    )
+    worker = threading.Thread(target=consumer.run)
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert shutdown.is_set()
+    assert any(name == "runtime_output_sink_errors" for name, _amount, _values in stats)

@@ -24,7 +24,20 @@ def test_glow_pass_contract_is_fixed_rgba_target() -> None:
 
     assert effect_pass.group_counts == (40, 23, 1)
     assert effect_pass.input_buffer_size(3840, 2160) == 3840 * 2160 * 12
-    assert effect_pass.PUSH_CONSTANTS_SIZE == 32
+    assert effect_pass.PUSH_CONSTANTS_SIZE == 64
+
+
+def test_glow_input_capacity_covers_monitor_aspect_changes() -> None:
+    assert VulkanGlowSourceComputeBackend.INPUT_BUFFER_CAPACITY == 512 * 512 * 3 * 4
+
+
+def test_glow_source_crop_normalization_keeps_a_valid_inner_rectangle() -> None:
+    assert VulkanGlowSourceComputeBackend._normalize_source_crop_uv(
+        (0.1, 0.2, 0.8, 0.6)
+    ) == (0.1, 0.2, 0.8, 0.6)
+    assert VulkanGlowSourceComputeBackend._normalize_source_crop_uv(
+        (float("nan"), 0.0, 1.0, 1.0)
+    ) == (0.0, 0.0, 1.0, 1.0)
 
 
 def test_glow_fence_poll_handles_pyvulkan_not_ready_exception() -> None:
@@ -63,7 +76,7 @@ def test_glow_poll_short_circuits_after_device_loss() -> None:
     backend.poll()
 
 
-def test_glow_queue_submit_uses_vulkan_context_lock() -> None:
+def test_glow_queue_submit_uses_dedicated_lock() -> None:
     class TrackingLock:
         held = False
 
@@ -84,12 +97,25 @@ def test_glow_queue_submit_uses_vulkan_context_lock() -> None:
 
     backend = object.__new__(VulkanGlowSourceComputeBackend)
     backend.context = SimpleNamespace(_lock=lock)
+    backend._submit_lock = lock
     backend.vk = Vk()
 
     backend._submit_queue("queue", 1, ["submit"], "fence")
 
     assert submissions == [("queue", 1, ["submit"], "fence")]
     assert not lock.held
+
+
+def test_glow_input_wait_is_backend_specific() -> None:
+    backend = object.__new__(VulkanGlowSourceComputeBackend)
+    backend.vk = SimpleNamespace(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT=32)
+    semaphore = object()
+
+    backend._rocm_interop = False
+    assert backend._input_ready_wait(semaphore) == ((semaphore,), (32,))
+
+    backend._rocm_interop = True
+    assert backend._input_ready_wait(semaphore) == ((), ())
 
 
 def test_glow_frame_lease_is_counted_once_and_released() -> None:
@@ -134,6 +160,8 @@ def test_glow_shader_and_spirv_are_checked_in_together() -> None:
     assert "srgb_to_linear" in source
     assert "vec2(output_uv.x, 1.0 - output_uv.y)" in source
     assert "uint surround_region_average;" in source
+    assert "vec4 source_crop;" in source
+    assert "detect_letterbox_crop" in source
     assert "vec2 grid = vec2(8.0, 6.0);" in source
     assert "float edge_band_pixels = clamp(" in source
     assert "/ 270.0)" in source

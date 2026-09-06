@@ -1,7 +1,7 @@
 Capture Mode: Monitor
-Monitor Index: 1
+Monitor Index: 2
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\9&1ce1d36&2&UID1540
+  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61698
   name: D270H
   manufacturer: TUP
   model: D270H
@@ -11,7 +11,7 @@ Monitor Identity:
   width: 3840
   height: 2160
 Window Title: ''
-Show FPS: false
+Show FPS: true
 Model List:
   Distill-Any-Depth-Small:
     resolutions:
@@ -475,30 +475,30 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Base
+Depth Model: Distill-Any-Depth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 518
+Depth Resolution: 336
 Anti-aliasing: 0
 Depth Antialias Strength: 0.0
 Depth Pop: 0.0
-Foreground Pop: 1.15
-Midground Pop: 1.05
-Background Pop: 1.05
-Depth Separation Preset: standard
+Foreground Pop: 1.0
+Midground Pop: 1.0
+Background Pop: 1.0
+Depth Separation Preset: default
 Convergence: 0.0
 Dynamic Convergence: false
 Dynamic Convergence Strength: 0.0
-Stereo Preset: cinema
-Stereo Quality: quality_4k
+Stereo Preset: traditional_fastest
+Stereo Quality: fast
 Stereo Compute Backend: auto
 Parallax Budget Preset: standard
 Temporal: false
 Temporal Strength: 0.0
 Auto Scene Reset: true
 Scene Reset Threshold: 0.22
-Edge Dilation: 1
-Mask Feather Radius: 1
+Edge Dilation: 0
+Mask Feather Radius: 0
 Hole Fill Mode: none
 Hole Fill Radius: 0
 Hole Fill Strength: 0.0
@@ -517,19 +517,19 @@ Vulkan Projection MIP LOD Bias: -0.35
 Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
-torch.compile: false
-TensorRT: null
+torch.compile: true
+TensorRT: true
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: true
+MIGraphX: null
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
 Language: EN
-Run Mode: OpenXR Link
+Run Mode: Local Viewer
 XR Headset Model: Meta Quest 2
 XR Preview Window: false
 VSync: false
@@ -538,6 +538,8 @@ Target FPS: 0
 Processing Resolution: Auto
 Render Size Policy: scaled
 Render Scale: 4K / 100%
+XR Render: 1.0
+XR Render Mode: auto
 Render Fixed Width: 1920
 Render Fixed Height: 1080
 Render Max Pixels: 8294400
@@ -561,23 +563,126 @@ Controller Model: QUEST
 Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
-Capture Tool: WindowsCaptureROCm
+LSFG Support: false
+Capture Tool: WindowsCaptureCUDA
 Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
 Stereo Output: 1
 Stereo Output Identity:
-  stable_id: DISPLAY\TUP0270\9&1ce1d36&2&UID1540
-  name: D270H
-  manufacturer: TUP
-  model: D270H
-  serial: '808728147'
-  left: 0
+  stable_id: DISPLAY\DELF017\7&314d3634&4&UID61700
+  name: Dell U2410(DP)
+  manufacturer: DEL
+  model: DELL U2410
+  serial: J257M0CR0TUL
+  left: 3840
   top: 0
-  width: 3840
-  height: 2160
+  width: 1920
+  height: 1200
 Show Log Panel: true
 Input Display Resolution Tier: 4K
-Synthetic View: quality_4k
+Synthetic View: fast
 OpenVINO: null
+OpenXR Screen States:
+  Default:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.9375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_lakesky:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  3d_home:
+    position:
+    - -1.9610674132102057
+    - 102.81677697013133
+    - 17.986561814634758
+    width: 24.528489980622957
+    height: 13.797275614100434
+    rotation_deg:
+    - 179.917460207701
+    - 5.415848201963977
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_aurora:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  3d_theater:
+    position:
+    - 0.0
+    - 1.5344
+    - 3.8504
+    width: 5.3075
+    height: 2.98546875
+    rotation_deg:
+    - -180.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_skycloud:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+OpenXR Render Scale: 1.24
+OpenXR Glow Modes:
+  Default: 'off'
+OpenXR Glow Transparency:
+  Default: 0.0

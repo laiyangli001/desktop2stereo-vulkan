@@ -5,6 +5,7 @@ from dataclasses import replace
 import inspect
 import json
 import math
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ import xr
 
 from app_runtime.output_contract import VulkanStereoOutputFrame
 from xr_viewer import core_input_helpers
+from xr_viewer import core_openxr_vulkan
 from xr_viewer.core_input_helpers import CoreInputHelpersMixin
 from viewer.vulkan_context import (
     ImageState,
@@ -309,6 +311,7 @@ def test_swapchain_color_mode_rejects_unknown_value() -> None:
 def test_render_scale_is_bounded_by_runtime_limit() -> None:
     assert _scaled_dimension(1000, 1200, 0.5) == 500
     assert _scaled_dimension(1000, 1200, 2.0) == 1200
+    assert _scaled_dimension(1000, 5000, 4.0) == 4000
     assert _scaled_dimension(1, 1, 0.1) == 1
 
 
@@ -338,6 +341,116 @@ def test_projection_swapchains_use_runtime_recommendation_times_render_scale() -
     assert created == [(1500, 1200), (1350, 1050)]
 
 
+def test_projection_pass_is_precreated_with_panorama_support(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter.config = replace(presenter.config, filament_panorama_path="test-panorama.hdr")
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=900,
+            recommended_image_rect_height=700,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = object()
+    presenter.swapchain_format = 43
+    presenter._create_projection_swapchain = lambda *_args, **_kwargs: SimpleNamespace()
+    created = []
+
+    def create_projection_pass(
+        context, target_format, *, enable_panorama, panorama_required
+    ):
+        created.append((context, target_format, enable_panorama, panorama_required))
+        return SimpleNamespace(panorama_enabled=enable_panorama)
+
+    monkeypatch.setattr(
+        core_openxr_vulkan, "VulkanProjectionScreenPass", create_projection_pass
+    )
+    monkeypatch.setattr(presenter, "_is_rocm_backend", lambda: False)
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert created == [(presenter.vulkan, 43, True, False)]
+
+
+def test_default_environment_skips_optional_nvidia_panorama_pipeline(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=900,
+            recommended_image_rect_height=700,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = object()
+    presenter.swapchain_format = 43
+    presenter._create_projection_swapchain = lambda *_args, **_kwargs: SimpleNamespace()
+    created = []
+
+    def create_projection_pass(
+        context, target_format, *, enable_panorama, panorama_required
+    ):
+        created.append((context, target_format, enable_panorama, panorama_required))
+        return SimpleNamespace(panorama_enabled=enable_panorama)
+
+    monkeypatch.setattr(
+        core_openxr_vulkan, "VulkanProjectionScreenPass", create_projection_pass
+    )
+    monkeypatch.setattr(presenter, "_is_rocm_backend", lambda: False)
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert created == [(presenter.vulkan, 43, False, False)]
+
+
+def test_rocm_keeps_required_panorama_pipeline_with_native_equirect(monkeypatch) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._view_configuration_views = (
+        SimpleNamespace(
+            recommended_image_rect_width=1000,
+            recommended_image_rect_height=800,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+        SimpleNamespace(
+            recommended_image_rect_width=900,
+            recommended_image_rect_height=700,
+            max_image_rect_width=1800,
+            max_image_rect_height=1400,
+        ),
+    )
+    presenter.vulkan = object()
+    presenter.swapchain_format = 43
+    presenter._openxr_equirect_supported = True
+    presenter._create_projection_swapchain = lambda *_args, **_kwargs: SimpleNamespace()
+    created = []
+
+    def create_projection_pass(
+        context, target_format, *, enable_panorama, panorama_required
+    ):
+        created.append((context, target_format, enable_panorama, panorama_required))
+        return SimpleNamespace(panorama_enabled=enable_panorama)
+
+    monkeypatch.setattr(presenter, "_is_rocm_backend", lambda: True)
+    monkeypatch.setattr(
+        core_openxr_vulkan, "VulkanProjectionScreenPass", create_projection_pass
+    )
+    presenter._create_projection_swapchains_for_scale(1.0)
+
+    assert created == [(presenter.vulkan, 43, True, True)]
+
+
 def test_presenter_validates_configuration() -> None:
     with pytest.raises(ValueError):
         OpenXrVulkanPresenter(OpenXrVulkanConfig(render_scale=0))
@@ -348,7 +461,7 @@ def test_openxr_defaults_to_validated_srgb_projection_target() -> None:
     assert config.swapchain_color_mode == "srgb"
     assert config.clear_color == (0.0, 0.0, 0.0, 1.0)
     assert config.controller_model == "PICO"
-    assert config.controller_guide_max_distance == pytest.approx(0.4)
+    assert config.controller_guide_max_distance == pytest.approx(1.0)
     assert config.headset_model == "Pico 4 / 4 Ultra"
 
 
@@ -388,7 +501,7 @@ def test_controller_guide_pose_hides_beyond_headset_distance() -> None:
     assert pose[1] == pytest.approx((0.34, 0.255))
     assert np.linalg.norm(np.asarray(pose[2], dtype=np.float64)) == pytest.approx(1.0)
 
-    presenter._head_position_w[2] = 0.401
+    presenter._head_position_w[2] = 1.001
     assert presenter._controller_guide_pose() is None
 
 
@@ -1036,6 +1149,50 @@ def test_fps_overlay_resolution_uses_live_xr_and_output_sizes() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("capture_size", "render_size", "eye_size", "expected_screen_size"),
+    (
+        ((1920, 1200), "3840x2400", (3840, 2400), (1920, 1200)),
+        ("3840x2160", (1920, 1080), (1920, 1080), (3840, 2160)),
+    ),
+)
+def test_fps_overlay_screen_resolution_prefers_source_capture_size(
+    capture_size, render_size, eye_size, expected_screen_size
+) -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter.swapchains = [SimpleNamespace(width=3648, height=3648)]
+    output_frame = SimpleNamespace(
+        left_eye=SimpleNamespace(width=eye_size[0], height=eye_size[1]),
+        metadata={"capture_size": capture_size, "render_size": render_size},
+    )
+
+    assert presenter._overlay_resolution_sizes(output_frame) == (
+        (3648, 3648),
+        expected_screen_size,
+    )
+
+
+def test_screen_geometry_uses_capture_aspect_over_stale_render_metadata() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 1.6, -2.0),
+        2.4,
+        1.35,
+        (-90.0, 0.0, 0.0),
+    )
+    output_frame = SimpleNamespace(
+        left_eye=SimpleNamespace(width=3840, height=2160),
+        metadata={
+            "capture_size": (1920, 1200),
+            "render_size": (3840, 2160),
+        },
+    )
+
+    presenter._sync_screen_aspect_to_frame(output_frame)
+
+    assert presenter._filament_screen[2] == pytest.approx(1.5)
+
+
 def test_filament_controller_guide_tracks_geometry_and_visibility() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._head_position_w = np.asarray((0.0, 0.0, 0.2), dtype=np.float64)
@@ -1064,7 +1221,7 @@ def test_filament_controller_guide_tracks_geometry_and_visibility() -> None:
     assert np.linalg.norm(matrix[:3, 1]) == pytest.approx(0.255)
     assert np.dot(matrix[:3, 2], presenter._head_position_w - matrix[:3, 3]) > 0.0
 
-    presenter._head_position_w[2] = 0.401
+    presenter._head_position_w[2] = 1.001
     presenter._update_filament_controller_guide(bridge)
     _, visible = bridge.calls[-1]
     assert visible is False
@@ -1103,14 +1260,119 @@ def test_projection_composer_defaults_on_and_can_be_explicitly_disabled(monkeypa
     assert presenter._vulkan_projection_composer_active is False
 
 
-def test_projection_quality_chain_defaults_on_and_can_be_disabled(monkeypatch) -> None:
+def test_filament_multiview_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("D2S_FILAMENT_MULTIVIEW", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    assert presenter._filament_multiview_requested is False
+
+    monkeypatch.setenv("D2S_FILAMENT_MULTIVIEW", "1")
+    presenter = OpenXrVulkanPresenter()
+    assert presenter._filament_multiview_requested is True
+
+
+def test_projection_quality_chain_defaults_to_direct_gpu_and_can_be_enabled(monkeypatch) -> None:
     monkeypatch.delenv("D2S_VULKAN_PROJECTION_QUALITY_CHAIN", raising=False)
+    presenter = OpenXrVulkanPresenter()
+    assert presenter._vulkan_projection_quality_chain_requested is False
+
+    monkeypatch.setenv("D2S_VULKAN_PROJECTION_QUALITY_CHAIN", "1")
     presenter = OpenXrVulkanPresenter()
     assert presenter._vulkan_projection_quality_chain_requested is True
 
-    monkeypatch.setenv("D2S_VULKAN_PROJECTION_QUALITY_CHAIN", "0")
-    presenter = OpenXrVulkanPresenter()
-    assert presenter._vulkan_projection_quality_chain_requested is False
+
+def test_rocm_defaults_to_stable_vulkan_controller_and_no_tool_quads(monkeypatch) -> None:
+    monkeypatch.setattr(
+        OpenXrVulkanPresenter,
+        "_is_rocm_backend",
+        staticmethod(lambda: True),
+    )
+    monkeypatch.delenv("D2S_ROCM_DISABLE_OPENXR_OVERLAYS", raising=False)
+    presenter = OpenXrVulkanPresenter(OpenXrVulkanConfig(controller_model="QUEST"))
+
+    assert presenter._rocm_openxr_stable_path is False
+    assert presenter._vulkan_controller_proxy_enabled is False
+    assert presenter._controller_brand.profile_id == "quest"
+    assert presenter._tool_quads_disabled() is False
+    assert presenter._rocm_projection_quality_chain_enabled is False
+
+
+def test_rocm_overlay_isolation_is_explicit_and_reversible(monkeypatch) -> None:
+    monkeypatch.setattr(
+        OpenXrVulkanPresenter,
+        "_is_rocm_backend",
+        staticmethod(lambda: True),
+    )
+    monkeypatch.setenv("D2S_ROCM_DISABLE_OPENXR_OVERLAYS", "1")
+    presenter = OpenXrVulkanPresenter(OpenXrVulkanConfig(controller_model="QUEST"))
+
+    assert presenter._rocm_openxr_stable_path is True
+    assert presenter._vulkan_controller_proxy_enabled is False
+    presenter._activate_rocm_openxr_stable_path()
+    assert presenter._vulkan_controller_proxy_enabled is True
+    assert presenter._controller_brand.profile_id == "none"
+    assert presenter._tool_quads_disabled() is True
+    assert presenter._rocm_projection_quality_chain_enabled is False
+
+
+def test_rocm_overlay_enable_override_keeps_gpu_tool_quads(monkeypatch) -> None:
+    monkeypatch.setattr(
+        OpenXrVulkanPresenter,
+        "_is_rocm_backend",
+        staticmethod(lambda: True),
+    )
+    monkeypatch.setenv("D2S_ROCM_DISABLE_OPENXR_OVERLAYS", "1")
+    monkeypatch.setenv("D2S_ROCM_ENABLE_OPENXR_OVERLAYS", "1")
+    presenter = OpenXrVulkanPresenter(OpenXrVulkanConfig(controller_model="QUEST"))
+
+    assert presenter._rocm_openxr_stable_path is False
+    assert presenter._vulkan_controller_proxy_enabled is False
+    assert presenter._tool_quads_disabled() is False
+
+
+def test_rocm_tool_quad_startup_can_fit_controller_and_help_panels() -> None:
+    pool = (1024, 1024)
+
+    assert OpenXrVulkanPresenter._tool_quad_precreate_size(
+        "controller_proxy_callout", pool
+    ) == (2048, 1536)
+    assert OpenXrVulkanPresenter._tool_quad_precreate_size(
+        "screen_help", pool
+    ) == (1280, 1536)
+    assert OpenXrVulkanPresenter._tool_quad_precreate_size(
+        "hand_help", pool
+    ) == (2048, 1024)
+
+
+def test_msdf_startup_prewarm_is_rocm_only(monkeypatch) -> None:
+    prewarm_calls = []
+
+    class FakeRenderer:
+        outputs = [object()]
+
+        def __init__(self, _vulkan, _atlas) -> None:
+            pass
+
+        def prewarm_outputs(self, sizes) -> None:
+            prewarm_calls.append(tuple(sizes))
+
+    monkeypatch.setattr(core_openxr_vulkan, "VulkanMsdfQuadRenderer", FakeRenderer)
+    nvidia = OpenXrVulkanPresenter()
+    nvidia.vulkan = object()
+    nvidia._msdf_font_atlas = object()
+    nvidia._rocm_backend = False
+    nvidia._initialize_msdf_quad_renderer()
+
+    assert prewarm_calls == []
+
+    rocm = OpenXrVulkanPresenter()
+    rocm.vulkan = object()
+    rocm._msdf_font_atlas = object()
+    rocm._rocm_backend = True
+    rocm._initialize_msdf_quad_renderer()
+
+    assert prewarm_calls == [
+        ((256, 64), (512, 64), (1024, 64), (512, 256), (1024, 512), (1024, 1024))
+    ]
 
 
 def test_projection_composer_sampling_does_not_mutate_filament_bridge() -> None:
@@ -1164,6 +1426,30 @@ def test_projection_composer_sampling_uses_scaled_2k_eye_texture_not_4k_capture(
     assert plan.mode == "upscale_easu"
 
 
+def test_projection_sampling_uses_openxr_screen_footprint_for_quality_size() -> None:
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(headset_model="Meta Quest 2")
+    )
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0)
+    )
+    presenter._projection_eye_extents = lambda: ((3000, 1688), (3000, 1688))
+    presenter._screen_footprint_pixels = lambda _view, _target: (3000.0, 1687.0)
+    frame = VulkanStereoOutputFrame(
+        frame_id=1,
+        timestamp=0.0,
+        left_eye=SimpleNamespace(width=3840, height=2160),
+        right_eye=SimpleNamespace(width=3840, height=2160),
+        metadata={},
+    )
+
+    plan = presenter._apply_screen_sampling_policy(frame, [object(), object()])
+
+    assert plan is not None
+    assert plan.quality_size == (3000, 1688)
+    assert plan.quality_width > 2048
+
+
 def test_projection_does_not_repeat_the_shared_output_quality_pass() -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
@@ -1184,6 +1470,34 @@ def test_projection_does_not_repeat_the_shared_output_quality_pass() -> None:
     assert plan.mode == "native_mip"
     assert plan.filter_scale == 1.0
     assert plan.upscale_scale == 1.0
+
+
+def test_screen_sampling_log_coalesces_pose_driven_policy_changes(monkeypatch, capsys) -> None:
+    now = [100.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: now[0])
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
+    frame = VulkanStereoOutputFrame(
+        frame_id=1,
+        timestamp=0.0,
+        left_eye=SimpleNamespace(width=1920, height=1080),
+        right_eye=SimpleNamespace(width=1920, height=1080),
+        metadata={"render_size": (1920, 1080)},
+    )
+
+    presenter._apply_screen_sampling_policy(frame)
+    assert "screen sampling policy" in capsys.readouterr().out
+
+    frame.metadata["output_quality_applied"] = 1
+    now[0] = 101.0
+    presenter._apply_screen_sampling_policy(frame)
+    assert capsys.readouterr().out == ""
+
+    now[0] = 102.1
+    presenter._apply_screen_sampling_policy(frame)
+    output = capsys.readouterr().out
+    assert "screen sampling policy" in output
+    assert "mode=native_mip" in output
 
 
 def test_projection_composer_final_pass_samples_completed_quality_mips() -> None:
@@ -1239,6 +1553,15 @@ def test_projection_panorama_survives_live_filament_foreground() -> None:
     assert panorama < foreground < screen
     foreground_block = source[foreground:screen]
     assert "load_target=bool(panorama_timeline)" in foreground_block
+
+
+def test_vulkan_panorama_upload_is_bounded_and_releases_staging() -> None:
+    source = inspect.getsource(OpenXrVulkanPresenter._ensure_vulkan_panorama_source)
+
+    assert "_VULKAN_PANORAMA_MAX_SIDE" in source
+    assert "Image.Resampling.BILINEAR" in source
+    assert "self._vulkan_panorama_staging.close()" in source
+    assert "source={source_w}x{source_h} uploaded={w}x{h}" in source
 
 
 def test_filament_controller_overlay_runs_after_vulkan_composer() -> None:
@@ -1602,7 +1925,6 @@ def test_projection_composer_uses_direct_vulkan_rasterization_in_opaque_runtime(
     assert "use_vulkan_projection_composer = bool(" in source
     assert "self._environment_blend_mode != xr.EnvironmentBlendMode.OPAQUE" not in source
     assert "opaque_runtime_requires_full_projection_background" not in source
-    assert "VulkanProjectionScreenPass" in render_source
     assert ".copy_image(" not in render_source
     assert "_screen_projection_bounds" not in render_source
     assert "Vulkan projection composer active:" in source
@@ -1622,8 +1944,14 @@ def test_projection_pass_reports_creation_stage_and_fallback_traceback() -> None
     assert 'self.creation_stage = "create_screen_pipeline"' in pass_source
     assert 'self.creation_stage = "create_panorama_pipeline"' in pass_source
     assert "if self.panorama_enabled:" in create_source
-    assert "enable_panorama=bool(self.config.filament_panorama_path)" in composer_source
+    assert "Vulkan projection pass is unavailable" in composer_source
+    projection_source = inspect.getsource(
+        OpenXrVulkanPresenter._create_projection_swapchains_for_scale
+    )
+    assert "bool(self.config.filament_panorama_path)" in projection_source
+    assert "self._is_rocm_backend()" in projection_source
     assert "Vulkan projection pass creation failed:" in pass_source
+    assert "Optional panorama pipeline unavailable" in pass_source
     assert "traceback.format_exc().rstrip()" in presenter_source
 
 
@@ -1674,6 +2002,25 @@ def test_release_output_frame_prefers_consumed_filament_timeline() -> None:
     OpenXrVulkanPresenter._release_output_frame(frame)
 
     assert calls == [(18, {"wait_for_timeline": 41})]
+
+
+def test_release_output_frame_calls_consumer_without_sync_argument() -> None:
+    calls = []
+    frame = SimpleNamespace(
+        frame_id=181,
+        metadata={
+            "_vulkan_source_consumer_release": (
+                lambda frame_id: calls.append(frame_id)
+            ),
+            "_vulkan_output_release": (
+                lambda frame_id: calls.append(("fallback", frame_id))
+            ),
+        },
+    )
+
+    OpenXrVulkanPresenter._release_output_frame(frame)
+
+    assert calls == [181]
 
 
 def test_release_output_frame_releases_glow_after_screen_consumer() -> None:
@@ -2263,7 +2610,7 @@ def test_msdf_osd_canvas_width_follows_text_advance() -> None:
     assert long_height == short_height
 
 
-def test_vulkan_reset_screen_restores_initial_size_and_pose() -> None:
+def test_vulkan_reset_screen_restores_only_initial_size_and_position() -> None:
     presenter = OpenXrVulkanPresenter()
     initial = ((0.0, 0.0, -2.5), 2.4, 1.35, (0.0, 0.0, 0.0))
     presenter._filament_screen_initial = initial
@@ -2271,10 +2618,20 @@ def test_vulkan_reset_screen_restores_initial_size_and_pose() -> None:
     presenter._filament_screen = (
         (1.0, 0.5, -20.0), 22.0, 12.375, (5.0, 10.0, 0.0)
     )
+    presenter._screen_curve_half_angle = math.radians(16.0)
+    presenter._screen_crop_width_percent = 12.0
+    presenter._screen_crop_height_percent = 9.0
+    presenter._screen_dynamic_crop = True
 
     presenter._dispatch_controller_shortcut("reset_screen")
 
-    assert presenter._filament_screen == initial
+    assert presenter._filament_screen == (
+        initial[0], initial[1], initial[2], (5.0, 10.0, 0.0)
+    )
+    assert presenter._screen_curve_half_angle == pytest.approx(math.radians(16.0))
+    assert presenter._screen_crop_width_percent == 12.0
+    assert presenter._screen_crop_height_percent == 9.0
+    assert presenter._screen_dynamic_crop is True
 
 
 def test_right_grip_moves_screen_without_resizing_it() -> None:
@@ -2294,6 +2651,119 @@ def test_right_grip_moves_screen_without_resizing_it() -> None:
     assert position == pytest.approx((0.2, 0.0, -2.0))
     assert width == pytest.approx(2.4)
     assert height == pytest.approx(1.35)
+
+
+def _prepare_pointer_priority_presenter(monkeypatch):
+    generation = {"value": 0}
+    monkeypatch.setattr(
+        core_openxr_vulkan,
+        "_physical_input_generation",
+        lambda: generation["value"],
+    )
+    presenter = OpenXrVulkanPresenter()
+    presenter._controller_inputs = ({}, {"trigger": 0.0})
+    presenter._screen_ray_hit_for_hand = lambda hand: (
+        (0.5, 0.5) if hand == 1 else None
+    )
+    presenter._hand_keyboard_hit = lambda _hand: False
+    presenter._last_physical_input_generation = 0
+    return presenter, generation
+
+
+def test_physical_mouse_event_blocks_remote_cursor_and_resumes_next_frame(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    cursor_positions = []
+    monkeypatch.setattr(
+        core_openxr_vulkan,
+        "_set_cursor_pos",
+        lambda *position: cursor_positions.append(position),
+    )
+
+    generation["value"] = 1
+    presenter._handle_vulkan_pointer_input()
+    assert cursor_positions == []
+
+    presenter._handle_vulkan_pointer_input()
+    assert len(cursor_positions) == 1
+
+
+def test_physical_keyboard_event_blocks_remote_cursor(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    cursor_positions = []
+    monkeypatch.setattr(
+        core_openxr_vulkan,
+        "_set_cursor_pos",
+        lambda *position: cursor_positions.append(position),
+    )
+
+    generation["value"] = 1
+    presenter._handle_vulkan_pointer_input()
+
+    assert cursor_positions == []
+
+
+def test_repeated_physical_events_keep_remote_cursor_blocked(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    cursor_positions = []
+    monkeypatch.setattr(
+        core_openxr_vulkan,
+        "_set_cursor_pos",
+        lambda *position: cursor_positions.append(position),
+    )
+
+    for value in (1, 2, 3):
+        generation["value"] = value
+        presenter._handle_vulkan_pointer_input()
+
+    assert cursor_positions == []
+
+
+def test_physical_event_cancels_remote_mouse_and_touch_drag(monkeypatch) -> None:
+    presenter, generation = _prepare_pointer_priority_presenter(monkeypatch)
+    mouse_events = []
+    monkeypatch.setattr(
+        core_openxr_vulkan,
+        "_send_mouse_flags",
+        lambda flag: mouse_events.append(flag),
+    )
+    presenter._pointer_state["right"] = "dragging"
+
+    class FakeTouchInjector:
+        available = True
+
+        def __init__(self):
+            self.events = []
+
+        def set(self, contact_id, x, y, want_down):
+            self.events.append((contact_id, x, y, want_down))
+
+        def flush(self):
+            self.events.append("flush")
+
+    injector = FakeTouchInjector()
+    presenter._touch_state["right"] = "down"
+    presenter._touch_px["right"] = (321, 654)
+    monkeypatch.setattr(core_openxr_vulkan, "_TOUCH_AVAILABLE", True)
+    monkeypatch.setattr(core_openxr_vulkan, "_touch_injector", injector)
+
+    generation["value"] = 1
+    presenter._handle_vulkan_pointer_input()
+
+    assert presenter._pointer_state["right"] == "idle"
+    assert presenter._touch_state["right"] == "idle"
+    release_events = [
+        event for event in injector.events if isinstance(event, tuple) and not event[3]
+    ]
+    assert release_events == [(1, 321, 654, False)]
+    assert mouse_events == [core_openxr_vulkan._MOUSEEVENTF_LEFTUP]
+
+
+def test_non_windows_physical_input_generation_is_noop() -> None:
+    if sys.platform == "win32":
+        pytest.skip("non-Windows fallback behavior")
+    from xr_viewer import windows_input
+
+    assert windows_input._physical_input_generation() == 0
 
 
 def test_right_grip_moves_keyboard_using_laser_local_anchor() -> None:
@@ -2527,7 +2997,7 @@ def test_screen_control_speed_ramps_from_precision_to_ten_meters_per_second() ->
     one_second = presenter._screen_hold_speed(
         1.0, dt=1.0 - 1.0 / 90.0, control="size"
     )
-    five_seconds = presenter._screen_hold_speed(
+    held = presenter._screen_hold_speed(
         1.0, dt=4.0, control="size"
     )
 
@@ -2536,7 +3006,31 @@ def test_screen_control_speed_ramps_from_precision_to_ten_meters_per_second() ->
         + presenter._screen_control_acceleration / 90.0
     )
     assert one_second == pytest.approx(2.08)
-    assert five_seconds == pytest.approx(10.0)
+    assert held == pytest.approx(presenter._screen_control_max_speed)
+
+
+def test_screen_control_deadzone_remaps_partial_stick_for_precision() -> None:
+    presenter = OpenXrVulkanPresenter()
+
+    assert presenter._screen_control_axis_value(0.19) == pytest.approx(0.0)
+    assert presenter._screen_control_axis_value(-0.60) == pytest.approx(-0.5)
+
+
+def test_screen_control_stick_selects_only_one_axis_with_hysteresis() -> None:
+    presenter = OpenXrVulkanPresenter()
+
+    axis, value = presenter._screen_control_stick_axis(0.8, 0.7)
+    assert axis == "size"
+    assert value > 0.0
+    axis, value = presenter._screen_control_stick_axis(0.7, 0.8)
+    assert axis == "size"
+    assert value > 0.0
+    axis, value = presenter._screen_control_stick_axis(0.2, 0.9)
+    assert axis == "distance"
+    assert value > 0.0
+    axis, value = presenter._screen_control_stick_axis(0.05, 0.05)
+    assert axis is None
+    assert value == pytest.approx(0.0)
 
 
 def test_pointer_exponential_resize_is_not_followed_by_fixed_guide_delta() -> None:
@@ -3232,6 +3726,76 @@ def test_default_screen_is_initialized_from_head_pose() -> None:
     assert rotation == pytest.approx((-90.0, 0.0, 0.0))
 
 
+def test_persisted_screen_state_is_applied_and_reset_restores_head_pose(tmp_path) -> None:
+    profile_path = tmp_path / "Default" / "profile.json"
+    profile_path.parent.mkdir()
+    profile_path.write_text(json.dumps({"glb": None}), encoding="utf-8")
+    persisted = {
+        "Default": {
+            "position": [1.0, 1.6, -2.5],
+            "width": 3.2,
+            "height": 1.8,
+            "rotation_deg": [-90.0, 5.0, 0.0],
+            "curved": True,
+            "curve_half_angle_rad": 0.72,
+        }
+    }
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(
+            filament_profile_path=str(profile_path),
+            filament_screen_states=persisted,
+        ),
+        on_controller_shortcut=lambda action, **values: (
+            calls.append((action, values)) or True
+        ),
+    )
+
+    presenter._load_filament_profile()
+    presenter._head_position_w = np.asarray((1.0, 1.6, 2.0), dtype=np.float64)
+    presenter._head_forward_w = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+    presenter._initialize_filament_screen_from_head()
+
+    assert presenter._filament_screen == (
+        (1.0, 1.6, -2.5),
+        3.2,
+        1.8,
+        (-90.0, 5.0, 0.0),
+    )
+    assert presenter._screen_curved is True
+
+    presenter._dispatch_controller_shortcut("reset_screen")
+
+    position, width, height, rotation = presenter._filament_screen
+    assert position == pytest.approx((21.0, 1.6, 2.0))
+    assert width == pytest.approx(23.09)
+    assert height == pytest.approx(12.988125)
+    assert rotation == pytest.approx((-90.0, 5.0, 0.0))
+    assert presenter._screen_curved is True
+    assert presenter._screen_curve_half_angle == pytest.approx(0.72)
+    assert calls[-1][0] == "persist_openxr_screen_state"
+    assert presenter.config.filament_screen_states["Default"]["position"] == pytest.approx(
+        (21.0, 1.6, 2.0)
+    )
+
+
+def test_default_screen_uses_current_head_height_not_stale_cached_height() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 0.0, -20.0),
+        23.09,
+        12.988125,
+        (0.0, 0.0, 0.0),
+    )
+    presenter._head_position_w = np.asarray((1.0, 1.6, 2.0), dtype=np.float64)
+    presenter._head_forward_w = np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+    presenter._initial_head_y = 9.0
+
+    presenter._initialize_filament_screen_from_head()
+
+    assert presenter._filament_screen[0][1] == pytest.approx(1.6)
+
+
 def test_packaged_default_profile_uses_neutral_filament_exposure() -> None:
     profile_path = (
         APP_ROOT
@@ -3432,6 +3996,21 @@ def test_projection_glow_is_absent_when_mode_is_off() -> None:
     assert presenter._projection_glow_state() is None
 
 
+def test_rocm_glow_prewarm_does_not_auto_enable_visual_glow() -> None:
+    source = (APP_ROOT / "xr_viewer" / "core_openxr_vulkan.py").read_text(
+        encoding="utf-8"
+    )
+    marker = "# AMD ROCm: pre-create"
+    start = source.index(marker)
+    end = source.index("    def _create_session_and_swapchains", start)
+    prewarm = source[start:end]
+
+    assert "VulkanGlowSourceComputeBackend" in prewarm
+    assert "prewarm_backend.submit" in prewarm
+    assert "Filament glow state preserved" in prewarm
+    assert '_set_filament_glow_mode("glow")' not in prewarm
+
+
 @pytest.mark.parametrize(
     ("mode", "mode_value"),
     (("glow", 1), ("veil", 2), ("surround", 3)),
@@ -3489,6 +4068,16 @@ def test_projection_glow_does_not_repeat_the_producer_y_flip() -> None:
     assert "vec2 content_uv = raw;" in shader
     assert "vec2 sample_uv = uv;" in shader
     assert "q.y = 1.0 - q.y;" not in shader
+
+
+def test_projection_glow_shader_applies_shared_opacity_to_all_modes() -> None:
+    shader = (
+        APP_ROOT / "shaders" / "d2s_projection_glow_frag.frag"
+    ).read_text(encoding="utf-8")
+
+    assert "state.glow.x * state.glow.z * state.veil.y" in shader
+    assert "state.glow.x * state.glow.w * state.veil.y" in shader
+    assert "state.veil.y * state.veil.x" in shader
 
 
 def test_projection_laser_packs_legacy_beam_transform_and_animation() -> None:
@@ -3583,6 +4172,48 @@ def test_screen_resolution_log_ignores_pose_jitter(capsys) -> None:
     assert capsys.readouterr().out == ""
 
 
+def test_screen_resolution_log_coalesces_rapid_configuration_changes(
+    monkeypatch, capsys
+) -> None:
+    now = [100.0]
+    monkeypatch.setattr(core_openxr_vulkan.time, "perf_counter", lambda: now[0])
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
+    presenter.swapchains = [
+        SimpleNamespace(width=1000, height=1000),
+        SimpleNamespace(width=1000, height=1000),
+    ]
+    view = SimpleNamespace(
+        pose=SimpleNamespace(
+            position=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        ),
+        fov=SimpleNamespace(
+            angle_left=-math.pi / 4.0,
+            angle_right=math.pi / 4.0,
+            angle_down=-math.pi / 4.0,
+            angle_up=math.pi / 4.0,
+        ),
+    )
+    frame = SimpleNamespace(
+        left_eye=SimpleNamespace(width=3840, height=2160),
+        right_eye=SimpleNamespace(width=3840, height=2160),
+        metadata={"render_size": (3840, 2160)},
+    )
+
+    presenter._report_screen_resolution([view, view], frame)
+    assert "render_size=3840x2160" in capsys.readouterr().out
+
+    frame.metadata["render_size"] = (1920, 1080)
+    now[0] = 101.0
+    presenter._report_screen_resolution([view, view], frame)
+    assert capsys.readouterr().out == ""
+
+    now[0] = 102.1
+    presenter._report_screen_resolution([view, view], frame)
+    assert "render_size=1920x1080" in capsys.readouterr().out
+
+
 def test_presenter_run_until_owns_shutdown_close() -> None:
     presenter = OpenXrVulkanPresenter()
     shutdown = threading.Event()
@@ -3594,6 +4225,48 @@ def test_presenter_run_until_owns_shutdown_close() -> None:
 
     assert presenter.run_until(shutdown) == 0
     assert calls == ["initialize", "frame", "close"]
+
+
+def test_presenter_device_loss_stops_runtime_event_for_fresh_process_restart() -> None:
+    presenter = OpenXrVulkanPresenter()
+    shutdown = threading.Event()
+    presenter.vulkan = SimpleNamespace(device_lost=True)
+    presenter.initialize = lambda: setattr(presenter, "_initialized", True)
+
+    def fail_frame():
+        presenter._request_fatal_device_loss()
+        return False
+
+    presenter.run_frame = fail_frame
+    presenter.close = lambda: None
+
+    presenter.run_until(shutdown)
+
+    assert shutdown.is_set()
+    assert presenter.fatal_device_loss is True
+
+
+def test_runtime_failure_waits_for_openxr_runtime_release_before_reconnect() -> None:
+    RuntimeFailureError = type("RuntimeFailureError", (Exception,), {})
+    presenter = OpenXrVulkanPresenter()
+    shutdown = threading.Event()
+    waits = []
+    presenter.initialize = lambda: setattr(presenter, "_initialized", True)
+    presenter.run_frame = lambda: (_ for _ in ()).throw(
+        RuntimeFailureError("runtime rejected frame")
+    )
+    presenter.close = lambda: None
+
+    def wait(delay):
+        waits.append(delay)
+        shutdown.set()
+        return True
+
+    shutdown.wait = wait
+
+    presenter.run_until(shutdown)
+
+    assert waits == [6.0]
 
 
 def test_presenter_close_destroys_bound_vulkan_before_openxr() -> None:
@@ -3620,6 +4293,18 @@ def test_presenter_close_destroys_bound_vulkan_before_openxr() -> None:
     assert calls == ["vulkan", "openxr"]
 
 
+def test_rocm_prewarm_closes_before_presenter_vulkan_device() -> None:
+    events = []
+    presenter = OpenXrVulkanPresenter()
+    presenter._prewarmed_glow_backend = SimpleNamespace(close=lambda: events.append("glow"))
+    presenter.vulkan = SimpleNamespace(
+        device_lost=False, wait_idle=lambda: None, close=lambda: events.append("device"),
+    )
+    presenter.close()
+    assert events == ["glow", "device"]
+    assert presenter._prewarmed_glow_backend is None
+
+
 def test_presenter_close_skips_openxr_instance_destroy_after_device_loss() -> None:
     calls = []
 
@@ -3641,6 +4326,9 @@ def test_presenter_close_skips_openxr_instance_destroy_after_device_loss() -> No
 
     presenter.close()
 
+    # VDXR can access freed loader state when xrDestroyInstance follows a
+    # device loss. The fatal path exits the process, so avoiding that call is
+    # safer than attempting an in-process reconnect with a dead device.
     assert calls == ["vulkan"]
     assert presenter.instance is None
 
@@ -3685,6 +4373,59 @@ def test_presenter_skips_end_frame_after_vulkan_device_loss() -> None:
         presenter.run_frame()
 
     assert calls == ["begin"]
+
+
+def test_presenter_recovers_from_invalid_openxr_composition_rect(capsys) -> None:
+    calls = []
+
+    class SwapchainRectInvalidError(RuntimeError):
+        pass
+
+    class FakeXr:
+        FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
+
+        def end_frame(self, _session, info):
+            calls.append(info["layer_count"])
+            if len(calls) == 1:
+                raise SwapchainRectInvalidError("stale rect")
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.xr = FakeXr()
+    presenter.session = object()
+    presenter._end_openxr_frame(42, [object()])
+
+    assert calls == [1, 0]
+    assert "retrying the frame without optional layers" in capsys.readouterr().out
+
+
+def test_presenter_invalid_optional_layer_recovery_keeps_primary_layers() -> None:
+    calls = []
+
+    class SwapchainRectInvalidError(RuntimeError):
+        pass
+
+    class FakeXr:
+        FrameEndInfo = staticmethod(lambda **kwargs: kwargs)
+
+        def end_frame(self, _session, info):
+            calls.append(info["layers"])
+            if len(calls) == 1:
+                raise SwapchainRectInvalidError("stale optional quad")
+
+    projection = object()
+    optional_quad = object()
+    presenter = OpenXrVulkanPresenter()
+    presenter.xr = FakeXr()
+    presenter.session = object()
+    presenter._end_openxr_frame(
+        42,
+        [projection, optional_quad],
+        fallback_layer_pointers=[projection],
+    )
+
+    assert calls == [[projection, optional_quad], [projection]]
+
+
 
 
 def test_presenter_waits_for_headset_and_retries_initialization(capsys) -> None:
@@ -3828,6 +4569,54 @@ def test_presenter_drains_only_latest_raw_runtime_result(monkeypatch) -> None:
     assert calls == [("new", 2.0)]
 
 
+def test_runtime_output_conversion_error_is_reported_once_until_recovery(
+    capsys,
+) -> None:
+    class FailingAdapter:
+        def convert(self, *_args, **_kwargs):
+            raise ValueError("conversion failed")
+
+    presenter = OpenXrVulkanPresenter()
+    presenter._output_adapter = FailingAdapter()
+    result = SimpleNamespace(debug_info={})
+
+    presenter._submit_runtime_result_on_presenter(result, 1.0)
+    presenter._submit_runtime_result_on_presenter(result, 2.0)
+
+    output = capsys.readouterr().out
+    assert output.count("Runtime output conversion failed") == 1
+
+
+def test_presenter_latches_fatal_device_loss_from_output_conversion() -> None:
+    class LostContext:
+        device_lost = True
+
+    class FailingAdapter:
+        def convert(self, *_args, **_kwargs):
+            raise RuntimeError("VkErrorDeviceLost")
+
+    presenter = OpenXrVulkanPresenter()
+    presenter.vulkan = LostContext()
+    presenter._output_adapter = FailingAdapter()
+
+    presenter._submit_runtime_result_on_presenter(
+        SimpleNamespace(debug_info={}), 1.0
+    )
+
+    assert presenter.fatal_device_loss is True
+    assert presenter.exit_requested is True
+    assert presenter._accept_output is False
+
+
+def test_presenter_close_stops_worker_output_before_teardown() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._accept_output = True
+    presenter.session_running = True
+    presenter.close()
+
+    assert presenter._accept_output is False
+
+
 def test_filament_bridge_binds_each_openxr_eye(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
 
@@ -3891,6 +4680,7 @@ def test_filament_multiview_uses_private_hdr_targets_and_keeps_eye_swapchains(
     presenter.swapchains = [left, right]
     presenter.swapchain_format = 43
     presenter._vulkan_projection_composer_requested = True
+    presenter._filament_multiview_requested = True
     closed = []
 
     class FakeDepthImage:
@@ -3933,22 +4723,12 @@ def test_filament_multiview_uses_private_hdr_targets_and_keeps_eye_swapchains(
             vkDestroySemaphore=lambda *_args: None,
         ),
     )
-    controller_swapchain = _EyeSwapchain(
-        "controller", [SimpleNamespace(image="controller-image")], 10, 20,
-        array_size=2,
-    )
-    presenter._create_projection_swapchain = lambda *_args, **_kwargs: (
-        controller_swapchain
-    )
-
     class FakeBridge:
         multiview_abi_available = True
         multiview_supported = True
         multiview_depth_swapchain_abi_available = True
         image_ready_semaphore_abi_available = True
         finished_drawing_semaphore_abi_available = True
-        controller_composition_layer_abi_available = True
-
         def create_stereo_swapchain_with_depth(self, images, **kwargs):
             assert list(images) == ["hdr-0", "hdr-1", "hdr-2"]
             assert kwargs == {
@@ -3959,21 +4739,11 @@ def test_filament_multiview_uses_private_hdr_targets_and_keeps_eye_swapchains(
                 "depth_format": 126,
             }
 
-        def create_controller_overlay_stereo_swapchain(self, images, **kwargs):
-            assert list(images) == ["controller-image"]
-            assert kwargs == {
-                "format": 43,
-                "width": 10,
-                "height": 20,
-                "depth_image": "depth",
-                "depth_format": 126,
-            }
-
     assert presenter._try_enable_filament_multiview(FakeBridge())
     assert presenter.swapchains == [left, right]
     assert len(presenter._filament_multiview_hdr_images) == 3
     assert len(presenter._filament_depth_attachments) == 1
-    assert presenter._controller_composition_swapchain is controller_swapchain
+    assert presenter._controller_composition_swapchain is None
     assert not closed
 
 
@@ -3984,6 +4754,7 @@ def test_filament_multiview_failure_preserves_two_swapchain_fallback(monkeypatch
     presenter.swapchains = [left, right]
     presenter.swapchain_format = 43
     presenter._vulkan_projection_composer_requested = True
+    presenter._filament_multiview_requested = True
     closed = []
 
     class FakeDepthImage:
@@ -4057,6 +4828,8 @@ def test_filament_multiview_keeps_fallback_for_mismatched_eye_extents() -> None:
 def test_filament_multiview_projection_diagnostic_activates_layered_path(
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("D2S_VULKAN_PROJECTION_COMPOSER", "1")
+    monkeypatch.setenv("D2S_FILAMENT_MULTIVIEW", "1")
     monkeypatch.setenv("D2S_FILAMENT_MULTIVIEW_PROJECTION_DIAGNOSTIC", "1")
     calls = []
 
@@ -4513,6 +5286,7 @@ def test_projection_composer_failure_falls_back_to_filament_in_same_frame(
             else None
         )
     )
+    presenter._vulkan_projection_composer_requested = True
     presenter.xr = FakeXr
     presenter.vulkan = SimpleNamespace(
         _lock=threading.RLock(),
@@ -5023,6 +5797,7 @@ def test_settings_menu_grip_drag_preserves_controller_relative_pose() -> None:
 
 def test_settings_menu_render_scale_defers_rebuild_until_slider_release() -> None:
     presenter = OpenXrVulkanPresenter()
+    presenter._settings_menu.set_tab("picture")
     control = next(
         item for item in presenter._settings_menu.controls()
         if item.key == "openxr_render_scale"
@@ -5030,7 +5805,7 @@ def test_settings_menu_render_scale_defers_rebuild_until_slider_release() -> Non
 
     presenter._apply_settings_menu_control(control, (control.rect[2], 0.5))
 
-    assert presenter._settings_menu_values["openxr_render_scale"] == 2.0
+    assert presenter._settings_menu_values["openxr_render_scale"] == 4.0
     assert presenter._pending_openxr_render_scale is None
 
 
@@ -5042,6 +5817,7 @@ def test_settings_menu_plus_button_applies_exact_slider_step() -> None:
         ) or True
     )
     presenter._settings_menu_values["color_brightness"] = 1.0
+    presenter._settings_menu.set_tab("picture")
     plus = next(
         item for item in presenter._settings_menu.controls()
         if item.key == "step:plus:color_brightness"
@@ -5102,6 +5878,110 @@ def test_settings_menu_glow_mode_uses_existing_runtime_state_machine() -> None:
     assert presenter._filament_glow_mode == "off"
     assert presenter._filament_glow_intensity_multiplier == 0.0
     assert presenter._filament_glow_shell_intensity_multiplier == 0.0
+
+
+def test_default_glow_mode_change_is_persisted_and_reloaded() -> None:
+    persisted = {"Default": "off"}
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(filament_glow_modes=persisted),
+        on_controller_shortcut=lambda action, **values: (
+            calls.append((action, values)) or True
+        ),
+    )
+    presenter._filament_glow_environment_enabled = True
+    presenter._filament_screen_state_environment = "Default"
+
+    presenter._set_filament_glow_mode("glow", persist=True)
+
+    assert calls[-1] == (
+        "persist_openxr_glow_mode",
+        {"environment": "Default", "mode": "glow"},
+    )
+    assert persisted["Default"] == "glow"
+
+
+def test_persisted_default_glow_mode_overrides_profile_defaults() -> None:
+    presenter = OpenXrVulkanPresenter(
+        # This is how PyYAML loads the unquoted value written for "off".
+        OpenXrVulkanConfig(filament_glow_modes={"Default": False})
+    )
+    presenter._filament_screen_state_environment = "Default"
+
+    presenter._apply_filament_glow_profile_fields(
+        {
+            "glow_mode": "veil",
+            "glow_intensity_multiplier": 1.85,
+            "glow_shell_intensity_multiplier": 0.0,
+        }
+    )
+
+    assert presenter._filament_glow_mode == "off"
+    assert presenter._filament_glow_intensity_multiplier == 0.0
+    assert presenter._filament_glow_shell_intensity_multiplier == 0.0
+
+
+def test_persisted_default_glow_mode_wins_after_lighting_preset() -> None:
+    presenter = OpenXrVulkanPresenter(
+        OpenXrVulkanConfig(filament_glow_modes={"Default": "glow"})
+    )
+    presenter._filament_screen_state_environment = "Default"
+    presenter._apply_filament_glow_profile_fields({
+        "glow_mode": "veil",
+        "glow_intensity_multiplier": 1.85,
+        "glow_shell_intensity_multiplier": 0.0,
+    })
+
+    presenter._apply_filament_lighting_preset(
+        {
+            "glow_mode": "surround",
+            "glow_intensity_multiplier": 0.0,
+            "glow_shell_intensity_multiplier": 1.85,
+        },
+        apply_bridge=False,
+    )
+    # This is the final load-stage reapplication used after the profile's
+    # selected preset has been resolved.
+    presenter._apply_filament_glow_profile_fields({})
+
+    assert presenter._filament_glow_mode == "glow"
+    assert presenter._filament_glow_intensity_multiplier > 0.0
+    assert presenter._filament_glow_shell_intensity_multiplier == 0.0
+
+
+def test_glow_transparency_slider_updates_gpu_parameters_and_persists() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda action, **values: (
+            calls.append((action, values)) or True
+        ),
+    )
+    presenter._filament_glow_environment_enabled = True
+    presenter._settings_menu.set_tab("glow")
+    controls = {
+        item.key: item for item in presenter._settings_menu.controls(show_glow=True)
+    }
+    transparency = controls["glow:transparency"]
+    fraction = (0.35 - transparency.minimum) / (
+        transparency.maximum - transparency.minimum
+    )
+    u = transparency.rect[0] + fraction * (
+        transparency.rect[2] - transparency.rect[0]
+    )
+
+    presenter._apply_settings_menu_control(transparency, (u, 0.0))
+
+    assert presenter._veil_alpha == pytest.approx(0.65)
+    assert calls[-1] == (
+        "persist_openxr_glow_transparency",
+        {"environment": "Default", "transparency": pytest.approx(0.35)},
+    )
+    presenter._filament_glow_mode = "glow"
+    presenter._filament_glow_intensity_multiplier = 1.0
+    presenter._filament_screen = ((0.0, 0.0, -2.0), 2.0, 1.0, (0.0, 0.0, 0.0))
+    glow_state = presenter._projection_glow_state()
+    assert glow_state is not None
+    assert np.frombuffer(glow_state[1], dtype="<f4")[13] == pytest.approx(0.65)
 
 
 def test_settings_menu_glow_control_is_ignored_outside_default_environment() -> None:
@@ -5215,6 +6095,10 @@ def test_settings_menu_room_list_includes_glb_and_panorama_profiles() -> None:
 
     presenter._refresh_settings_menu_values()
 
+    assert presenter._settings_menu.room_tab_visible is True
+    assert "tab:room" in {
+        control.key for control in presenter._settings_menu.controls()
+    }
     room_keys = {key for key, _label in presenter._settings_menu.room_models}
     assert "3d_theater" in room_keys
     assert "hdr_lakesky" in room_keys
@@ -5258,6 +6142,7 @@ def test_environment_hot_switch_unloads_glb_for_panorama_and_then_persists(
     presenter.filament_bridge = bridge
 
     class ProjectionPass:
+        panorama_enabled = True
         def __init__(self): self.closed = False
         def close(self): self.closed = True
 
@@ -5278,8 +6163,8 @@ def test_environment_hot_switch_unloads_glb_for_panorama_and_then_persists(
     assert bridge.calls[:2] == ["idle", "unload"]
     assert presenter.config.filament_glb_path is None
     assert presenter.config.filament_panorama_path == str(panorama)
-    assert projection_pass.closed is True
-    assert presenter._vulkan_projection_screen_pass is None
+    assert projection_pass.closed is False
+    assert presenter._vulkan_projection_screen_pass is projection_pass
     assert persisted == [("select_environment_model", {"model": "hdr"})]
     output = capsys.readouterr().out
     assert "[OpenXRViewer] Environment hot switch complete: model=hdr\n" in output
@@ -5441,6 +6326,8 @@ def test_settings_menu_screen_rotation_and_reset_restore_profile_pose() -> None:
     presenter._filament_screen_initial = initial
     presenter._filament_screen = initial
     presenter._screen_initial_curve_half_angle = math.radians(20.0)
+    presenter._screen_curve_half_angle = math.radians(20.0)
+    presenter._screen_curved = True
     presenter._settings_menu.set_tab("screen")
     controls = {item.key: item for item in presenter._settings_menu.controls()}
 
@@ -5452,7 +6339,9 @@ def test_settings_menu_screen_rotation_and_reset_restore_profile_pose() -> None:
     presenter._apply_settings_menu_control(
         controls["section:reset_defaults"], (0.0, 0.0)
     )
-    assert presenter._filament_screen == initial
+    assert presenter._filament_screen == (
+        initial[0], initial[1], initial[2], (10.0, 20.0, 120.0)
+    )
     assert presenter._screen_curve_half_angle == pytest.approx(math.radians(20.0))
 
 
@@ -5464,6 +6353,7 @@ def test_settings_menu_render_scale_step_schedules_one_rebuild() -> None:
         ) or True
     )
     presenter._settings_menu_values["openxr_render_scale"] = 1.0
+    presenter._settings_menu.set_tab("picture")
     minus = next(
         item for item in presenter._settings_menu.controls()
         if item.key == "step:minus:openxr_render_scale"
@@ -5786,3 +6676,183 @@ def test_standalone_vulkan_context_smoke() -> None:
     finally:
         context.close()
     assert context.closed
+
+
+def test_vulkan_context_device_loss_close_skips_driver_destruction() -> None:
+    calls = []
+
+    class FakeVk:
+        def __getattr__(self, name):
+            def record(*_args):
+                calls.append(name)
+
+            return record
+
+    context = object.__new__(VulkanContext)
+    context.vk = FakeVk()
+    context.device = "dead-device"
+    context.instance = "dead-instance"
+    context._timeline_semaphore = "timeline"
+    context._frame_contexts = [
+        SimpleNamespace(
+            queue_resources={
+                "graphics": SimpleNamespace(
+                    fence="fence", command_pool="command-pool"
+                )
+            }
+        )
+    ]
+    context._owns_device = True
+    context._owns_instance = True
+    context._external_image_registry = None
+    context._image_states = ImageStateTracker(default_queue_family_index=0)
+    context._command_buffer = "command-buffer"
+    context._command_pool = "command-pool"
+    context._fence = "fence"
+    context.queue = "queue"
+    context.physical_device = "physical-device"
+    context._closed = False
+    context._device_lost = True
+    context._lock = threading.RLock()
+
+    context.close()
+
+    assert calls == []
+    assert context.closed is True
+
+
+def test_screen_crop_uv_effective_geometry_curve_and_physical_mouse_mapping() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 4.0, 2.0, (0.0, 0.0, 0.0)
+    )
+    presenter._screen_crop_width_percent = 10.0
+    presenter._screen_crop_height_percent = 20.0
+    presenter._screen_curved = True
+    presenter._screen_curve_half_angle = 0.50
+    presenter._target_monitor_rect = lambda: (100, 200, 1000, 500)
+
+    assert presenter._screen_crop_uv() == pytest.approx((0.1, 0.2, 0.8, 0.6))
+    effective = presenter._effective_filament_screen()
+    assert effective is not None
+    assert effective[1:3] == pytest.approx((3.2, 1.2))
+    assert presenter._effective_screen_curve_half_angle() == pytest.approx(0.4)
+    assert presenter._cursor_pixel_for_screen_uv(0.0, 0.0) == (200, 600)
+    assert presenter._cursor_pixel_for_screen_uv(1.0, 1.0) == (1000, 300)
+
+
+def test_crop_controls_reset_and_manual_change_disable_dynamic_crop() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    presenter._settings_menu.set_screen_section("crop")
+    controls = {item.key: item for item in presenter._settings_menu.controls()}
+    presenter._screen_dynamic_crop = True
+
+    width = controls["screen:crop_width"]
+    presenter._apply_settings_menu_control(
+        width, (width.rect[0] + (width.rect[2] - width.rect[0]) * (12.0 / 45.0), 0.0)
+    )
+
+    assert presenter._screen_crop_width_percent == pytest.approx(12.0)
+    assert presenter._screen_dynamic_crop is False
+
+    presenter._screen_crop_height_percent = 8.0
+    presenter._screen_dynamic_crop = True
+    presenter._apply_settings_menu_control(controls["screen:reset_crop"], (0.0, 0.0))
+
+    assert presenter._screen_crop_width_percent == 0.0
+    assert presenter._screen_crop_height_percent == 0.0
+    assert presenter._screen_dynamic_crop is False
+
+
+def test_crop_detector_one_shot_and_dynamic_three_result_hysteresis() -> None:
+    presenter = OpenXrVulkanPresenter()
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    presenter._on_controller_shortcut = lambda *_args, **_kwargs: True
+    presenter._screen_auto_crop_pending = True
+    presenter._screen_crop_detector_inflight = True
+
+    presenter._apply_screen_crop_detection((0.0, 0.1, 1.0, 0.8), 1)
+
+    assert presenter._screen_auto_crop_pending is False
+    assert presenter._screen_dynamic_crop is False
+    assert presenter._screen_crop_width_percent == 0.0
+    assert presenter._screen_crop_height_percent == pytest.approx(10.0)
+
+    presenter._screen_dynamic_crop = True
+    presenter._screen_crop_width_percent = 14.0
+    presenter._screen_crop_height_percent = 10.0
+    for serial in (2, 3):
+        presenter._apply_screen_crop_detection((0.0, 0.0, 1.0, 1.0), serial)
+    assert presenter._screen_crop_width_percent == 14.0
+    presenter._apply_screen_crop_detection((0.0, 0.0, 1.0, 1.0), 4)
+    assert presenter._screen_crop_width_percent == 0.0
+    assert presenter._screen_crop_height_percent == 0.0
+
+
+def test_unavailable_crop_detector_keeps_static_crop_and_disables_dynamic_mode() -> None:
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda *_args, **_kwargs: True
+    )
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    presenter._screen_crop_width_percent = 14.0
+    presenter._screen_crop_height_percent = 10.0
+    presenter._screen_dynamic_crop = True
+    presenter._screen_auto_crop_pending = True
+
+    presenter._screen_crop_detection_unavailable()
+
+    assert presenter._screen_crop_width_percent == 14.0
+    assert presenter._screen_crop_height_percent == 10.0
+    assert presenter._screen_dynamic_crop is False
+    assert presenter._screen_auto_crop_pending is False
+
+
+def test_projection_quality_cache_can_release_jittered_extents() -> None:
+    class CachedImage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    first = CachedImage()
+    second = CachedImage()
+    projection = object.__new__(VulkanProjectionScreenPass)
+    projection.quality_images = {(100, 50, 37): [first]}
+    projection.mip_images = {(100, 50, 37): [second]}
+
+    projection._close_quality_image_cache()
+
+    assert first.closed is True
+    assert second.closed is True
+    assert projection.quality_images == {}
+    assert projection.mip_images == {}
+
+
+def test_crop_state_is_persisted_per_openxr_environment() -> None:
+    calls = []
+    presenter = OpenXrVulkanPresenter(
+        on_controller_shortcut=lambda *args, **kwargs: calls.append((args, kwargs)) or True
+    )
+    presenter._filament_screen_state_environment = "Cinema"
+    presenter._filament_screen = (
+        (0.0, 0.0, -2.0), 2.4, 1.35, (0.0, 0.0, 0.0)
+    )
+    presenter._screen_crop_width_percent = 11.0
+    presenter._screen_crop_height_percent = 9.0
+    presenter._screen_dynamic_crop = True
+
+    presenter._persist_screen_state(force=True)
+
+    state = presenter.config.filament_screen_states["Cinema"]
+    assert state["crop_width_percent"] == 11.0
+    assert state["crop_height_percent"] == 9.0
+    assert state["dynamic_crop"] is True
+    assert calls[-1][0][0] == "persist_openxr_screen_state"

@@ -9,6 +9,7 @@ from xr_viewer.settings_menu import (
 
 def test_picture_layout_exposes_all_planned_controls():
     menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
     keys = {control.key for control in menu.controls()}
     assert {
         "openxr_render_scale", "color_brightness", "color_contrast", "color_saturation", "color_gamma",
@@ -18,8 +19,27 @@ def test_picture_layout_exposes_all_planned_controls():
     } <= keys
 
 
+def test_screen_tab_precedes_picture_tab_in_shared_layout():
+    menu = OpenXrSettingsMenu()
+    tabs = [
+        control.key for control in menu.controls(show_glow=True)
+        if control.key.startswith("tab:")
+    ]
+
+    assert tabs == [
+        "tab:screen", "tab:depth", "tab:glow", "tab:room", "tab:picture",
+    ]
+
+
+def test_screen_is_the_default_openxr_settings_tab():
+    menu = OpenXrSettingsMenu()
+
+    assert menu.tab == "screen"
+
+
 def test_slider_hit_and_quantization():
     menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
     brightness = next(control for control in menu.controls() if control.key == "color_brightness")
     x0, y0, x1, y1 = brightness.rect
     control = menu.hit_test(((x0 + x1) * 0.5, (y0 + y1) * 0.5))
@@ -58,6 +78,7 @@ def test_min_lod_never_exceeds_max_lod():
 
 def test_tab_switch_rebuilds_page_controls():
     menu = OpenXrSettingsMenu()
+    assert menu.set_tab("picture") is True
     assert menu.set_tab("screen") is True
     keys = {control.key for control in menu.controls()}
     assert {
@@ -88,7 +109,17 @@ def test_glow_tab_is_visible_only_for_default_environment():
     menu.set_tab("glow")
     assert {
         "glow:surround", "glow:glow", "glow:veil", "glow:off",
+        "glow:transparency",
     } <= {control.key for control in menu.controls(show_glow=True)}
+    transparency = next(
+        control for control in menu.controls(show_glow=True)
+        if control.key == "glow:transparency"
+    )
+    assert (
+        transparency.minimum,
+        transparency.maximum,
+        transparency.step,
+    ) == (0.0, 1.0, 0.05)
     assert not any(
         control.key.startswith("glow:") for control in menu.controls()
     )
@@ -124,12 +155,65 @@ def test_screen_tab_exposes_distance_rotation_and_reset():
     } <= keys
     height = next(control for control in menu.controls() if control.key == "screen:height")
     assert (height.minimum, height.maximum, height.step) == (-10.0, 10.0, 0.05)
+    distance = controls["screen:distance"]
+    assert (distance.minimum, distance.maximum, distance.step) == (0.25, 20.0, 0.05)
     rotations = [
         controls[key] for key in ("screen:rotate:-90", "screen:rotate:+90")
     ]
     assert max(control.rect[3] for control in rotations) < (
         controls["screen:width"].rect[1] - 0.05
     )
+
+
+def test_screen_crop_section_has_symmetric_crop_controls_and_navigation():
+    menu = OpenXrSettingsMenu()
+    assert menu.screen_section == "layout"
+    assert menu.set_screen_section("crop") is True
+    controls = {control.key: control for control in menu.controls()}
+
+    assert {
+        "screen:section:layout", "screen:section:crop", "screen:auto_crop",
+        "screen:dynamic_crop", "screen:reset_crop", "screen:crop_width",
+        "screen:crop_height",
+    } <= controls.keys()
+    assert controls["screen:dynamic_crop"].kind == "toggle"
+    assert (
+        controls["screen:crop_width"].minimum,
+        controls["screen:crop_width"].maximum,
+        controls["screen:crop_width"].step,
+    ) == (0.0, 45.0, 1.0)
+    assert "screen:width" not in controls
+
+    assert menu.set_screen_section("layout") is True
+    assert "screen:width" in {control.key for control in menu.controls()}
+
+
+def test_screen_subsection_row_is_below_the_menu_subtitle():
+    menu = OpenXrSettingsMenu()
+    controls = {control.key: control for control in menu.controls()}
+    section_tabs = [
+        controls["screen:section:layout"],
+        controls["screen:section:crop"],
+    ]
+    type_controls = [
+        controls[f"screen:type:{name}"]
+        for name in ("flat", "subtle", "medium", "deep")
+    ]
+
+    assert min(control.rect[1] for control in section_tabs) >= 0.17
+    assert max(control.rect[3] for control in section_tabs) < min(
+        control.rect[1] for control in type_controls
+    )
+    assert min(
+        right.rect[0] - left.rect[2]
+        for left, right in zip(type_controls, type_controls[1:])
+    ) >= 0.05 - 1e-9
+    assert min(
+        control.rect[1] for control in (
+            controls["screen:rotate:-90"],
+            controls["screen:rotate:+90"],
+        )
+    ) - max(control.rect[3] for control in type_controls) >= 0.03 - 1e-9
 
 
 def test_room_tab_exposes_models_three_seats_and_live_sliders():
@@ -151,12 +235,11 @@ def test_room_tab_exposes_models_three_seats_and_live_sliders():
     ] == ["Front", "Middle", "Back"]
 
 
-def test_default_environment_hides_room_tab():
+def test_room_tab_remains_available_before_an_environment_is_selected():
     menu = OpenXrSettingsMenu()
-    menu.room_tab_visible = False
 
-    assert "tab:room" not in {control.key for control in menu.controls()}
-    assert menu.set_tab("room") is False
+    assert "tab:room" in {control.key for control in menu.controls()}
+    assert menu.set_tab("room") is True
 
 
 def test_room_tab_keeps_three_model_rows_above_seat_and_live_controls():
@@ -186,11 +269,12 @@ def test_room_tab_keeps_three_model_rows_above_seat_and_live_controls():
 
 def test_picture_layout_places_one_reset_action_beside_section_heading():
     menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
     controls = {control.key: control for control in menu.controls()}
     assert controls["tab:picture"].rect[3] < controls["color_brightness"].rect[1]
     assert controls["section:reset_defaults"].rect[1] < controls["color_brightness"].rect[1]
     assert controls["section:reset_defaults"].rect[1] > 0.125
-    assert controls["section:reset_defaults"].rect[3] < 0.18
+    assert controls["section:reset_defaults"].rect[3] == pytest.approx(0.225)
     assert controls["section:reset_defaults"].label == "Reset to default values"
     assert not any("reset_defaults" in key for key in controls if key != "section:reset_defaults")
     assert set(PICTURE_DEFAULTS) == {
@@ -199,18 +283,20 @@ def test_picture_layout_places_one_reset_action_beside_section_heading():
     assert "close" not in controls
 
 
-def test_openxr_render_scale_uses_half_to_double_range():
+def test_openxr_render_scale_uses_half_to_quadruple_range():
     menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
     control = next(
         item for item in menu.controls() if item.key == "openxr_render_scale"
     )
-    assert (control.minimum, control.maximum, control.step) == (0.5, 2.0, 0.05)
+    assert (control.minimum, control.maximum, control.step) == (0.5, 4.0, 0.05)
     assert control.value_from_u(control.rect[0]) == 0.5
-    assert control.value_from_u(control.rect[2]) == 2.0
+    assert control.value_from_u(control.rect[2]) == 4.0
 
 
 def test_slider_minus_and_plus_are_independent_hit_targets():
     menu = OpenXrSettingsMenu()
+    menu.set_tab("picture")
     slider = next(
         item for item in menu.controls() if item.key == "color_brightness"
     )

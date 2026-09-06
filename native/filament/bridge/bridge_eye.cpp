@@ -293,6 +293,18 @@ int bridge_eye_create_controller_overlay_stereo_swapchain_with_depth(
             external_swapchain;
     auto& eye = bridge->eyes[0];
     eye.controller_view->setViewport(filament::Viewport{0, 0, width, height});
+    // This swapchain is submitted as an alpha-blended OpenXR composition
+    // layer. set_multiview_views(true) makes the shared views opaque for the
+    // private HDR producer; restore transparent output for this dedicated
+    // controller layer so its untouched pixels stay transparent.
+    eye.controller_view->setBlendMode(
+            filament::View::BlendMode::TRANSLUCENT);
+    eye.controller_view->setPostProcessingEnabled(false);
+    // The controller composition reuses the multiview depth attachment. Clear
+    // both render channels before drawing so room/screen depth from the HDR
+    // producer cannot hide the controller models or the B-button guide.
+    eye.controller_view->setChannelDepthClearEnabled(0, true);
+    eye.controller_view->setChannelDepthClearEnabled(2, true);
     // The main HDR producer retains only room/effect content. Controllers,
     // lasers and guides are emitted by the final transparent Projection layer.
     eye.foreground_view->setVisibleLayers(

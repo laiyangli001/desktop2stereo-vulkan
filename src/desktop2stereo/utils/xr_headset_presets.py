@@ -17,6 +17,10 @@ class XRHeadsetPreset:
     # Application sampling tier, not a claim about a vendor's exact panel
     # specification. It is selected by the GUI headset model.
     resolution_tier_k: int
+    # Multiplier of the OpenXR runtime's recommended eye image size used by
+    # the Headset optimized mode. The runtime's recommended/max extents still
+    # clamp the actual swapchain dimensions.
+    recommended_render_scale: float = 1.0
 
     @property
     def width_m(self) -> float:
@@ -32,7 +36,9 @@ class XRHeadsetPreset:
 
 
 XR_HEADSET_PRESETS = (
-    XRHeadsetPreset("Meta Quest 2", "vr", "Meta Quest 2", 1.3, 2),
+    # Meta's Quest 2 render-scale guidance places the physical panel near
+    # 1.24x of the 100% per-eye render target.
+    XRHeadsetPreset("Meta Quest 2", "vr", "Meta Quest 2", 1.3, 2, 1.24),
     XRHeadsetPreset("Meta Quest 3", "vr", "Meta Quest 3", 1.3, 4),
     XRHeadsetPreset("Meta Quest Pro", "vr", "Meta Quest Pro", 1.1, 4),
     XRHeadsetPreset("Pico 4 / 4 Ultra", "vr", "Pico 4 / 4 Ultra", 20.0, 4),

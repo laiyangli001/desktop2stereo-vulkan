@@ -208,6 +208,19 @@ def test_vulkan_output_shader_decodes_srgb_before_unorm_store():
     assert "if (found >= 1.0) return 1.0;" in shader
 
 
+def test_vulkan_stereo_shaders_clamp_displaced_edges_instead_of_reflecting():
+    shader_root = APP_ROOT / "shaders"
+    for name in (
+        "d2s_stereo_fused.comp",
+        "d2s_stereo_layered.comp",
+        "d2s_stereo_layered_output.comp",
+        "d2s_stereo_layered_tiled.comp",
+    ):
+        shader = (shader_root / name).read_text(encoding="utf-8")
+        assert "float clamp_coordinate" in shader
+        assert "reflect_coordinate" not in shader
+
+
 def test_vulkan_msdf_quad_shader_is_a_gpu_atlas_to_storage_image_pass():
     shader = (
         APP_ROOT

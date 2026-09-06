@@ -7,6 +7,7 @@ separate GLFW/Vulkan swapchain and never creates an OpenGL context.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 import queue
 import sys
 import time
@@ -30,6 +31,9 @@ DIRECT_DISPLAY_INSTANCE_EXTENSIONS = (
 DIRECT_DISPLAY_WIN32_DEVICE_EXTENSION = "VK_NV_acquire_winrt_display"
 FULL_SCREEN_EXCLUSIVE_INSTANCE_EXTENSION = "VK_KHR_get_surface_capabilities2"
 FULL_SCREEN_EXCLUSIVE_DEVICE_EXTENSION = "VK_EXT_full_screen_exclusive"
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+LOCAL_VIEWER_ICON_PATH = Path(__file__).resolve().parents[1] / "icon2.ico"
 
 
 def direct_display_capability(
@@ -121,6 +125,56 @@ def should_restore_persistent_fullscreen(
     return bool(fullscreen and (not visible or iconic or not topmost))
 
 
+def configure_taskbar_window_style(extended_style: int, *, show_taskbar_button: bool) -> int:
+    """Return the Win32 extended style for the requested taskbar behavior."""
+    style = int(extended_style)
+    if show_taskbar_button:
+        style &= ~WS_EX_TOOLWINDOW
+        style |= WS_EX_APPWINDOW
+    else:
+        style |= WS_EX_TOOLWINDOW
+        style &= ~WS_EX_APPWINDOW
+    return style
+
+
+def load_glfw_window_icons(icon_path: Path = LOCAL_VIEWER_ICON_PATH) -> tuple[Any, ...]:
+    """Load useful ICO resolutions for GLFW's native window-icon API."""
+    try:
+        from PIL import Image
+
+        with Image.open(icon_path) as icon:
+            available_sizes = (
+                icon.ico.sizes() if getattr(icon, "ico", None) is not None else {icon.size}
+            )
+            preferred_sizes = ((16, 16), (32, 32), (48, 48), (256, 256))
+            return tuple(
+                icon.ico.getimage(size).convert("RGBA")
+                for size in preferred_sizes
+                if size in available_sizes
+            ) or (icon.convert("RGBA").copy(),)
+    except Exception:
+        return ()
+
+
+def configure_glfw_taskbar_icon(
+    glfw: Any,
+    window: Any,
+    *,
+    show_taskbar_button: bool,
+) -> bool:
+    """Apply Desktop2Stereo's icon only to the LSFG-visible taskbar window."""
+    if not show_taskbar_button:
+        return False
+    icons = load_glfw_window_icons()
+    if not icons:
+        return False
+    try:
+        glfw.set_window_icon(window, len(icons), icons)
+    except Exception:
+        return False
+    return True
+
+
 def configure_glfw_window_hints(glfw: Any, *, fullscreen: bool) -> None:
     """Reset process-global GLFW hints before creating each viewer window."""
     glfw.default_window_hints()
@@ -132,8 +186,8 @@ def configure_glfw_window_hints(glfw: Any, *, fullscreen: bool) -> None:
     glfw.window_hint(glfw.FLOATING, glfw.FALSE)
     glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.TRUE)
     if fullscreen and sys.platform == "win32":
-        # Create the output hidden so Windows cannot register a taskbar button
-        # before WS_EX_TOOLWINDOW is applied by _configure_persistent_fullscreen.
+        # Create the output hidden so the final taskbar style is applied before
+        # Windows shows the fullscreen window.
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
         glfw.window_hint(glfw.FLOATING, glfw.TRUE)
         glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
@@ -567,6 +621,7 @@ class VulkanLocalViewerConfig:
     preview_monitor_index: int | None = None
     manage_glfw_lifecycle: bool = True
     exclude_from_capture: bool = False
+    show_taskbar_button: bool = False
     cursor_passthrough: bool = False
     # Original capture size (tex_w,tex_h in legacy viewer) for dynamic eye ratio.
     # When set, HalfSBS uses W/2×H etc. based on this, not packed sw/sh.
@@ -697,15 +752,13 @@ class VulkanLocalViewer:
         # framebuffer down (e.g. 1920x1200 -> 1280x800 at 150%), leaving the
         # swapchain at the scaled extent and the image in the top-left corner.
         if sys.platform == "win32":
-            try:
-                import ctypes
+            from windows_dpi import set_per_monitor_dpi_v2
 
-                ctypes.windll.shcore.SetProcessDpiAwareness(2)
-            except Exception:
-                try:
-                    ctypes.windll.user32.SetProcessDPIAware()
-                except Exception:
-                    pass
+            # Per-monitor v2 (not v1) is required: v1 still lets GLFW scale the
+            # window to the primary/system scale on a mixed-DPI desktop, which
+            # prints as a reduced swapchain_extent (e.g. 1280x800) and leaves
+            # the SBS image in the top-left.
+            set_per_monitor_dpi_v2()
         import glfw
         try:
             import vulkan as vk
@@ -761,6 +814,11 @@ class VulkanLocalViewer:
         )
         if not self.window:
             raise RuntimeError("could not create Vulkan local viewer window")
+        configure_glfw_taskbar_icon(
+            glfw,
+            self.window,
+            show_taskbar_button=self.config.show_taskbar_button,
+        )
         if self._exclusive_fullscreen:
             if sys.platform == "darwin":
                 # The hidden-until-styled startup is a Windows trick
@@ -854,8 +912,11 @@ class VulkanLocalViewer:
             extended_style = self._win32_user32.GetWindowLongW(
                 self._win32_hwnd, -20
             )
-            extended_style |= 0x00000008 | 0x00000080 | 0x08000000
-            extended_style &= ~0x00040000
+            extended_style |= 0x00000008 | 0x08000000
+            extended_style = configure_taskbar_window_style(
+                extended_style,
+                show_taskbar_button=self.config.show_taskbar_button,
+            )
             if self.config.cursor_passthrough:
                 extended_style |= 0x00000020  # WS_EX_TRANSPARENT for cursor passthrough
             self._win32_user32.SetWindowLongW(

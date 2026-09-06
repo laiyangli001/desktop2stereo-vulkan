@@ -17,6 +17,7 @@ class SnapshotChangeClass(Enum):
 _HOT_RELOAD_FIELDS = frozenset(
     {
         "runtime_quality_mode",
+        "language",
         "presentation_flags",
         "debug_flags",
         "debug_output",
@@ -139,6 +140,7 @@ class RuntimeSettingsSnapshot:
     version: int
     timestamp: float
     source: str | None = None
+    language: str | None = None
     application_runtime_target: str | None = None
     runtime_quality_mode: str | None = None
     stereo_synthesis_mode: str | None = None

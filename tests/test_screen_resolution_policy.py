@@ -2,6 +2,7 @@ import pytest
 
 from utils.screen_resolution_policy import (
     build_output_sampling_plan,
+    build_projection_screen_sampling_plan,
     build_screen_sampling_plan,
     classify_input_resolution,
 )
@@ -64,3 +65,20 @@ def test_shared_headset_target_uses_the_existing_input_headset_matrix():
     assert (native.mode, native.target_width, native.target_height) == (
         "native_mip", 3840, 2160
     )
+
+
+def test_projection_plan_uses_visible_footprint_instead_of_quest2_2k_tier():
+    plan = build_projection_screen_sampling_plan(3840, 2160, 3000, 1687)
+
+    assert plan.mode == "downsample_lanczos_rcas"
+    assert plan.quality_size == (3000, 1688)
+    assert plan.quality_width > 2048
+    assert plan.quality_width / plan.quality_height == pytest.approx(3840 / 2160, rel=1e-3)
+
+
+def test_projection_plan_preserves_1920x1200_aspect_ratio():
+    plan = build_projection_screen_sampling_plan(1920, 1200, 2400, 1500)
+
+    assert plan.mode == "upscale_easu"
+    assert plan.quality_size == (2400, 1500)
+    assert plan.quality_width / plan.quality_height == pytest.approx(16 / 10)

@@ -268,6 +268,9 @@ def hot_reload_value_snapshot(settings_dict: dict, config) -> dict:
             min(10.0, float(settings_dict.get("Audio Delay", -0.1))),
         ),
     }
+    language = str(settings_dict.get("Language", "") or "").strip()
+    if language:
+        values["language"] = language
     _add_runtime_quality_mode_if_changed(values, settings_dict, config)
     _add_rebuild_fields_if_changed(values, settings_dict, config)
     if _is_fast_quality(settings_dict, config):

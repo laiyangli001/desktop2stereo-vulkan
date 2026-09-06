@@ -26,7 +26,7 @@ def output_sampling_plan_for_config(
     )
     # Local Viewer presents to a physical display; inflating every frame to
     # the headset tier before presenting wastes the whole GPU budget there.
-    # Other modes (XR/streaming consumers of the tier canvas) are unaffected.
+    # Consumers with output quality enabled still use the selected tier canvas.
     if (
         plan.mode == "upscale_easu"
         and os.environ.get("D2S_CAP_OUTPUT_UPSCALE", "") == "1"

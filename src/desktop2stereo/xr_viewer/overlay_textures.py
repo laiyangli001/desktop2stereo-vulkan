@@ -137,16 +137,37 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         "muted": (165, 176, 194, 255),
         "disabled": (91, 101, 117, 255),
     }
+    outer_inset = 16
+    content_inset = 34
     draw.rounded_rectangle(
-        (8, 8, width - 8, height - 8), radius=30,
+        # Use an explicit inclusive endpoint so the transparent margin is
+        # exactly the same on all four sides of the texture.
+        (
+            outer_inset,
+            outer_inset,
+            width - 1 - outer_inset,
+            height - 1 - outer_inset,
+        ),
+        radius=30,
         fill=colors["shell"], outline=colors["border"], width=4,
     )
     draw.rounded_rectangle(
         (34, 20, width - 34, 96), radius=15,
-        fill=colors["card"], outline=colors["border"], width=2,
+        # The tab buttons already provide their own outlines.  Keep the
+        # header's slightly lighter surface, but avoid a second enclosing
+        # stroke around the tab strip.
+        fill=colors["header"],
     )
     draw.rounded_rectangle(
-        (34, 105, width - 34, height - 18), radius=20,
+        # Keep the content card inset consistent on the horizontal edges
+        # and at the bottom of the outer menu shell.
+        (
+            content_inset,
+            105,
+            width - 1 - content_inset,
+            height - 1 - content_inset,
+        ),
+        radius=20,
         fill=colors["card"], outline=colors["border"], width=2,
     )
     label_font = load_overlay_font(21, prefer_cjk=True)
@@ -165,11 +186,15 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
     # Separators belong to the card background. Drawing them before controls
     # prevents the lines from crossing localized labels, tracks, or buttons.
     separator_y = {
-        "picture": (250, 346, 441, 537, 633, 729),
-        "depth": (318,),
+        "picture": (283, 379, 474, 570, 665, 760),
+        "depth": (351,),
         "glow": (405,),
         "room": (310, 405, 510, 625, 755),
-        "screen": (310, 424, 540, 648, 756),
+        "screen": (
+            (205, 420, 590, 756)
+            if getattr(menu, "screen_section", "layout") == "crop"
+            else (335, 442, 552, 660, 756)
+        ),
     }
     for y in separator_y[menu.tab]:
         draw.line((70, y, width - 70, y), fill=colors["border"], width=1)
@@ -209,6 +234,14 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             )
         elif control.key == "room:toggle_screen_reflection":
             active = bool(values.get("room:screen_reflection_enabled", True))
+        elif control.key == "openxr:render_auto":
+            active = bool(values.get("openxr_render_auto", False))
+        elif control.key.startswith("screen:section:"):
+            active = control.key.rsplit(":", 1)[1] == getattr(
+                menu, "screen_section", "layout"
+            )
+        elif control.key == "screen:dynamic_crop":
+            active = bool(values.get("screen:dynamic_crop", False))
         label = translate(control.label)
         if control.kind == "slider":
             value = float(values.get(control.key, control.minimum))
@@ -240,6 +273,8 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             value_text = (
                 f"{round(value * 100):.0f}%"
                 if control.key == "openxr_render_scale"
+                else f"{value:.0f}% each"
+                if control.key in {"screen:crop_width", "screen:crop_height"}
                 else f"{value:.2f}"
             )
             value_box = draw.textbbox((0, 0), value_text, font=value_font)
@@ -257,6 +292,24 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
             elif not control.enabled:
                 button_fill = (27, 34, 47, 255)
             draw.rounded_rectangle(box, radius=13, fill=button_fill, outline=outline, width=2)
+            if control.kind == "toggle":
+                switch_width = min(72, max(42, (box[2] - box[0]) // 3))
+                switch_height = min(32, max(22, (box[3] - box[1]) // 2))
+                switch_x1 = box[2] - 18
+                switch_x0 = switch_x1 - switch_width
+                switch_y0 = (box[1] + box[3] - switch_height) // 2
+                switch_y1 = switch_y0 + switch_height
+                draw.rounded_rectangle(
+                    (switch_x0, switch_y0, switch_x1, switch_y1),
+                    radius=switch_height // 2,
+                    fill=colors["blue"] if active else colors["track"],
+                )
+                knob_x = switch_x1 - switch_height // 2 if active else switch_x0 + switch_height // 2
+                draw.ellipse(
+                    (knob_x - switch_height // 2 + 3, switch_y0 + 3,
+                     knob_x + switch_height // 2 - 3, switch_y1 - 3),
+                    fill=colors["text"],
+                )
             if active:
                 draw.rounded_rectangle((box[0] + 20, box[3] - 5, box[2] - 20, box[3] - 1), radius=2, fill=colors["blue"])
             if control.key.startswith("screen:type:"):
@@ -295,7 +348,10 @@ def build_settings_menu_rgba(menu, values, *, hover_key=None, cursor_uv=None, la
         "depth": "Stereo depth",
         "glow": "Glow effects",
         "room": "Scene controls",
-        "screen": "Screen geometry",
+        "screen": (
+            "Screen crop" if getattr(menu, "screen_section", "layout") == "crop"
+            else "Screen geometry"
+        ),
     }
     draw.text(
         (82, 112), translate(section_labels[menu.tab]),

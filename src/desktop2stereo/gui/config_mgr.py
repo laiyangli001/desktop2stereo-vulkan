@@ -141,6 +141,15 @@ class GUIConfigMixin:
             cfg.get("Render Size Policy", DEFAULTS["Render Size Policy"]))
         self.render_scale_dd.value = self._render_scale_to_display(
             cfg.get("Render Scale", DEFAULTS["Render Scale"]))
+        openxr_render_value = cfg.get(
+            "XR Render",
+            cfg.get("OpenXR Render Scale", DEFAULTS["XR Render"]),
+        )
+        if str(cfg.get("XR Render Mode", "")).strip().lower() == "auto":
+            openxr_render_value = "Auto (Headset)"
+        self.openxr_render_resolution_dd.value = self._openxr_render_resolution_to_display(
+            openxr_render_value
+        )
         fixed_width = self._parse_int(cfg.get("Render Fixed Width", DEFAULTS["Render Fixed Width"]), DEFAULTS["Render Fixed Width"])
         fixed_height = self._parse_int(cfg.get("Render Fixed Height", DEFAULTS["Render Fixed Height"]), DEFAULTS["Render Fixed Height"])
         self.render_fixed_dd.value = self._fixed_size_to_display(fixed_width, fixed_height)
@@ -199,6 +208,7 @@ class GUIConfigMixin:
             "NVIDIA Frame Generation",
             cfg.get("Lossless Scaling Support", DEFAULTS["NVIDIA Frame Generation"]),
         )
+        self.lsfg_cb.value = bool(cfg.get("LSFG Support", DEFAULTS["LSFG Support"]))
         if keep_optional:
             self.locale = cfg.get("Language", DEFAULTS["Language"])
             self.lang_dd.value = "English" if self.locale == "EN" else "简体中文"
@@ -401,6 +411,16 @@ class GUIConfigMixin:
             "Processing Resolution": self._config.get("Processing Resolution", DEFAULTS["Processing Resolution"]),
             "Render Size Policy": "scaled",
             "Render Scale": self._display_to_render_scale(self.render_scale_dd.value),
+            "XR Render": self._display_to_openxr_render_resolution(
+                self.openxr_render_resolution_dd.value
+            ),
+            "XR Render Mode": (
+                "auto"
+                if self._openxr_render_resolution_is_auto(
+                    self.openxr_render_resolution_dd.value
+                )
+                else "manual"
+            ),
             "Render Fixed Width": render_fixed_width,
             "Render Fixed Height": render_fixed_height,
             "Render Max Pixels": self._parse_int(self.render_max_pixels_dd.value, DEFAULTS["Render Max Pixels"]),
@@ -436,6 +456,7 @@ class GUIConfigMixin:
             "Fill 16:9": self._display_to_display_fit(self.display_fit_dd.value) == "contain",
             "Fix Viewer Aspect": self._display_to_display_fit(self.display_fit_dd.value) != "stretch",
             "NVIDIA Frame Generation": bool(self.lossless_cb.value),
+            "LSFG Support": bool(self.lsfg_cb.value),
             "Stream Key": self.stream_key_tf.value,
             "Video Encoder Backend": {
                 "Auto": "auto",
@@ -591,6 +612,16 @@ class GUIConfigMixin:
             "Vulkan Projection Max LOD": self._parse_float(self.projection_max_lod_dd.value, DEFAULTS["Vulkan Projection Max LOD"]),
             "Vulkan Projection MIP LOD Bias": self._parse_float(self.projection_mip_lod_bias_dd.value, DEFAULTS["Vulkan Projection MIP LOD Bias"]),
             "Vulkan Projection RCAS Sharpness": self._parse_float(self.projection_rcas_sharpness_dd.value, DEFAULTS["Vulkan Projection RCAS Sharpness"]),
+            "XR Render": self._display_to_openxr_render_resolution(
+                self.openxr_render_resolution_dd.value
+            ),
+            "XR Render Mode": (
+                "auto"
+                if self._openxr_render_resolution_is_auto(
+                    self.openxr_render_resolution_dd.value
+                )
+                else "manual"
+            ),
             "Cross Eyed": bool(self.cross_eyed_cb.value),
             "Audio Delay": self._parse_float(
                 self.audio_delay_tf.value, DEFAULTS["Audio Delay"]

@@ -9,6 +9,11 @@ from gui.localization import gettext_for, normalize_locale
 
 SETTINGS_MENU_TEXTURE_SIZE = (1024, 832)
 SETTINGS_MENU_WORLD_SIZE = (0.95, 0.77)
+OPENXR_RENDER_SCALE_MIN = 0.5
+OPENXR_RENDER_SCALE_MAX = 4.0
+# The content subtitle is rendered at texture Y=112. Keep the shared action
+# row below that baseline so it cannot collide with the title in any locale.
+SETTINGS_MENU_ACTION_ROW = (0.17, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,7 +40,9 @@ class MenuControl:
 
 
 PICTURE_CONTROLS = (
-    ("openxr_render_scale", "Render Scale", 0.5, 2.0, 0.05),
+    # Percentage of the OpenXR runtime's recommended eye resolution.  The
+    # runtime still owns its Graphics Quality setting and max extent.
+    ("openxr_render_scale", "Render Resolution", OPENXR_RENDER_SCALE_MIN, OPENXR_RENDER_SCALE_MAX, 0.05),
     ("color_brightness", "Brightness", 0.2, 2.0, 0.1),
     ("color_contrast", "Contrast", 0.5, 2.0, 0.1),
     ("color_saturation", "Saturation", 0.0, 2.0, 0.1),
@@ -70,7 +77,11 @@ class OpenXrSettingsMenu:
 
     def __init__(self) -> None:
         self.visible = False
-        self.tab = "picture"
+        self.tab = "screen"
+        # The in-headset texture has room for either the geometry controls or
+        # the crop controls, but not both without making laser targets too
+        # small.  The desktop Flet mirror reads this same state.
+        self.screen_section = "layout"
         self.hover_key: str | None = None
         self.active_hand: int | None = None
         self.active_key: str | None = None
@@ -99,9 +110,17 @@ class OpenXrSettingsMenu:
         self.revision += 1
 
     def set_tab(self, tab: str) -> bool:
-        if tab not in self.tabs or (tab == "room" and not self.room_tab_visible) or tab == self.tab:
+        if tab not in self.tabs or tab == self.tab:
             return False
         self.tab = tab
+        self.hover_key = None
+        self.mark_dirty()
+        return True
+
+    def set_screen_section(self, section: str) -> bool:
+        if section not in {"layout", "crop"} or section == self.screen_section:
+            return False
+        self.screen_section = section
         self.hover_key = None
         self.mark_dirty()
         return True
@@ -110,12 +129,16 @@ class OpenXrSettingsMenu:
         self, *, allow_curve: bool = True, show_glow: bool = False,
         lang: str = "EN",
     ) -> tuple[MenuControl, ...]:
-        visible_tabs = ["picture", "depth"]
+        # Keep the geometry controls immediately available while preserving
+        # the existing order of the middle tabs.  Both the XR renderer and
+        # the Flet mirror consume this shared ordering.
+        visible_tabs = ["screen", "depth"]
         if show_glow:
             visible_tabs.append("glow")
-        if self.room_tab_visible:
-            visible_tabs.append("room")
-        visible_tabs.append("screen")
+        # Environment selection is managed from this tab, so it must remain
+        # available even while the Default environment is active.
+        visible_tabs.append("room")
+        visible_tabs.append("picture")
         left, right, gap = 0.04, 0.96, 0.008
         locale = normalize_locale(lang)
         labels = {
@@ -146,12 +169,16 @@ class OpenXrSettingsMenu:
         if self.tab in {"picture", "depth", "screen"}:
             controls.append(MenuControl(
                 "section:reset_defaults", "Reset to default values",
-                (0.70, 0.135, 0.92, 0.17),
+                (0.70, SETTINGS_MENU_ACTION_ROW[0], 0.92, SETTINGS_MENU_ACTION_ROW[1]),
             ))
         if self.tab == "picture":
+            controls.append(MenuControl(
+                "openxr:render_auto", "Headset optimized",
+                (0.08, SETTINGS_MENU_ACTION_ROW[0], 0.55, SETTINGS_MENU_ACTION_ROW[1]),
+            ))
             for index, (key, label, minimum, maximum, step) in enumerate(PICTURE_CONTROLS):
                 column, row = divmod(index, 6)
-                y0 = 0.20 + row * 0.115
+                y0 = 0.24 + row * 0.115
                 x0 = 0.08 + column * 0.47
                 self._append_slider_controls(
                     controls, key, label,
@@ -161,7 +188,7 @@ class OpenXrSettingsMenu:
         elif self.tab == "depth":
             self._append_slider_controls(
                 controls, "depth_strength", "Depth strength",
-                (0.16, 0.25, 0.84, 0.32), 0.0, 1.0, 0.05,
+                (0.16, 0.29, 0.84, 0.36), 0.0, 1.0, 0.05,
             )
             controls.extend((
                 MenuControl("depth:toggle_stereo", "2D / 3D", (0.12, 0.46, 0.44, 0.58)),
@@ -174,6 +201,10 @@ class OpenXrSettingsMenu:
                 MenuControl("glow:veil", "Veil", (0.08, 0.53, 0.47, 0.73)),
                 MenuControl("glow:off", "OFF", (0.53, 0.53, 0.92, 0.73)),
             ))
+            self._append_slider_controls(
+                controls, "glow:transparency", "Glow transparency",
+                (0.12, 0.80, 0.88, 0.85), 0.0, 1.0, 0.05,
+            )
         elif self.tab == "room":
             model_count = max(1, len(self.room_models))
             columns = min(5, model_count)
@@ -196,22 +227,80 @@ class OpenXrSettingsMenu:
                     (0.31, 0.52, 0.69, 0.60),
                 ),
             ))
-            self._append_slider_controls(controls, "room:seat_height", "Seat height", (0.12, 0.68, 0.88, 0.73), -3.0, 3.0, 0.05)
-            self._append_slider_controls(controls, "room:exposure", "Scene brightness", (0.12, 0.84, 0.88, 0.89), -8.0, 8.0, 0.1)
+            self._append_slider_controls(
+                controls, "room:seat_height", "Seat height",
+                (0.12, 0.68, 0.88, 0.73), -3.0, 3.0, 0.05,
+            )
+            self._append_slider_controls(
+                controls, "room:exposure", "Scene brightness",
+                (0.12, 0.84, 0.88, 0.89), -8.0, 8.0, 0.1,
+            )
         else:
             controls.extend((
-                MenuControl("screen:type:flat", "Flat", (0.07, 0.18, 0.27, 0.35), enabled=True),
-                MenuControl("screen:type:subtle", "Subtle", (0.29, 0.18, 0.49, 0.35), enabled=allow_curve),
-                MenuControl("screen:type:medium", "Medium", (0.51, 0.18, 0.71, 0.35), enabled=allow_curve),
-                MenuControl("screen:type:deep", "Deep", (0.73, 0.18, 0.93, 0.35), enabled=allow_curve),
+                MenuControl(
+                    "screen:section:layout", "Layout",
+                    (0.08, SETTINGS_MENU_ACTION_ROW[0], 0.37, SETTINGS_MENU_ACTION_ROW[1]),
+                ),
+                MenuControl(
+                    "screen:section:crop", "Crop",
+                    (0.40, SETTINGS_MENU_ACTION_ROW[0], 0.69, SETTINGS_MENU_ACTION_ROW[1]),
+                ),
+            ))
+            if self.screen_section == "crop":
+                controls.extend((
+                    MenuControl("screen:auto_crop", "Auto Crop", (0.08, 0.26, 0.46, 0.38)),
+                    MenuControl(
+                        "screen:dynamic_crop", "Dynamic Crop", (0.54, 0.26, 0.92, 0.38),
+                        "toggle",
+                    ),
+                    MenuControl("screen:reset_crop", "Reset Crop", (0.32, 0.47, 0.68, 0.57)),
+                ))
+                self._append_slider_controls(
+                    controls, "screen:crop_width", "Width crop (Left / Right)",
+                    (0.12, 0.68, 0.88, 0.73), 0.0, 45.0, 1.0,
+                )
+                self._append_slider_controls(
+                    controls, "screen:crop_height", "Height crop (Top / Bottom)",
+                    (0.12, 0.84, 0.88, 0.89), 0.0, 45.0, 1.0,
+                )
+                return tuple(controls)
+            controls.extend((
+                MenuControl(
+                    "screen:type:flat", "Flat", (0.065, 0.24, 0.245, 0.40),
+                    enabled=True,
+                ),
+                MenuControl(
+                    "screen:type:subtle", "Subtle", (0.295, 0.24, 0.475, 0.40),
+                    enabled=allow_curve,
+                ),
+                MenuControl(
+                    "screen:type:medium", "Medium", (0.525, 0.24, 0.705, 0.40),
+                    enabled=allow_curve,
+                ),
+                MenuControl(
+                    "screen:type:deep", "Deep", (0.755, 0.24, 0.935, 0.40),
+                    enabled=allow_curve,
+                ),
             ))
             controls.extend((
-                MenuControl("screen:rotate:-90", "-90°", (0.25, 0.405, 0.45, 0.49)),
-                MenuControl("screen:rotate:+90", "+90°", (0.55, 0.405, 0.75, 0.49)),
+                MenuControl("screen:rotate:-90", "-90°", (0.20, 0.43, 0.40, 0.52)),
+                MenuControl("screen:rotate:+90", "+90°", (0.60, 0.43, 0.80, 0.52)),
             ))
-            self._append_slider_controls(controls, "screen:width", "Screen size", (0.12, 0.58, 0.88, 0.63), 0.25, 2.0, 0.01)
-            self._append_slider_controls(controls, "screen:height", "Screen height", (0.12, 0.71, 0.88, 0.76), -10.0, 10.0, 0.05)
-            self._append_slider_controls(controls, "screen:distance", "Screen distance", (0.12, 0.84, 0.88, 0.89), 0.25, 2.0, 0.05)
+            self._append_slider_controls(
+                controls, "screen:width", "Screen size",
+                (0.12, 0.58, 0.88, 0.63), 0.25, 2.0, 0.01,
+            )
+            self._append_slider_controls(
+                controls, "screen:height", "Screen height",
+                (0.12, 0.71, 0.88, 0.76), -10.0, 10.0, 0.05,
+            )
+            self._append_slider_controls(
+                controls, "screen:distance", "Screen distance",
+                # Keep the mirror in sync with the headset presets, including
+                # the 1000" IMAX distance (20x). The controller itself has
+                # always been able to reach this range.
+                (0.12, 0.84, 0.88, 0.89), 0.25, 20.0, 0.05,
+            )
         return tuple(controls)
 
     @staticmethod

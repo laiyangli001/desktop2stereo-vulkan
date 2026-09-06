@@ -4,6 +4,13 @@
 #include "bridge_material.h"
 
 void bridge_scene_destroy(FilamentBridge* bridge) {
+    if (!bridge) return;
+    const bool has_scene_resources =
+            bridge->asset != nullptr || !bridge->glb_bytes.empty() ||
+            !bridge->brightness.scene_materials.empty() ||
+            !bridge->brightness.skybox_materials.empty() ||
+            !bridge->brightness.skybox_entities.empty();
+    if (!has_scene_resources) return;
     std::fprintf(stderr, "[FilamentBridge] load_glb phase=destroy begin bridge=%p\n",
             static_cast<void*>(bridge));
     std::fflush(stderr);

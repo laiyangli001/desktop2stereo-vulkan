@@ -74,6 +74,8 @@ _PROGRESS_PREFIX = "[D2S_PROGRESS] "
 _STATUS_PREFIX = "[D2S_STATUS] "
 _BACKEND_STATUS_PREFIX = "[D2S_BACKEND_STATUS] "
 _DISPLAY_REFRESH_WARNING_PREFIX = "[D2S_DISPLAY_REFRESH_WARNING] "
+_TCL_SHUTDOWN_NOISE_MARKER = "tcl_asyncdelete: async handler deleted by the wrong thread"
+_TCL_SHUTDOWN_STACK_RE = re.compile(r"^0x[0-9a-f]+(?:,|\s)", re.IGNORECASE)
 _ASYNCIO_SHUTDOWN_UNRAISABLE_MODULES = (
     "asyncio.base_subprocess",
     "asyncio.proactor_events",
@@ -90,6 +92,21 @@ _file_log_handler = None
 logger = logging.getLogger(__name__)
 status_logger = logging.getLogger("status")
 child_logger = logging.getLogger("child")
+
+
+def _save_run_completion_flags(settings_path: str) -> tuple[bool, str]:
+    """Clear one-shot compile flags without clobbering child-runtime changes."""
+    settings = read_yaml(settings_path) or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    for key in (
+        "Recompile TensorRT",
+        "Recompile MIGraphX",
+        "Recompile CoreML",
+        "Recompile OpenVINO",
+    ):
+        settings[key] = False
+    return save_yaml(settings_path, settings)
 
 
 class FirewallProbeError(RuntimeError):
@@ -1458,11 +1475,7 @@ class GUIProcessMixin:
                 if self.process and self.process.returncode is not None:
                     self._diag(f"process exited during wait, code={self.process.returncode}")
                     break
-            self._config["Recompile TensorRT"] = False
-            self._config["Recompile MIGraphX"] = False
-            self._config["Recompile CoreML"] = False
-            self._config["Recompile OpenVINO"] = False
-            save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
+            _save_run_completion_flags(os.path.join(BASE_DIR, "settings.yaml"))
         except Exception as e:
             self._diag(f"_countdown_and_run failed:\n{traceback.format_exc()}", error=True)
             if self._calibration_active:
@@ -1505,6 +1518,18 @@ class GUIProcessMixin:
         text = str(line or "").strip()
         if not text:
             return
+        # Tk can emit this native panic while the runtime is exiting if a
+        # background Tk thread is being finalized at the same time.  It is
+        # not an application failure, and the stack is not useful in the GUI
+        # log.  Keep the filter stateful so the complete native stack is
+        # hidden, without suppressing unrelated child errors.
+        if _TCL_SHUTDOWN_NOISE_MARKER in text.casefold():
+            self._tcl_shutdown_noise_active = True
+            return
+        if getattr(self, "_tcl_shutdown_noise_active", False):
+            if text.startswith("Exception Code:") or _TCL_SHUTDOWN_STACK_RE.match(text):
+                return
+            self._tcl_shutdown_noise_active = False
         if _VULKAN_DESCRIPTOR_DETAIL_RE.match(text):
             if not getattr(self, "_vulkan_descriptor_summary_logged", False):
                 self._vulkan_descriptor_summary_logged = True

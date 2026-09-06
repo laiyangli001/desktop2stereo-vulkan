@@ -32,17 +32,56 @@ def test_settings_menu_canvas_has_room_below_bottom_controls():
         SETTINGS_MENU_TEXTURE_SIZE[1], SETTINGS_MENU_TEXTURE_SIZE[0]
     )
     reset = next(control for control in menu.controls() if control.key == "section:reset_defaults")
-    assert int(reset.rect[3] * rgba.shape[0]) < int(0.20 * rgba.shape[0])
+    assert int(reset.rect[3] * rgba.shape[0]) < int(0.24 * rgba.shape[0])
+
+
+def test_settings_menu_tab_header_has_no_duplicate_outer_stroke():
+    menu = OpenXrSettingsMenu()
+    rgba = build_settings_menu_rgba(menu, {})
+
+    # The center of the header is away from the rounded corners and tab
+    # buttons, so it exposes the header surface rather than an outline.
+    assert tuple(rgba[20, SETTINGS_MENU_TEXTURE_SIZE[0] // 2]) == (
+        25, 35, 52, 255
+    )
+
+
+def test_settings_menu_content_card_has_balanced_bottom_inset():
+    menu = OpenXrSettingsMenu()
+    rgba = build_settings_menu_rgba(menu, {})
+    center_x = SETTINGS_MENU_TEXTURE_SIZE[0] // 2
+    height = SETTINGS_MENU_TEXTURE_SIZE[1]
+
+    assert tuple(rgba[height - 37, center_x]) == (27, 38, 56, 255)
+    assert tuple(rgba[height - 25, center_x]) == (21, 30, 45, 250)
+
+
+def test_settings_menu_shell_has_equal_texture_edge_margins():
+    menu = OpenXrSettingsMenu()
+    rgba = build_settings_menu_rgba(menu, {})
+    center_x = SETTINGS_MENU_TEXTURE_SIZE[0] // 2
+    center_y = SETTINGS_MENU_TEXTURE_SIZE[1] // 2
+
+    shell = (21, 30, 45, 250)
+    transparent = (0, 0, 0, 0)
+    assert tuple(rgba[100, center_x]) == shell
+    assert tuple(rgba[15, center_x]) == transparent
+    assert tuple(rgba[center_y, 20]) == shell
+    assert tuple(rgba[center_y, 15]) == transparent
+    assert tuple(rgba[811, center_x]) == shell
+    assert tuple(rgba[816, center_x]) == transparent
+    assert tuple(rgba[center_y, 1003]) == shell
+    assert tuple(rgba[center_y, 1008]) == transparent
 
 
 @pytest.mark.parametrize(
     ("tab", "separator_pixels"),
     (
-        ("picture", (250, 346, 441, 537, 633, 729)),
-        ("depth", (318,)),
+        ("picture", (283, 379, 474, 570, 665, 760)),
+        ("depth", (351,)),
         ("glow", (405,)),
         ("room", (310, 405, 510, 625, 755)),
-        ("screen", (310, 424, 540, 648, 756)),
+        ("screen", (335, 442, 552, 660, 756)),
     ),
 )
 def test_menu_separators_stay_between_controls(tab, separator_pixels) -> None:

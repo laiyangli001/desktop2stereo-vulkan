@@ -42,16 +42,30 @@ class VulkanProjectionScreenPass:
     _DEFAULT_RCAS_SHARPNESS = 0.5
 
     def __init__(
-        self, context: Any, target_format: int, *, enable_panorama: bool = False
+        self,
+        context: Any,
+        target_format: int,
+        *,
+        enable_panorama: bool = False,
+        panorama_required: bool = False,
     ) -> None:
         self.context = context
         self.vk = context.vk
         self.target_format = int(target_format)
         self.panorama_enabled = bool(enable_panorama)
+        self.panorama_required = bool(panorama_required and enable_panorama)
         self.min_mip_lod = self._min_mip_lod_from_env()
         self.mip_lod_bias = self._mip_lod_bias_from_env()
         self.max_mip_lod = self._max_mip_lod_from_env()
         self.rcas_sharpness = self._rcas_sharpness_from_env()
+        self.anisotropy_enabled = bool(
+            getattr(
+                getattr(context, "device_info", None),
+                "sampler_anisotropy_enabled",
+                False,
+            )
+        )
+        self.max_anisotropy = self._max_supported_anisotropy()
         (
             self.min_mip_lod,
             self.max_mip_lod,
@@ -77,6 +91,7 @@ class VulkanProjectionScreenPass:
         self.glow_descriptor_sets: list[Any] = []
         self.glow_descriptor_timelines = [0] * self._DESCRIPTOR_COUNT
         self.glow_param_buffers: list[VulkanStorageBuffer] = []
+        self.screen_crop_buffers: list[VulkanStorageBuffer] = []
         self.laser_descriptor_set_layout = None
         self.laser_descriptor_pool = None
         self.laser_descriptor_sets: list[Any] = []
@@ -86,6 +101,8 @@ class VulkanProjectionScreenPass:
         self.quality_images: dict[tuple[int, int, int], list[VulkanTransientImage]] = {}
         self.mip_slot_timelines = [0] * self._QUALITY_SLOT_COUNT
         self.mip_images: dict[tuple[int, int, int], list[VulkanTransientImage]] = {}
+        self._quality_chain_oom_active: bool = False
+        self._max_quality_pixels: int = 16 * 1024 * 1024
         self._mip_recording_templates: dict[
             tuple[int, int, int, int, int], dict[str, Any]
         ] = {}
@@ -219,13 +236,26 @@ class VulkanProjectionScreenPass:
                 addressModeU=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                 addressModeV=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                 addressModeW=vk.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                maxAnisotropy=1.0,
+                anisotropyEnable=vk.VK_TRUE if self.anisotropy_enabled else vk.VK_FALSE,
+                maxAnisotropy=self.max_anisotropy if self.anisotropy_enabled else 1.0,
                 mipLodBias=self.mip_lod_bias,
                 minLod=self.min_mip_lod,
                 maxLod=self.max_mip_lod,
             ),
             None,
         )
+
+    def _max_supported_anisotropy(self) -> float:
+        if not self.anisotropy_enabled:
+            return 1.0
+        try:
+            properties = self.vk.vkGetPhysicalDeviceProperties(self.context.physical_device)
+            limits = getattr(properties, "limits", None)
+            supported = float(getattr(limits, "maxSamplerAnisotropy", 1.0))
+            return max(1.0, min(8.0, supported))
+        except Exception:
+            self.anisotropy_enabled = False
+            return 1.0
 
     def _collect_retired_samplers(self) -> None:
         completed = self.context.completed_timeline_value()
@@ -314,7 +344,12 @@ class VulkanProjectionScreenPass:
                     0,
                     vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     stage_flags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
-                )
+                ),
+                DescriptorBinding(
+                    1,
+                    vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    stage_flags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                ),
             ],
         )
         self.creation_stage = "create_sampled_descriptor_pool"
@@ -323,12 +358,16 @@ class VulkanProjectionScreenPass:
             vk.VkDescriptorPoolCreateInfo(
                 sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                 maxSets=self._DESCRIPTOR_COUNT * 4,
-                poolSizeCount=1,
+                poolSizeCount=2,
                 pPoolSizes=[
                     vk.VkDescriptorPoolSize(
                         type=vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                         descriptorCount=self._DESCRIPTOR_COUNT * 4,
-                    )
+                    ),
+                    vk.VkDescriptorPoolSize(
+                        type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        descriptorCount=self._DESCRIPTOR_COUNT * 4,
+                    ),
                 ],
             ),
             None,
@@ -355,6 +394,33 @@ class VulkanProjectionScreenPass:
         self.hdr_descriptor_sets = allocated_descriptor_sets[
             self._DESCRIPTOR_COUNT * 3:self._DESCRIPTOR_COUNT * 4
         ]
+        self.screen_crop_buffers = [
+            VulkanStorageBuffer(self.context, 16)
+            for _ in range(self._DESCRIPTOR_COUNT)
+        ]
+        full_crop = struct.pack("<4f", 0.0, 0.0, 1.0, 1.0)
+        for descriptor_set, buffer in zip(self.descriptor_sets, self.screen_crop_buffers):
+            buffer.write_bytes(full_crop)
+            vk.vkUpdateDescriptorSets(
+                self.context.device,
+                1,
+                [
+                    vk.VkWriteDescriptorSet(
+                        sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        dstSet=descriptor_set,
+                        dstBinding=1,
+                        descriptorCount=1,
+                        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        pBufferInfo=[
+                            vk.VkDescriptorBufferInfo(
+                                buffer=buffer.buffer, offset=0, range=16,
+                            )
+                        ],
+                    )
+                ],
+                0,
+                None,
+            )
         self.creation_stage = "create_glow_descriptors"
         self.glow_descriptor_set_layout = create_descriptor_set_layout(
             self.context,
@@ -1354,37 +1420,138 @@ class VulkanProjectionScreenPass:
             None,
         )[0]
         if self.panorama_enabled:
-            self.creation_stage = "create_panorama_pipeline_layout"
+            self._create_panorama_pipeline(
+                panorama_vertex_module,
+                panorama_fragment_module,
+            )
+
+    def _create_panorama_pipeline(self, vertex_module: Any, fragment_module: Any) -> None:
+        """Create optional GPU panorama pass without taking down screen output."""
+        vk = self.vk
+        self.creation_stage = "create_panorama_pipeline_layout"
+        try:
             self.panorama_pipeline_layout = vk.vkCreatePipelineLayout(
                 self.context.device,
                 vk.VkPipelineLayoutCreateInfo(
                     sType=vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                    setLayoutCount=1, pSetLayouts=[self.descriptor_set_layout],
+                    setLayoutCount=1,
+                    pSetLayouts=[self.descriptor_set_layout],
                     pushConstantRangeCount=1,
                     pPushConstantRanges=[vk.VkPushConstantRange(
-                        stageFlags=(vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT),
-                        offset=0, size=32,
+                        stageFlags=(
+                            vk.VK_SHADER_STAGE_VERTEX_BIT
+                            | vk.VK_SHADER_STAGE_FRAGMENT_BIT
+                        ),
+                        offset=0,
+                        size=32,
                     )],
-                ), None,
+                ),
+                None,
             )
             self.creation_stage = "create_panorama_pipeline"
             self.panorama_pipeline = vk.vkCreateGraphicsPipelines(
-                self.context.device, None, 1, [vk.VkGraphicsPipelineCreateInfo(
+                self.context.device,
+                None,
+                1,
+                [vk.VkGraphicsPipelineCreateInfo(
                     sType=vk.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
                     stageCount=2,
                     pStages=[
-                        vk.VkPipelineShaderStageCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, stage=vk.VK_SHADER_STAGE_VERTEX_BIT, module=panorama_vertex_module, pName="main"),
-                        vk.VkPipelineShaderStageCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, stage=vk.VK_SHADER_STAGE_FRAGMENT_BIT, module=panorama_fragment_module, pName="main"),
+                        vk.VkPipelineShaderStageCreateInfo(
+                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                            stage=vk.VK_SHADER_STAGE_VERTEX_BIT,
+                            module=vertex_module,
+                            pName="main",
+                        ),
+                        vk.VkPipelineShaderStageCreateInfo(
+                            sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                            stage=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                            module=fragment_module,
+                            pName="main",
+                        ),
                     ],
-                    pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO),
-                    pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST),
-                    pViewportState=vk.VkPipelineViewportStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, viewportCount=1, scissorCount=1),
-                    pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, polygonMode=vk.VK_POLYGON_MODE_FILL, cullMode=vk.VK_CULL_MODE_NONE, frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE, lineWidth=1.0),
-                    pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT),
-                    pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, attachmentCount=1, pAttachments=[vk.VkPipelineColorBlendAttachmentState(blendEnable=vk.VK_FALSE, colorWriteMask=(vk.VK_COLOR_COMPONENT_R_BIT|vk.VK_COLOR_COMPONENT_G_BIT|vk.VK_COLOR_COMPONENT_B_BIT|vk.VK_COLOR_COMPONENT_A_BIT))]),
-                    pDynamicState=vk.VkPipelineDynamicStateCreateInfo(sType=vk.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, dynamicStateCount=2, pDynamicStates=[vk.VK_DYNAMIC_STATE_VIEWPORT, vk.VK_DYNAMIC_STATE_SCISSOR]),
-                    layout=self.panorama_pipeline_layout, renderPass=self.render_pass, subpass=0, basePipelineIndex=-1,
-                )], None)[0]
+                    pVertexInputState=vk.VkPipelineVertexInputStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+                    ),
+                    pInputAssemblyState=vk.VkPipelineInputAssemblyStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                        topology=vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                    ),
+                    pViewportState=vk.VkPipelineViewportStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                        viewportCount=1,
+                        scissorCount=1,
+                    ),
+                    pRasterizationState=vk.VkPipelineRasterizationStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                        polygonMode=vk.VK_POLYGON_MODE_FILL,
+                        cullMode=vk.VK_CULL_MODE_NONE,
+                        frontFace=vk.VK_FRONT_FACE_COUNTER_CLOCKWISE,
+                        lineWidth=1.0,
+                    ),
+                    pMultisampleState=vk.VkPipelineMultisampleStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                        rasterizationSamples=vk.VK_SAMPLE_COUNT_1_BIT,
+                    ),
+                    pColorBlendState=vk.VkPipelineColorBlendStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                        attachmentCount=1,
+                        pAttachments=[vk.VkPipelineColorBlendAttachmentState(
+                            blendEnable=vk.VK_FALSE,
+                            colorWriteMask=(
+                                vk.VK_COLOR_COMPONENT_R_BIT
+                                | vk.VK_COLOR_COMPONENT_G_BIT
+                                | vk.VK_COLOR_COMPONENT_B_BIT
+                                | vk.VK_COLOR_COMPONENT_A_BIT
+                            ),
+                        )],
+                    ),
+                    pDynamicState=vk.VkPipelineDynamicStateCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                        dynamicStateCount=2,
+                        pDynamicStates=[
+                            vk.VK_DYNAMIC_STATE_VIEWPORT,
+                            vk.VK_DYNAMIC_STATE_SCISSOR,
+                        ],
+                    ),
+                    layout=self.panorama_pipeline_layout,
+                    renderPass=self.render_pass,
+                    subpass=0,
+                    basePipelineIndex=-1,
+                )],
+                None,
+            )[0]
+        except Exception as exc:
+            if (
+                bool(getattr(self.context, "device_lost", False))
+                or self.panorama_required
+            ):
+                raise
+            if self.panorama_pipeline is not None:
+                try:
+                    vk.vkDestroyPipeline(
+                        self.context.device, self.panorama_pipeline, None
+                    )
+                except Exception:
+                    pass
+            if self.panorama_pipeline_layout is not None:
+                try:
+                    vk.vkDestroyPipelineLayout(
+                        self.context.device,
+                        self.panorama_pipeline_layout,
+                        None,
+                    )
+                except Exception:
+                    pass
+            self.panorama_pipeline = None
+            self.panorama_pipeline_layout = None
+            self.panorama_enabled = False
+            print(
+                "[VulkanProjection] Optional panorama pipeline unavailable; "
+                "keeping GPU screen composition active: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _target_view_and_framebuffer(
         self, target: Any, array_layer: int, *, overlay: bool = False
@@ -1444,6 +1611,7 @@ class VulkanProjectionScreenPass:
         push_constants: bytes,
         clear_color: tuple[float, float, float, float],
         wait_semaphore: Any | None,
+        source_crop_uv: tuple[float, float, float, float] | None = None,
     ) -> int:
         draw = self._prepare_draw(
             source,
@@ -1453,6 +1621,7 @@ class VulkanProjectionScreenPass:
             frame_slot=frame_slot,
             push_constants=push_constants,
             clear_color=clear_color,
+            source_crop_uv=source_crop_uv,
         )
         timeline = self.context.submit_on(
             "graphics",
@@ -1484,6 +1653,7 @@ class VulkanProjectionScreenPass:
                 frame_slot=int(item["frame_slot"]),
                 push_constants=item["push_constants"],
                 clear_color=item["clear_color"],
+                source_crop_uv=item.get("source_crop_uv"),
                 overlay=bool(load_target),
             )
             if load_target:
@@ -1776,6 +1946,7 @@ class VulkanProjectionScreenPass:
                 frame_slot=int(item["frame_slot"]),
                 push_constants=item["push_constants"],
                 clear_color=item["clear_color"],
+                source_crop_uv=item.get("source_crop_uv"),
             )
             filtered["target_old_layout"] = self.context.image_state(scratch.image).layout
             filtered_draws.append(filtered)
@@ -1926,6 +2097,7 @@ class VulkanProjectionScreenPass:
                     frame_slot=int(item["frame_slot"]),
                     push_constants=item["push_constants"],
                     clear_color=item["clear_color"],
+                    source_crop_uv=item.get("source_crop_uv"),
                     source_ready_in_submission=True,
                     overlay=bool(load_target),
             )
@@ -2004,6 +2176,8 @@ class VulkanProjectionScreenPass:
         mode: str,
         filter_scale: float,
         upscale_scale: float,
+        quality_width: int | None = None,
+        quality_height: int | None = None,
         load_target: bool = False,
         wait_for_timeline: int = 0,
         extra_wait_semaphores: list[Any] | tuple[Any, ...] = (),
@@ -2039,27 +2213,31 @@ class VulkanProjectionScreenPass:
         ) or not self._supports_linear_blit(target_format):
             return None
         scale = float(upscale_scale) if mode == "upscale_easu" else 1.0 / float(filter_scale)
-        quality_width = max(16, int(round(int(source.width) * scale)) & ~1)
-        quality_height = max(16, int(round(int(source.height) * scale)) & ~1)
+        quality_width = max(
+            16,
+            (
+                int(quality_width)
+                if quality_width is not None
+                else int(round(int(source.width) * scale))
+            )
+            & ~1,
+        )
+        quality_height = max(
+            16,
+            (
+                int(quality_height)
+                if quality_height is not None
+                else int(round(int(source.height) * scale))
+            )
+            & ~1,
+        )
+        if self._quality_chain_oom_active:
+            return None
+        if (self._max_quality_pixels > 0
+                and quality_width * quality_height > self._max_quality_pixels):
+            self._quality_chain_oom_active = True
+            return None
         key = (quality_width, quality_height, target_format)
-        quality_images = self.quality_images.get(key)
-        if quality_images is None:
-            quality_images = [
-                VulkanTransientImage(self.context, quality_width, quality_height,
-                    format=target_format, label=f"projection-quality-eye{eye}-slot{slot}")
-                for eye in range(2) for slot in range(self._QUALITY_SLOT_COUNT)
-            ]
-            self.quality_images[key] = quality_images
-        mip_images = self.mip_images.get(key)
-        if mip_images is None:
-            mip_levels = int(math.floor(math.log2(max(quality_width, quality_height)))) + 1
-            mip_images = [
-                VulkanTransientImage(self.context, quality_width, quality_height,
-                    format=target_format, label=f"projection-quality-mip-eye{eye}-slot{slot}",
-                    mip_levels=mip_levels)
-                for eye in range(2) for slot in range(self._QUALITY_SLOT_COUNT)
-            ]
-            self.mip_images[key] = mip_images
         descriptor_indices = [
             (int(item["eye_index"]) * 3 + int(item["frame_slot"])) % self._DESCRIPTOR_COUNT
             for item in draws
@@ -2070,6 +2248,62 @@ class VulkanProjectionScreenPass:
         in_use.extend(self.quality_descriptor_timelines[index] for index in descriptor_indices)
         if any(int(value) > int(completed) for value in in_use):
             return None
+        if key not in self.quality_images or key not in self.mip_images:
+            # The projected footprint can move by a few pixels every frame.
+            # Keep one completed extent alive instead of accumulating a full
+            # pair of six-image eye/slot caches for every jittered extent.
+            if self.quality_images or self.mip_images:
+                self._close_quality_image_cache()
+        quality_images = self.quality_images.get(key)
+        if quality_images is None:
+            created_quality_images: list[VulkanTransientImage] = []
+            try:
+                for eye in range(2):
+                    for slot in range(self._QUALITY_SLOT_COUNT):
+                        created_quality_images.append(
+                            VulkanTransientImage(
+                                self.context, quality_width, quality_height,
+                                format=target_format,
+                                label=f"projection-quality-eye{eye}-slot{slot}",
+                            )
+                        )
+            except Exception:
+                for image in created_quality_images:
+                    image.close()
+                self._quality_chain_oom_active = True
+                return None
+            quality_images = created_quality_images
+            self.quality_images[key] = quality_images
+        mip_images = self.mip_images.get(key)
+        if mip_images is None:
+            # The quality pass already converts to the projected screen
+            # footprint and RCAS follows that conversion. A second mip chain
+            # would only blur the final sample; native-mip mode owns mipmaps.
+            mip_levels = 1
+            created_mip_images: list[VulkanTransientImage] = []
+            try:
+                for eye in range(2):
+                    for slot in range(self._QUALITY_SLOT_COUNT):
+                        created_mip_images.append(
+                            VulkanTransientImage(
+                                self.context, quality_width, quality_height,
+                                format=target_format,
+                                label=f"projection-quality-mip-eye{eye}-slot{slot}",
+                                mip_levels=mip_levels,
+                            )
+                        )
+            except Exception:
+                for image in created_mip_images:
+                    image.close()
+                self._quality_chain_oom_active = True
+                # The quality images were allocated for this failed pair and
+                # cannot be useful without their matching mip images.
+                for image in quality_images:
+                    image.close()
+                self.quality_images.pop(key, None)
+                return None
+            mip_images = created_mip_images
+            self.mip_images[key] = mip_images
         quality_draws = []
         rcas_draws = []
         screen_draws = []
@@ -2107,6 +2341,7 @@ class VulkanProjectionScreenPass:
                 mip, item["target"], array_layer=int(item["array_layer"]),
                 eye_index=eye_index, frame_slot=int(item["frame_slot"]),
                 push_constants=item["push_constants"], clear_color=item["clear_color"],
+                source_crop_uv=item.get("source_crop_uv"),
                 source_ready_in_submission=True,
                 overlay=bool(load_target),
             )
@@ -2134,6 +2369,8 @@ class VulkanProjectionScreenPass:
                     self._record_rcas_draw(command_buffer, mip_draw)
                 else:
                     self._record_copy_draw(command_buffer, mip_draw)
+                # With one mip level this is only the color-attachment to
+                # shader-read barrier; no mip generation is performed.
                 self._record_generate_mips(
                     command_buffer,
                     mip_draw["target"],
@@ -2345,6 +2582,17 @@ class VulkanProjectionScreenPass:
             | self.vk.VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
         )
         return bool(int(properties.optimalTilingFeatures) & int(required) == int(required))
+
+    def _close_quality_image_cache(self) -> None:
+        """Release cached quality intermediates after their timeline completes."""
+        for images in self.quality_images.values():
+            for image in images:
+                image.close()
+        for images in self.mip_images.values():
+            for image in images:
+                image.close()
+        self.quality_images.clear()
+        self.mip_images.clear()
 
     def _prepare_copy_draw(
         self,
@@ -2792,6 +3040,7 @@ class VulkanProjectionScreenPass:
         frame_slot: int,
         push_constants: bytes,
         clear_color: tuple[float, float, float, float],
+        source_crop_uv: tuple[float, float, float, float] | None = None,
         source_ready_in_submission: bool = False,
         descriptor_set: Any | None = None,
         descriptor_timelines: list[int] | None = None,
@@ -2816,7 +3065,24 @@ class VulkanProjectionScreenPass:
         last_use = timeline_slots[descriptor_index]
         if last_use:
             self.context.wait_for_timeline(last_use)
+        use_screen_crop = descriptor_set is None
         descriptor_set = descriptor_set or self.descriptor_sets[descriptor_index]
+        if use_screen_crop:
+            try:
+                crop_values = tuple(
+                    float(value) for value in (source_crop_uv or (0.0, 0.0, 1.0, 1.0))
+                )
+            except (TypeError, ValueError):
+                crop_values = (0.0, 0.0, 1.0, 1.0)
+            if len(crop_values) != 4 or not all(math.isfinite(value) for value in crop_values):
+                crop_values = (0.0, 0.0, 1.0, 1.0)
+            crop_x = max(0.0, min(0.9, crop_values[0]))
+            crop_y = max(0.0, min(0.9, crop_values[1]))
+            crop_width = max(0.1, min(1.0 - crop_x, crop_values[2]))
+            crop_height = max(0.1, min(1.0 - crop_y, crop_values[3]))
+            self.screen_crop_buffers[descriptor_index].write_bytes(
+                struct.pack("<4f", crop_x, crop_y, crop_width, crop_height)
+            )
         self.vk.vkUpdateDescriptorSets(
             self.context.device,
             1,
@@ -3135,16 +3401,12 @@ class VulkanProjectionScreenPass:
         self.rcas_descriptor_timelines[rcas_draw["descriptor_index"]] = int(timeline)
 
     def close(self) -> None:
+        self._quality_chain_oom_active = False
         self._mip_recording_templates.clear()
         self._render_pass_recording_templates.clear()
         self._image_barrier_templates.clear()
         if self.context.device is not None:
-            for images in self.quality_images.values():
-                for image in images:
-                    image.close()
-            for images in self.mip_images.values():
-                for image in images:
-                    image.close()
+            self._close_quality_image_cache()
             for framebuffer in self.framebuffers.values():
                 self.vk.vkDestroyFramebuffer(self.context.device, framebuffer, None)
             for framebuffer in self.overlay_framebuffers.values():
@@ -3227,6 +3489,8 @@ class VulkanProjectionScreenPass:
                 )
             for buffer in self.glow_param_buffers:
                 buffer.close()
+            for buffer in self.screen_crop_buffers:
+                buffer.close()
             for buffer in self.laser_param_buffers:
                 buffer.close()
             if self.glow_descriptor_pool is not None:
@@ -3265,6 +3529,7 @@ class VulkanProjectionScreenPass:
         self.panorama_pipeline_layout = None
         self.glow_descriptor_sets.clear()
         self.glow_param_buffers.clear()
+        self.screen_crop_buffers.clear()
         self.laser_descriptor_sets.clear()
         self.laser_param_buffers.clear()
         self.pipeline = None

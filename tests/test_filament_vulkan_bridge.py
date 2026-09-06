@@ -551,6 +551,9 @@ def test_native_multiview_uses_final_controller_composition_layer() -> None:
     assert "bridge->renderer->render(bridge->eyes[0].controller_view)" in eye_source
     assert "bridge->engine->flushAndWait()" in eye_source
     assert "0x02u | (1u << kScreenLayerBase)" in eye_source
+    assert "eye.controller_view->setBlendMode(\n            filament::View::BlendMode::TRANSLUCENT)" in eye_source
+    assert "eye.controller_view->setPostProcessingEnabled(false)" in eye_source
+    assert "setChannelDepthClearEnabled(0, true)" in eye_source
     assert "filament_bridge_render_controller_composition_layer" in facade
     assert "filament_bridge_render_controller_composition_layer" in public_header
     assert (

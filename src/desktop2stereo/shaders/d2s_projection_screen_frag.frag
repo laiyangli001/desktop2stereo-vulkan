@@ -1,6 +1,9 @@
 #version 450
 
 layout(set = 0, binding = 0) uniform sampler2D screen_texture;
+layout(set = 0, binding = 1, std430) readonly buffer ScreenCropState {
+    vec4 source_crop;
+} crop_state;
 layout(push_constant) uniform ScreenParams {
     mat4 view_projection;
     vec4 center;
@@ -11,6 +14,22 @@ layout(push_constant) uniform ScreenParams {
 
 layout(location = 0) in vec2 texture_uv;
 layout(location = 0) out vec4 output_color;
+
+vec2 crop_min_uv() {
+    return clamp(crop_state.source_crop.xy, vec2(0.0), vec2(0.9));
+}
+
+vec2 crop_max_uv() {
+    vec2 minimum = crop_min_uv();
+    return clamp(
+        minimum + max(crop_state.source_crop.zw, vec2(0.1)),
+        minimum + vec2(0.1), vec2(1.0)
+    );
+}
+
+vec2 crop_source_uv(vec2 display_uv) {
+    return mix(crop_min_uv(), crop_max_uv(), clamp(display_uv, vec2(0.0), vec2(1.0)));
+}
 
 float sinc(float value) {
     float magnitude = abs(value);
@@ -36,9 +55,9 @@ vec4 sample_lanczos2(vec2 uv) {
             float weight = lanczos2_weight(offset.x / scale)
                 * lanczos2_weight(offset.y / scale);
             vec2 sample_uv = clamp(
-                uv + offset * vec2(params.center.w, params.right.w) * scale,
-                vec2(0.0),
-                vec2(1.0)
+                crop_source_uv(uv) + offset * vec2(params.center.w, params.right.w) * scale,
+                crop_min_uv(),
+                crop_max_uv()
             );
             total += texture(screen_texture, sample_uv) * weight;
             total_weight += weight;
@@ -53,7 +72,7 @@ float luma(vec3 color) {
 
 vec3 sample_easu_source(vec2 pixel, vec2 source_texel) {
     return texture(screen_texture, clamp(
-        (pixel + vec2(0.5)) * source_texel, vec2(0.0), vec2(1.0)
+        (pixel + vec2(0.5)) * source_texel, crop_min_uv(), crop_max_uv()
     )).rgb;
 }
 
@@ -94,10 +113,11 @@ void easu_tap(
 
 vec3 sample_easu(vec2 uv) {
     vec2 source_texel = abs(vec2(params.center.w, params.right.w));
-    vec2 source_size = 1.0 / source_texel;
+    vec2 source_size = (crop_max_uv() - crop_min_uv()) / source_texel;
     vec2 output_size = max(vec2(params.up.w, params.size_curve.w), vec2(1.0));
     vec2 output_uv = (floor(uv * output_size) + vec2(0.5)) / output_size;
-    vec2 source_position = output_uv * source_size - vec2(0.5);
+    vec2 source_position = crop_min_uv() / source_texel
+        + output_uv * source_size - vec2(0.5);
     vec2 source_base = floor(source_position);
     vec2 pp = source_position - source_base;
 
@@ -159,7 +179,7 @@ void main() {
         ? vec4(sample_easu(texture_uv), 1.0)
         : (params.size_curve.w > 0.5
             ? sample_lanczos2(texture_uv)
-            : texture(screen_texture, texture_uv));
+            : texture(screen_texture, crop_source_uv(texture_uv)));
     output_color = vec4(color.rgb, params.size_curve.w < -0.5
         ? clamp(dot(color.rgb, vec3(0.299, 0.587, 0.114)) * 0.35, 0.0, 0.35)
         : 1.0);

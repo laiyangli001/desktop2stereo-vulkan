@@ -291,6 +291,7 @@ class GUIBuilderMixin:
             self.acceleration_label, self.computing_device_label, self.capture_tool_label,
             self.target_fps_label, self.render_policy_label, self.render_fixed_label,
             self.render_min_dimension_label, self.run_mode_label, self.xr_headset_label,
+            self.openxr_render_resolution_label,
             self.stereo_output_label, self.controller_label, self.lang_label,
             self.stream_url_label, self.stream_port_label,
             self.stream_proto_label, self.audio_label, self.crf_label,
@@ -663,6 +664,23 @@ class GUIBuilderMixin:
             value=str(DEFAULTS["Render Align"]), width=S(130))
         self.row6d = ft.Row([self.render_scale_label, self.render_scale_dd,
             ft.Container(width=S(40)), self.render_align_label, self.render_align_dd], spacing=1)
+        self.openxr_render_resolution_label = ft.Text(
+            "XR Render:", size=FONT_SIZE, width=S(130), visible=False
+        )
+        self.openxr_render_resolution_dd = CompactDropdown(
+            options=self._openxr_render_resolution_options(),
+            value=self._openxr_render_resolution_to_display(
+                DEFAULTS["XR Render"]
+            ),
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+        )
+        self.openxr_render_resolution_dd.visible = False
+        self.row6g = ft.Row(
+            [self.openxr_render_resolution_label, self.openxr_render_resolution_dd],
+            spacing=1,
+            visible=False,
+        )
         self.render_fixed_label = ft.Text("Render Fixed Size:", size=FONT_SIZE, width=S(130), visible=False)
         self.render_fixed_dd = CompactDropdown(
             options=["1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"],
@@ -744,8 +762,14 @@ class GUIBuilderMixin:
             label="NvFRUC 补帧",
             tooltip=UI_MESSAGES[self.locale]["tooltip_nvfruc"],
         )
+        self.lsfg_cb = ft.Checkbox(
+            scale=SCALE,
+            visual_density=ft.VisualDensity.COMPACT,
+            label="LSFG Support",
+            tooltip=UI_MESSAGES[self.locale]["tooltip_lsfg"],
+        )
         self.row7a = ft.Row([
-            self.run_mode_label, self.run_mode_dd, self.lossless_cb,
+            self.run_mode_label, self.run_mode_dd, self.lossless_cb, self.lsfg_cb,
             ft.Container(width=S(40)), self.stream_settings_cb,
         ], spacing=1)
         self.xr_headset_row = ft.Row(
@@ -800,7 +824,7 @@ class GUIBuilderMixin:
         lang_row = ft.Row([self.lang_label, self.lang_dd, ft.Container(width=S(40)),
             self.theme_label, self.theme_dd], spacing=1)
 
-        self.status_text = ft.Text("", italic=True, size=max(10, FONT_SIZE - 2))
+        self.status_text = ft.Text("", size=max(10, FONT_SIZE - 2))
         self.backend_status_text = ft.Text(
             "", size=10, color=ft.Colors.GREY,
             visible=True, overflow=ft.TextOverflow.VISIBLE,
@@ -829,7 +853,7 @@ class GUIBuilderMixin:
         # Device group is OUTSIDE the scroll area so it can stretch to fill the
         # leftover height (like the log panel). Its own content scrolls when the
         # window is shorter than the rows.
-        device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6e, self.row6f,
+        device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
                        self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
                        self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
                        tight=True)
@@ -925,6 +949,9 @@ class GUIBuilderMixin:
             ], spacing=S(4), expand=True),
             visible=False,
             expand=True,
+            # Match the Computing Device group's bottom inset so both panel
+            # borders end on the same horizontal line in the stretched row.
+            margin=ft.Margin(0, 0, 0, S(6)),
             padding=ft.Padding(S(8), S(6), S(8), S(6)),
             bgcolor=ft.Colors.SURFACE_CONTAINER,
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),

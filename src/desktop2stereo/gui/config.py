@@ -169,6 +169,10 @@ DEFAULTS = {
     "Processing Resolution": "Auto",
     "Render Size Policy": "scaled",
     "Render Scale": "4K / 100%",
+    # OpenXR projection target multiplier. This is independent from the
+    # capture/inference Render Scale above.
+    "XR Render": 1.0,
+    "XR Render Mode": "auto",
     "Render Fixed Width": 1920,
     "Render Fixed Height": 1080,
     "Render Max Pixels": 3840 * 2160,
@@ -194,6 +198,7 @@ DEFAULTS = {
     "NVIDIA Frame Generation": False,
     # Legacy key is read only for migration from pre-NvFRUC settings.
     "Lossless Scaling Support": False,
+    "LSFG Support": False,
     "Capture Tool": "none",
     "Display Fit Mode": "contain",
     "Stream Display Fit Mode": "contain",

@@ -50,6 +50,7 @@ class VulkanDeviceInfo:
     transfer_queue_family_index: int = -1
     timeline_semaphore_enabled: bool = False
     synchronization2_enabled: bool = False
+    sampler_anisotropy_enabled: bool = False
     # Vulkan does not expose a portable DXGI LUID in the base properties
     # query. Keep it explicit so cross-API consumers never infer identity
     # from a name or PCI vendor alone.
@@ -364,7 +365,7 @@ class VulkanContext:
                 cfg.required_device_extensions,
                 available_device_extensions,
             )
-            device, synchronization2_enabled = _create_device(
+            device, synchronization2_enabled, sampler_anisotropy_enabled = _create_device(
                 vk,
                 physical_device,
                 queue_families,
@@ -379,6 +380,7 @@ class VulkanContext:
                 queue_families,
                 timeline_semaphore_enabled=True,
                 synchronization2_enabled=synchronization2_enabled,
+                sampler_anisotropy_enabled=sampler_anisotropy_enabled,
             )
             return cls(
                 vk=vk,
@@ -415,6 +417,7 @@ class VulkanContext:
         owns_device: bool = True,
         timeline_semaphore_enabled: bool = False,
         synchronization2_enabled: bool = False,
+        sampler_anisotropy_enabled: bool = False,
         compute_queue_index: int = 0,
         transfer_queue_index: int = 0,
         frame_context_count: int = 3,
@@ -444,6 +447,7 @@ class VulkanContext:
                 ),
                 timeline_semaphore_enabled=timeline_semaphore_enabled,
                 synchronization2_enabled=synchronization2_enabled,
+                sampler_anisotropy_enabled=sampler_anisotropy_enabled,
             ),
             owns_instance=owns_instance,
             owns_device=owns_device,
@@ -1976,17 +1980,23 @@ class VulkanContext:
             if self._closed:
                 return
             vk = self.vk
+            # After VK_ERROR_DEVICE_LOST some Windows drivers/VDXR builds
+            # crash while destroying child Vulkan objects. The process is
+            # already abandoning this context; let the OS reclaim the dead
+            # device instead of calling into a driver with invalid state.
+            device_lost = bool(self._device_lost)
             try:
-                if self.device is not None and not self._device_lost:
+                if self.device is not None and not device_lost:
                     try:
                         vk.vkDeviceWaitIdle(self.device)
                     except Exception as exc:
                         self.mark_device_lost(exc)
-                        if not self._device_lost:
+                        device_lost = bool(self._device_lost)
+                        if not device_lost:
                             raise
                 registry = getattr(self, "_external_image_registry", None)
                 if registry is not None:
-                    if self._device_lost:
+                    if device_lost:
                         registry.discard()
                     else:
                         try:
@@ -1994,7 +2004,7 @@ class VulkanContext:
                         except Exception:
                             registry.discard()
             finally:
-                if self.device is not None:
+                if self.device is not None and not device_lost:
                     if self._timeline_semaphore is not None:
                         vk.vkDestroySemaphore(self.device, self._timeline_semaphore, None)
                     for frame in self._frame_contexts:
@@ -2003,7 +2013,7 @@ class VulkanContext:
                             vk.vkDestroyCommandPool(self.device, resources.command_pool, None)
                     if self._owns_device:
                         vk.vkDestroyDevice(self.device, None)
-                if self.instance is not None and self._owns_instance:
+                if self.instance is not None and self._owns_instance and not device_lost:
                     vk.vkDestroyInstance(self.instance, None)
                 self._image_states.clear()
                 self._external_image_registry = None
@@ -2398,6 +2408,7 @@ def _device_info(
     *,
     timeline_semaphore_enabled: bool = False,
     synchronization2_enabled: bool = False,
+    sampler_anisotropy_enabled: bool = False,
 ) -> VulkanDeviceInfo:
     properties = vk.vkGetPhysicalDeviceProperties(physical_device)
     adapter_luid = _query_adapter_luid(vk, physical_device)
@@ -2413,6 +2424,7 @@ def _device_info(
         transfer_queue_family_index=int(queue_families.transfer),
         timeline_semaphore_enabled=bool(timeline_semaphore_enabled),
         synchronization2_enabled=bool(synchronization2_enabled),
+        sampler_anisotropy_enabled=bool(sampler_anisotropy_enabled),
         adapter_luid=adapter_luid,
     )
 
@@ -2525,9 +2537,18 @@ def _create_device(
     timeline_features, synchronization2_enabled = _require_timeline_semaphore_features(
         vk, physical_device
     )
+    sampler_anisotropy_enabled = physical_device_supports_sampler_anisotropy(
+        vk, physical_device
+    )
+    enabled_core_features = None
+    if sampler_anisotropy_enabled:
+        enabled_core_features = vk.VkPhysicalDeviceFeatures(
+            samplerAnisotropy=vk.VK_TRUE
+        )
     device_info = vk.VkDeviceCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         pNext=timeline_features,
+        pEnabledFeatures=enabled_core_features,
         queueCreateInfoCount=len(queue_infos),
         pQueueCreateInfos=queue_infos,
         enabledExtensionCount=len(extension_names),
@@ -2536,7 +2557,21 @@ def _create_device(
     return (
         vk.vkCreateDevice(physical_device, device_info, None),
         synchronization2_enabled,
+        sampler_anisotropy_enabled,
     )
+
+
+def physical_device_supports_sampler_anisotropy(vk: Any, physical_device: Any) -> bool:
+    """Return core sampler-anisotropy support without requiring the feature."""
+    query = getattr(vk, "vkGetPhysicalDeviceFeatures", None)
+    feature_type = getattr(vk, "VkPhysicalDeviceFeatures", None)
+    if query is None or feature_type is None:
+        return False
+    try:
+        features = query(physical_device)
+        return bool(getattr(features, "samplerAnisotropy", False))
+    except Exception:
+        return False
 
 
 def _color_subresource_range(

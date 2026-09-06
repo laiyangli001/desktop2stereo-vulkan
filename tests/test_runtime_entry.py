@@ -2,6 +2,8 @@ import ast
 import json
 from pathlib import Path
 
+import pytest
+
 
 from path_config import APP_ROOT, PROJECT_ROOT
 
@@ -257,7 +259,41 @@ def test_openxr_render_scale_uses_dedicated_persisted_setting(monkeypatch):
     monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
     assert _resolve_openxr_render_scale({"OpenXR Render Scale": 0.5}) == 0.5
     assert _resolve_openxr_render_scale({"OpenXR Render Scale": 2.0}) == 2.0
-    assert _resolve_openxr_render_scale({"OpenXR Render Scale": 8.0}) == 2.0
+    assert _resolve_openxr_render_scale({"OpenXR Render Scale": 8.0}) == 4.0
+
+
+def test_openxr_render_resolution_is_canonical_and_accepts_percent(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.delenv("D2S_OPENXR_RENDER_RESOLUTION", raising=False)
+    monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
+    assert _resolve_openxr_render_scale({"XR Render": "125%"}) == 1.25
+    assert _resolve_openxr_render_scale({"XR Render": 0.5}) == 0.5
+    assert _resolve_openxr_render_scale({"XR Render": "400%"}) == 4.0
+
+
+def test_openxr_render_resolution_alias_is_supported():
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    assert _resolve_openxr_render_scale({"OpenXR Render Resolution": "400%"}) == 4.0
+
+
+def test_openxr_render_resolution_environment_override_has_priority(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.setenv("D2S_OPENXR_RENDER_RESOLUTION", "150%")
+    monkeypatch.setenv("D2S_OPENXR_RENDER_SCALE", "50%")
+    assert _resolve_openxr_render_scale({"XR Render": 0.75}) == 1.5
+
+
+def test_openxr_headset_auto_uses_quest2_optimized_scale(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.delenv("D2S_OPENXR_RENDER_RESOLUTION", raising=False)
+    monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
+    assert _resolve_openxr_render_scale(
+        {"XR Render Mode": "auto", "XR Headset Model": "Meta Quest 2"}
+    ) == pytest.approx(1.24)
 
 def test_openxr_filament_color_defaults_come_from_common_json() -> None:
     from app_runtime.runtime_entry import _openxr_filament_config
@@ -279,6 +315,30 @@ def test_openxr_filament_color_defaults_come_from_common_json() -> None:
     assert config["filament_environment_screen_light_sample_hz"] == 12.0
     assert config["filament_glow_sample_hz"] == 30.0
     assert config["filament_glow_smoothing_seconds"] == 0.10
+
+
+def test_openxr_glow_transparency_settings_are_loaded_and_legacy_opacity_migrates() -> None:
+    from app_runtime.runtime_entry import _openxr_filament_config
+
+    config = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Transparency": {"Default": 0.35}}
+    )
+    assert config["filament_glow_transparencies"] == {"Default": 0.35}
+
+    legacy = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Opacity": {"Default": 0.65}}
+    )
+    assert legacy["filament_glow_transparencies"] == {"Default": 0.35}
+
+
+def test_openxr_glow_off_yaml_boolean_is_loaded_as_explicit_off_mode() -> None:
+    from app_runtime.runtime_entry import _openxr_filament_config
+
+    config = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Modes": {"Default": False}}
+    )
+
+    assert config["filament_glow_modes"] == {"Default": "off"}
 
 
 def test_openxr_environment_uses_selected_folder_and_profile_glb(tmp_path: Path) -> None:

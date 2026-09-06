@@ -312,11 +312,13 @@ def runtime_config_from_d2s_settings(
         stereo_compute_backend=_normalize_stereo_compute_backend(
             settings.get("Stereo Compute Backend", "auto")
         ),
-        # The headset output-quality upscale (EASU to the headset 4K tier) is
-        # meaningless for network streaming and costs hundreds of ms per frame
-        # through the torch fallback. A 1920x1200 input must stay 1920x1200 for
-        # the streamers; the 16:9 transport canvas is applied downstream.
-        output_quality_enabled=not _streamer_mode_output_quality_disabled(settings),
+        # OpenXR's projection composer already samples the source eye image
+        # directly into the runtime-owned swapchain. Pre-downsampling a 4K
+        # source to the selected headset tier makes text permanently softer
+        # and prevents the OpenXR resolution multiplier from recovering detail.
+        # Keep the source native for OpenXR; the runtime's recommended/max view
+        # extents remain the final display-resolution authority.
+        output_quality_enabled=not _output_quality_disabled(settings),
         output_headset_tier_k=headset_tier,
         output_min_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Min LOD", 0.0)))),
         output_max_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Max LOD", 0.35)))),
@@ -344,7 +346,7 @@ def _output_headset_tier_from_settings(settings: dict[str, Any]) -> int:
 
 
 def _streamer_mode_output_quality_disabled(settings: dict[str, Any]) -> bool:
-    """Return whether the headset output-quality upscale should be skipped.
+    """Return whether stream output-quality resampling should be skipped.
 
     Streamers publish to browsers/network players, not a headset, so upscaling
     the packed SBS to the headset 4K tier only adds hundreds of ms of EASU
@@ -363,6 +365,17 @@ def _streamer_mode_output_quality_disabled(settings: dict[str, Any]) -> bool:
         "MJPEG",
         "RTMP",
     }
+
+
+def _output_quality_disabled(settings: dict[str, Any]) -> bool:
+    """Skip producer-side resampling when the consumer is OpenXR or a stream."""
+    if _streamer_mode_output_quality_disabled(settings):
+        return True
+    try:
+        from utils.run_mode import normalize_run_mode
+    except Exception:
+        return False
+    return normalize_run_mode(str(settings.get("Run Mode", "") or "")) == "OpenXR Link"
 
 
 def _optional_int_setting(settings: dict[str, Any], *keys: str) -> int | None:
@@ -604,7 +617,10 @@ def openxr_render_config_from_snapshot(
     render_size: tuple[int, int] | None = None,
     preset: str = "standard",
     screen_roll: float = 0.0,
-    padding_mode: str = "reflection",
+    # Disparity can move the outermost destination pixels outside the source.
+    # Border extension avoids reflecting those pixels into a second visible
+    # edge in the final stereo image.
+    padding_mode: str = "border",
 ):
     """Convert normalized runtime settings into OpenXR render-core uniforms."""
     from .openxr_render import OpenXRRenderConfig

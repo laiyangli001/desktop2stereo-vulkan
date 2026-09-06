@@ -153,10 +153,9 @@ def _borrow_native_resource(frame_buffer):
 
 
 def _setup_dpi_awareness():
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        ctypes.windll.user32.SetProcessDPIAware()
+    from windows_dpi import set_per_monitor_dpi_v2
+
+    set_per_monitor_dpi_v2()
 
 
 class WindowsCaptureEventRunner:

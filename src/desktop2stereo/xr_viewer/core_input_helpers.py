@@ -15,6 +15,7 @@ from .windows_input import (
     _send_key,
     _send_vscroll,
     _physical_keyboard_active,
+    _physical_mouse_active,
 )
 
 
@@ -52,6 +53,16 @@ class CoreInputHelpersMixin:
         pos_attr = f'_arrow_{pos_dir}_held'
         neg_vk = VK_MAP[neg_dir]
         pos_vk = VK_MAP[pos_dir]
+
+        if _physical_keyboard_active():
+            # The hardware keyboard has priority: while the user types on it,
+            # release any beam-held arrow key and ignore the stick.
+            for attr in (neg_attr, pos_attr):
+                if getattr(self, attr):
+                    vk = neg_vk if attr == neg_attr else pos_vk
+                    ctypes.windll.user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+                    setattr(self, attr, False)
+            return
 
         if abs(value) <= self._input_deadzone():
             for attr in (neg_attr, pos_attr):
@@ -281,6 +292,13 @@ class CoreInputHelpersMixin:
         SCROLL_MAX_NOTCH = 35.0
         ACCEL_EXPONENT = 2.8
 
+        if _physical_mouse_active():
+            # The hardware mouse owns the wheel: while it was used recently,
+            # drop the beam's accumulated scroll so no stale wheel events are
+            # injected once the physical device goes quiet.
+            setattr(self, "_scroll_accum_x", 0.0)
+            setattr(self, "_scroll_accum_y", 0.0)
+            return
         for axis_val, accum_attr, send_fn in [
             (x_axis, '_scroll_accum_x', _send_hscroll),
             (y_axis, '_scroll_accum_y', _send_vscroll),

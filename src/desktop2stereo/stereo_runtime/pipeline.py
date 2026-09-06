@@ -399,8 +399,34 @@ def _enable_openxr_depth_cuda_graph_if_needed(
 
 def _unpack_raw_queue_item(item):
     if isinstance(item, CapturedFrame):
-        return compatibility_frame(item), item.target_height, item.timestamp, item
+        # Resolve render policy from actual captured dimensions.  The legacy
+        # target_height is only a requested preprocessing hint; using it here
+        # loses source aspect ratio and can upscale a 1920x1200 capture to a
+        # configured 4K height.
+        source_size = None
+        if isinstance(item.capture_size, (tuple, list)) and len(item.capture_size) >= 2:
+            try:
+                candidate = (int(item.capture_size[0]), int(item.capture_size[1]))
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and candidate[0] > 0 and candidate[1] > 0:
+                source_size = candidate
+        if source_size is None:
+            frame = compatibility_frame(item)
+            shape = tuple(getattr(frame, "shape", ()))
+            if len(shape) == 4:
+                source_size = (int(shape[3]), int(shape[2]))
+            elif len(shape) >= 2:
+                source_size = (int(shape[1]), int(shape[0]))
+            else:
+                source_size = item.target_height
+        return compatibility_frame(item), source_size, item.timestamp, item
     frame_raw, size, capture_start_time = item
+    shape = tuple(getattr(frame_raw, "shape", ()))
+    if len(shape) == 4:
+        size = (int(shape[3]), int(shape[2]))
+    elif len(shape) >= 2:
+        size = (int(shape[1]), int(shape[0]))
     return frame_raw, size, capture_start_time, None
 
 def _runtime_depth_backend(runtime) -> str:
@@ -696,6 +722,22 @@ def _attach_cuda_ready_event(runtime_result):
 
 def _cuda_event_ready(event) -> bool:
     if event is None:
+        return True
+    # A NVIDIA torch CUDA event can be waited on by the consumer stream without
+    # a host-side poll. ``query()`` is unreliable here: the runtime producer
+    # and presenter run on different Python threads/streams, and keeping the
+    # result in ``_pending_runtime_items`` can leave XR displaying one frame
+    # forever. The CUDA output adapter enqueues the GPU wait before it reads
+    # the tensors, so treat wait-capable NVIDIA events as ready to publish.
+    # HIP events also expose ``wait``; keep ROCm on its original query/pending
+    # path because its adapter has a different Vulkan staging handoff.
+    try:
+        import torch
+
+        is_rocm = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        is_rocm = False
+    if not is_rocm and callable(getattr(event, "wait", None)):
         return True
     query = getattr(event, "query", None)
     if not callable(query):
