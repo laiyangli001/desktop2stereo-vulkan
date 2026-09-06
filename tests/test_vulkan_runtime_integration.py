@@ -194,6 +194,22 @@ def test_presenter_owned_vulkan_compute_declares_cuda_external_input_path():
     assert '"vulkan_zero_cpu_readback": True' in source
 
 
+def test_local_gpu_viewer_uses_common_external_buffer_path_for_cuda_and_rocm():
+    source = (
+        APP_ROOT
+        / "viewer"
+        / "vulkan_local_viewer.py"
+    ).read_text(encoding="utf-8")
+
+    assert "VulkanExportableBuffer" in source
+    assert "copy_tensor_to_buffer" in source
+    assert "vkCmdCopyBufferToImage" in source
+    assert '"ROCm" if is_rocm else "CUDA"' in source
+    assert "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT" in source
+    assert "memory_handle_type=rocm_handle_type" in source
+    assert "single_packed_blit" in source
+
+
 def test_vulkan_output_shader_decodes_srgb_before_unorm_store():
     shader = (
         APP_ROOT

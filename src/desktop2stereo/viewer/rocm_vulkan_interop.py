@@ -1,4 +1,4 @@
-"""AMD HIP runtime interop for exportable Vulkan image slots."""
+"""AMD HIP runtime interop for exportable Vulkan image and buffer slots."""
 
 from __future__ import annotations
 

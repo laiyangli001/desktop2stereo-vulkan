@@ -189,6 +189,41 @@ def test_direct_stream_output_uses_uint8_nvenc_and_fps_provider() -> None:
     assert "observe_sbs_fps if adaptive_capture_rate.enabled else None" in stream_branch
 
 
+def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -> None:
+    import app_runtime.runtime_entry as runtime_entry
+
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(runtime_entry, "OUTPUT_RESOLUTION", (3840, 2160))
+    config = runtime_entry._resolve_local_viewer_render_size_config(
+        {
+            "Processing Resolution": "Auto",
+            "Display Mode": "Half-SBS",
+        },
+        "Viewer",
+        type("CudaDevice", (), {"type": "cuda"})(),
+    )
+
+    assert config.policy.value == "fixed"
+    assert (config.fixed_width, config.fixed_height) == (1920, 1080)
+    assert runtime_entry.OUTPUT_RESOLUTION == (3840, 2160)
+
+
+def test_local_viewer_native_4k_escape_hatch_and_macos_are_unchanged(monkeypatch) -> None:
+    import app_runtime.runtime_entry as runtime_entry
+
+    settings = {"Processing Resolution": "Auto", "Display Mode": "Half-SBS"}
+    device = type("CudaDevice", (), {"type": "cuda"})()
+    monkeypatch.setenv("D2S_LOCAL_VIEWER_NATIVE_4K", "1")
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ) is runtime_entry.RENDER_SIZE_CONFIG
+    monkeypatch.delenv("D2S_LOCAL_VIEWER_NATIVE_4K")
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Darwin")
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ) is runtime_entry.RENDER_SIZE_CONFIG
+
+
 def test_openxr_starts_after_inference_load_and_first_ready_output() -> None:
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
 

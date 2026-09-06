@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import os
 import queue
 import sys
 import time
@@ -15,7 +16,11 @@ from typing import Any, Callable
 
 from utils.display_info import resolve_glfw_monitor_index
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
-from viewer.vulkan_resources import VulkanExportableImage, VulkanExportableSemaphore
+from viewer.vulkan_resources import (
+    VulkanExportableBuffer,
+    VulkanExportableImage,
+    VulkanExportableSemaphore,
+)
 from viewer.window_control import hide_window_from_capture, set_window_mouse_passthrough
 
 
@@ -1586,9 +1591,10 @@ class _TransferSource:
         self._mapped = None
         self._image_initialized = False
         self._interop_context: _LocalInteropContext | None = None
-        self._external_image: VulkanExportableImage | None = None
+        self._external_buffer: VulkanExportableBuffer | None = None
         self._cuda_ready: VulkanExportableSemaphore | None = None
         self._cuda_importer: CudaVulkanImageImporter | None = None
+        self._rocm_interop = False
         self._cuda_active = False
         self._slow_present_count = 0
         self._create()
@@ -1633,13 +1639,6 @@ class _TransferSource:
         if required.issubset(set(self.owner._interop_extensions)):
             try:
                 self._interop_context = _LocalInteropContext(self.owner)
-                self._external_image = VulkanExportableImage(
-                    self._interop_context,
-                    width,
-                    height,
-                    label="local-viewer-cuda-source",
-                    format=source_format,
-                )
                 self._cuda_ready = VulkanExportableSemaphore(
                     self._interop_context,
                     label="local-viewer-cuda-ready",
@@ -1659,21 +1658,38 @@ class _TransferSource:
                         self._cuda_importer = CudaVulkanImageImporter()
                 except Exception:
                     self._cuda_importer = CudaVulkanImageImporter()
-                # Imports and establishes GENERAL once, before any frame is sent.
-                self._cuda_importer.register_slot(self._external_image)
+                self._rocm_interop = is_rocm
+                rocm_handle_type = None
+                if is_rocm and os.name == "nt":
+                    # AMD HIP's stable Windows external-memory path imports
+                    # KMT handles. CUDA continues to use opaque Win32 handles.
+                    rocm_handle_type = getattr(
+                        vk,
+                        "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT",
+                        None,
+                    )
+                self._external_buffer = VulkanExportableBuffer(
+                    self._interop_context,
+                    self.capacity,
+                    label="local-viewer-gpu-source",
+                    usage=vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    memory_handle_type=rocm_handle_type,
+                )
+                self._cuda_importer.register_buffer(self._external_buffer)
                 self._cuda_importer.register_semaphore(self._cuda_ready)
                 self._cuda_active = True
                 print(
                     "[VulkanLocalViewer] "
                     + ("ROCm" if is_rocm else "CUDA")
-                    + " external-image zero-copy active",
+                    + " external-buffer zero-copy active"
+                    + (" (KMT)" if rocm_handle_type is not None else ""),
                     flush=True,
                 )
             except Exception as exc:
                 self._disable_cuda_interop(exc)
         else:
             print(
-                "[VulkanLocalViewer] CUDA external-image zero-copy unavailable: "
+                "[VulkanLocalViewer] CUDA external-memory zero-copy unavailable: "
                 "required Vulkan external-memory/semaphore extensions missing",
                 flush=True,
             )
@@ -1681,12 +1697,15 @@ class _TransferSource:
     def _disable_cuda_interop(
         self, reason: Exception | str, *, announce: bool = True
     ) -> None:
-        if announce and (self._cuda_active or self._external_image is not None):
+        if announce and (
+            self._cuda_active
+            or self._external_buffer is not None
+        ):
             detail = str(reason)
             print(
-                "[VulkanLocalViewer] CUDA external-image zero-copy unavailable: "
+                "[VulkanLocalViewer] CUDA external-memory zero-copy unavailable: "
                 f"{type(reason).__name__}: {detail}" if isinstance(reason, Exception)
-                else f"[VulkanLocalViewer] CUDA external-image zero-copy unavailable: {detail}",
+                else f"[VulkanLocalViewer] CUDA external-memory zero-copy unavailable: {detail}",
                 flush=True,
             )
         self._cuda_active = False
@@ -1694,9 +1713,10 @@ class _TransferSource:
             self._cuda_importer.close()
         if self._cuda_ready is not None:
             self._cuda_ready.close()
-        if self._external_image is not None:
-            self._external_image.close()
-        self._cuda_ready = self._external_image = self._cuda_importer = None
+        if self._external_buffer is not None:
+            self._external_buffer.close()
+        self._cuda_ready = self._external_buffer = self._cuda_importer = None
+        self._rocm_interop = False
 
     @staticmethod
     def transition_image(vk: Any, cmd: Any, image: Any, old: int, new: int) -> None:
@@ -1729,26 +1749,30 @@ class _TransferSource:
         index = int(index_output[0])
         vk.vkResetFences(o.device, 1, [o.fence])
 
-        cuda_source = self._cuda_active and bool(getattr(pixels, "is_cuda", False))
+        gpu_source = self._cuda_active and bool(getattr(pixels, "is_cuda", False))
+        gpu_buffer_source = gpu_source and self._external_buffer is not None
         stage_started = time.perf_counter()
-        if cuda_source:
+        if gpu_source:
             try:
-                self._cuda_importer.copy_tensor(pixels, self._external_image)
+                if not gpu_buffer_source:
+                    raise RuntimeError("GPU external buffer is unavailable")
+                self._cuda_importer.copy_tensor_to_buffer(pixels, self._external_buffer)
                 self._cuda_importer.signal_semaphore(self._cuda_ready)
-                # HIP (ROCm) async ops above must complete before the Vulkan
-                # submit reads the imported external image. Synchronize on the
-                # HIP stream so the next depth-frame stream sync (torch
-                # cuda.synchronize) does not hang waiting on a surface the
-                # driver left in-flight. CUDA importer exposes no synchronize
-                # and keeps its established behavior.
-                sync = getattr(self._cuda_importer, "synchronize", None)
-                if callable(sync):
-                    sync()
+                # CUDA signals the Vulkan wait semaphore on the same CUDA
+                # stream as the copy.  Do not host-synchronize that stream:
+                # Vulkan will wait on the external semaphore before sampling
+                # the buffer.  HIP's current KMT-buffer importer uses a
+                # synchronous copy, so retain its explicit drain for ROCm.
+                if self._rocm_interop:
+                    sync = getattr(self._cuda_importer, "synchronize", None)
+                    if callable(sync):
+                        sync()
             except Exception as exc:
                 self._disable_cuda_interop(exc)
-                cuda_source = False
+                gpu_source = False
+                gpu_buffer_source = False
                 pixels, _width, _height = frame_to_rgba_bytes(pixels)
-        if not cuda_source:
+        if not gpu_source:
             if not isinstance(pixels, (bytes, bytearray, memoryview)):
                 # CUDA/ROCm interop unavailable: the caller may hand us a GPU
                 # tensor; convert it to tightly packed RGBA8 host bytes first.
@@ -1777,9 +1801,43 @@ class _TransferSource:
         vk.vkResetCommandBuffer(cmd, 0)
         vk.vkBeginCommandBuffer(cmd, vk.VkCommandBufferBeginInfo(sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO))
         source_image = self.image
-        if cuda_source:
-            source_image = self._external_image.image
-            self._transition(cmd, source_image, vk.VK_IMAGE_LAYOUT_GENERAL, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+        if gpu_buffer_source:
+            self._transition(
+                cmd,
+                self.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                if self._image_initialized
+                else vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            )
+            vk.vkCmdCopyBufferToImage(
+                cmd,
+                self._external_buffer.buffer,
+                self.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                [vk.VkBufferImageCopy(
+                    bufferOffset=0,
+                    bufferRowLength=0,
+                    bufferImageHeight=0,
+                    imageSubresource=vk.VkImageSubresourceLayers(
+                        aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                        mipLevel=0,
+                        baseArrayLayer=0,
+                        layerCount=1,
+                    ),
+                    imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                    imageExtent=vk.VkExtent3D(
+                        width=self.size[0], height=self.size[1], depth=1
+                    ),
+                )],
+            )
+            self._transition(
+                cmd,
+                self.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            )
         else:
             self._transition(cmd, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL if self._image_initialized else vk.VK_IMAGE_LAYOUT_UNDEFINED, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
             vk.vkCmdCopyBufferToImage(cmd, self.buffer, self.image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, [vk.VkBufferImageCopy(bufferOffset=0, bufferRowLength=0, bufferImageHeight=0, imageSubresource=vk.VkImageSubresourceLayers(aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT, mipLevel=0, baseArrayLayer=0, layerCount=1), imageOffset=vk.VkOffset3D(x=0, y=0, z=0), imageExtent=vk.VkExtent3D(width=self.size[0], height=self.size[1], depth=1))])
@@ -1856,11 +1914,31 @@ class _TransferSource:
                 f"blit_regions={regions}",
                 flush=True,
             )
-        # Keep every driver call to one region.  NVIDIA Windows drivers can
-        # block the imported CUDA-image transfer when a single vkCmdBlitImage
-        # contains two packed-eye regions; separate commands preserve the
-        # symmetric cover crop without entering that multi-region path.
-        for source_rect, destination_rect in regions:
+        # For the GPU buffer path, an exact-aspect Half-SBS frame can be
+        # scaled as one packed image. It is equivalent to two eye blits and
+        # avoids a second 4K filtering pass/command on the local viewer.
+        single_packed_blit = (
+            gpu_buffer_source
+            and len(regions) == 2
+            and regions[0]
+            == (
+                (0, 0, self.size[0] // 2, self.size[1]),
+                (0, 0, o.extent[0] // 2, o.extent[1]),
+            )
+            and regions[1]
+            == (
+                (self.size[0] // 2, 0, self.size[0], self.size[1]),
+                (o.extent[0] // 2, 0, o.extent[0], o.extent[1]),
+            )
+        )
+        blit_regions = (
+            (((0, 0, self.size[0], self.size[1]), (0, 0, o.extent[0], o.extent[1])),)
+            if single_packed_blit
+            else regions
+        )
+        # Keep the common buffer path to one region. Separate commands remain
+        # the safe crop fallback when the packed frame is not exact-aspect.
+        for source_rect, destination_rect in blit_regions:
             sx0, sy0, sx1, sy1 = source_rect
             dx0, dy0, dx1, dy1 = destination_rect
             vk.vkCmdBlitImage(
@@ -1879,13 +1957,13 @@ class _TransferSource:
                 vk.VK_FILTER_LINEAR,
             )
         self._transition(cmd, target, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
-        if cuda_source:
+        if gpu_source:
             self._transition(cmd, source_image, vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.VK_IMAGE_LAYOUT_GENERAL)
         vk.vkEndCommandBuffer(cmd)
         record_ms = (time.perf_counter() - stage_started) * 1000.0
         waits = [o.image_available]
         stages = [vk.VK_PIPELINE_STAGE_TRANSFER_BIT]
-        if cuda_source:
+        if gpu_source:
             waits.append(self._cuda_ready.semaphore)
             stages.append(vk.VK_PIPELINE_STAGE_TRANSFER_BIT)
         submit = vk.VkSubmitInfo(sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO, waitSemaphoreCount=len(waits), pWaitSemaphores=waits, pWaitDstStageMask=stages, commandBufferCount=1, pCommandBuffers=[cmd], signalSemaphoreCount=1, pSignalSemaphores=[o.render_finished])
@@ -1910,7 +1988,7 @@ class _TransferSource:
                     f"upload={upload_ms:.1f}ms record={record_ms:.1f}ms "
                     f"submit={submit_ms:.1f}ms submit_result={submit_result} "
                     f"present={present_ms:.1f}ms present_result={result} "
-                    f"cuda={cuda_source} fit={fit_mode}",
+                    f"gpu={gpu_source} rocm={self._rocm_interop} fit={fit_mode}",
                     flush=True,
                 )
         o._swap_image_initialized[index] = True

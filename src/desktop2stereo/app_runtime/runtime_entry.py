@@ -14,6 +14,7 @@ from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
 from stereo_runtime.pipeline import RuntimePipelineLoop
+from stereo_runtime.render_size import RenderSizePolicy
 from utils import (
     CAPTURE_MODE,
     CAPTURE_TOOL,
@@ -493,6 +494,46 @@ def _wait_for_runtime_ready(
     return False
 
 
+def _resolve_local_viewer_render_size_config(settings, run_mode, device):
+    """Use the v2.5 local-viewer source size while keeping 4K I/O.
+
+    The old local path captured the 4K monitor and presented to the 4K
+    display, but ran the Half-SBS warp at one eye (1920x1080) and upscaled
+    that packed result in the display shader.  The current scaled/native path
+    accidentally moved depth and warp to 3840x2160.  Restore that contract
+    only for the non-Darwin GPU local viewer; the Vulkan swapchain and capture
+    target remain native 4K.  D2S_LOCAL_VIEWER_NATIVE_4K=1 is an explicit
+    escape hatch for full-resolution processing.
+    """
+    if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
+        return RENDER_SIZE_CONFIG
+    if str(getattr(device, "type", device)).strip().lower() != "cuda":
+        return RENDER_SIZE_CONFIG
+    if os.environ.get("D2S_LOCAL_VIEWER_NATIVE_4K", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return RENDER_SIZE_CONFIG
+    if str(settings.get("Processing Resolution", "Auto")).strip().lower() != "auto":
+        return RENDER_SIZE_CONFIG
+    if str(settings.get("Display Mode", "")).strip().lower().replace("_", "-") != "half-sbs":
+        return RENDER_SIZE_CONFIG
+    if RENDER_SIZE_CONFIG.policy is not RenderSizePolicy.SCALED:
+        return RENDER_SIZE_CONFIG
+    if RENDER_SIZE_CONFIG.scale_factor != "4K / 100%":
+        return RENDER_SIZE_CONFIG
+    if not isinstance(OUTPUT_RESOLUTION, (tuple, list)) or len(OUTPUT_RESOLUTION) != 2:
+        return RENDER_SIZE_CONFIG
+    output_width, output_height = (int(OUTPUT_RESOLUTION[0]), int(OUTPUT_RESOLUTION[1]))
+    if output_width < 2 or output_height < 2:
+        return RENDER_SIZE_CONFIG
+    return replace(
+        RENDER_SIZE_CONFIG,
+        policy=RenderSizePolicy.FIXED,
+        fixed_width=output_width // 2,
+        fixed_height=output_height // 2,
+    )
+
+
 def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     """Run capture, inference, and pipeline threads until shutdown is requested."""
 
@@ -574,6 +615,12 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
         # the warp viewer can sample the capture directly (zero-copy).
         os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
+    elif configured_run_mode in {"Local Viewer", "Viewer"}:
+        # The Vulkan local viewer consumes GPU RGBA8 directly.  Pack on the
+        # producer GPU so the external buffer transfers 1 byte/channel rather
+        # than a float32 frame.  Keep the Darwin branch above unchanged: its
+        # viewer has platform-specific output handling and owns this setting.
+        os.environ.setdefault("D2S_RUNTIME_OUTPUT_UINT8", "1")
     direct_stream_mode = is_network_stream_mode(configured_run_mode) or configured_run_mode == "MJPEG Streamer"
     if direct_stream_mode:
         os.environ["D2S_RUNTIME_OUTPUT_UINT8"] = "1"
@@ -597,6 +644,21 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
             configured_run_mode, configured_target_fps
         ),
     )
+    effective_render_size_config = _resolve_local_viewer_render_size_config(
+        settings,
+        configured_run_mode,
+        DEVICE,
+    )
+    if effective_render_size_config is not RENDER_SIZE_CONFIG:
+        print(
+            "[Main] Local Viewer v2.5 source path: "
+            f"capture={OUTPUT_RESOLUTION[0]}x{OUTPUT_RESOLUTION[1]} "
+            f"processing={effective_render_size_config.fixed_width}x"
+            f"{effective_render_size_config.fixed_height} "
+            "presentation=native-4K; set D2S_LOCAL_VIEWER_NATIVE_4K=1 "
+            "to force native processing",
+            flush=True,
+        )
     if is_network_stream_mode(configured_run_mode):
         probe_capture_fps = adaptive_capture_rate.begin_stream_probe(int(base_runtime_fps))
         print(
@@ -611,7 +673,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         device=DEVICE,
         device_info=DEVICE_INFO,
         output_resolution=OUTPUT_RESOLUTION,
-        render_size_config=RENDER_SIZE_CONFIG,
+        render_size_config=effective_render_size_config,
         fps=base_runtime_fps,
         window_title=WINDOW_TITLE,
         capture_mode=CAPTURE_MODE,
