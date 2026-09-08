@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import Condition, RLock
 from time import perf_counter
 from typing import Any, Callable, Iterable
 
@@ -15,10 +15,21 @@ class VulkanCapabilityError(RuntimeError):
     pass
 
 
+class VulkanTimelineTimeout(VulkanCapabilityError):
+    """A bounded GPU wait expired without proving that the device is lost."""
+
+
 def is_vulkan_device_lost_error(exc: BaseException) -> bool:
     """Return whether a Vulkan binding exception reports a lost device."""
     marker = f"{type(exc).__name__} {exc}".lower().replace("_", " ")
     return "devicelost" in "".join(marker.split())
+
+
+def is_vulkan_timeout_error(exc: BaseException) -> bool:
+    """Return whether *exc* represents a bounded Vulkan synchronization timeout."""
+    marker = f"{type(exc).__name__} {exc}".lower().replace("_", " ")
+    compact = "".join(marker.split())
+    return "timeout" in compact or "timedout" in compact or "notready" in compact
 
 
 def make_vulkan_version(major: int, minor: int, patch: int = 0) -> int:
@@ -267,6 +278,8 @@ class VulkanContext:
             default_queue_family_index=self.queue_family_index
         )
         self._lock = RLock()
+        self._wait_condition = Condition(self._lock)
+        self._active_blocking_waits = 0
         self._closed = False
         self._device_lost = False
         self._device_lost_error: str | None = None
@@ -1947,38 +1960,80 @@ class VulkanContext:
             return
         with self._lock:
             self._ensure_open()
-            if self._timeline_semaphore is None:
-                self.vk.vkDeviceWaitIdle(self.device)
+            self._active_blocking_waits += 1
+            vk = self.vk
+            device = self.device
+            timeline_semaphore = self._timeline_semaphore
+        try:
+            if timeline_semaphore is None:
+                vk.vkDeviceWaitIdle(device)
                 return
-            wait_fn = getattr(self.vk, "vkWaitSemaphores", None)
-            wait_info_type = getattr(self.vk, "VkSemaphoreWaitInfo", None)
-            wait_info_structure = getattr(self.vk, "VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO", None)
+            wait_fn = getattr(vk, "vkWaitSemaphores", None)
+            wait_info_type = getattr(vk, "VkSemaphoreWaitInfo", None)
+            wait_info_structure = getattr(vk, "VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO", None)
             if wait_fn is None or wait_info_type is None or wait_info_structure is None:
-                self.vk.vkDeviceWaitIdle(self.device)
+                vk.vkDeviceWaitIdle(device)
                 return
             try:
                 result = wait_fn(
-                    self.device,
+                    device,
                     wait_info_type(
                         sType=wait_info_structure,
                         semaphoreCount=1,
-                        pSemaphores=[self._timeline_semaphore],
+                        pSemaphores=[timeline_semaphore],
                         pValues=[target],
                     ),
                     int(timeout_ns),
                 )
             except Exception as exc:
-                self.mark_device_lost(exc)
+                if is_vulkan_timeout_error(exc):
+                    raise VulkanTimelineTimeout(
+                        f"timed out waiting for Vulkan timeline value {target}"
+                    ) from exc
+                with self._lock:
+                    self.mark_device_lost(exc)
                 raise
-            if result is not None and int(result) != int(self.vk.VK_SUCCESS):
-                raise VulkanCapabilityError(
-                    f"timed out waiting for Vulkan timeline value {target}: {result}"
+            if result is not None and int(result) != int(vk.VK_SUCCESS):
+                result_code = int(result)
+                timeout_codes = {
+                    int(code)
+                    for code in (
+                        getattr(vk, "VK_TIMEOUT", None),
+                        getattr(vk, "VK_NOT_READY", None),
+                    )
+                    if code is not None
+                }
+                if result_code in timeout_codes:
+                    raise VulkanTimelineTimeout(
+                        f"timed out waiting for Vulkan timeline value {target}: {result}"
+                    )
+                device_lost_code = getattr(vk, "VK_ERROR_DEVICE_LOST", None)
+                result_text = (
+                    f"VK_ERROR_DEVICE_LOST ({result})"
+                    if device_lost_code is not None
+                    and result_code == int(device_lost_code)
+                    else str(result)
                 )
+                error = VulkanCapabilityError(
+                    f"Vulkan timeline wait for value {target} failed: {result_text}"
+                )
+                with self._lock:
+                    self.mark_device_lost(error)
+                raise error
+        finally:
+            with self._lock:
+                self._active_blocking_waits = max(0, self._active_blocking_waits - 1)
+                self._wait_condition.notify_all()
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            wait_condition = getattr(self, "_wait_condition", None)
+            while getattr(self, "_active_blocking_waits", 0):
+                if wait_condition is None:
+                    break
+                wait_condition.wait()
             vk = self.vk
             # After VK_ERROR_DEVICE_LOST some Windows drivers/VDXR builds
             # crash while destroying child Vulkan objects. The process is

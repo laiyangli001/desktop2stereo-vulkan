@@ -9,6 +9,7 @@ import time
 
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
 from viewer.rocm_vulkan_interop import RocmVulkanImageImporter
+from viewer.vulkan_context import is_vulkan_device_lost_error
 from viewer.vulkan_resources import (
     VulkanBinarySemaphore,
     VulkanExportableBuffer,
@@ -583,15 +584,25 @@ class CudaVulkanOutputAdapter(GpuProducerAdapter):
                             waits[eye_index] if eye_index < len(waits) else None
                         ),
                     )
-                    if (
-                        self.backend_name == "cuda"
-                        and release_timeline is not None
-                        and slot_index < len(self._cuda_release_timelines)
-                    ):
-                        self._cuda_release_timelines[slot_index] = max(
-                            int(self._cuda_release_timelines[slot_index]),
-                            int(release_timeline),
-                        )
+                    if self.backend_name == "cuda":
+                        if (
+                            release_timeline is not None
+                            and slot_index < len(self._cuda_release_timelines)
+                        ):
+                            self._cuda_release_timelines[slot_index] = max(
+                                int(self._cuda_release_timelines[slot_index]),
+                                int(release_timeline),
+                            )
+                    elif self.backend_name == "rocm":
+                        release_timelines = getattr(self, "_rocm_release_timelines", ())
+                        if (
+                            release_timeline is not None
+                            and slot_index < len(release_timelines)
+                        ):
+                            release_timelines[slot_index] = max(
+                                int(release_timelines[slot_index]),
+                                int(release_timeline),
+                            )
                     self._prepared_source_eyes.discard((frame_key, eye_index))
                     continue
                 release_values = (
@@ -994,6 +1005,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
     def __init__(self, presenter):
         super().__init__(presenter)
         self._rocm_ready_pending: set[tuple[int, int]] = set()
+        self._rocm_release_timelines: list[int] = []
         self._eye_buffers: list[tuple[VulkanExportableBuffer, VulkanExportableBuffer]] = []
         self._buffer_frames: dict[int, tuple[VulkanExportableBuffer, VulkanExportableBuffer]] = {}
         self._host_eye_slots: list[tuple[VulkanHostImage, VulkanHostImage]] = []
@@ -1203,6 +1215,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             self.close()
             raise
         self._extent = (width, height)
+        self._rocm_release_timelines = [0 for _ in range(self.ring_size)]
         memory_mode = (
             "kmt_win32"
             if memory_handle_type is not None
@@ -1218,11 +1231,27 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._logged_external_sync_mode = True
 
     def _claim_slot(self, slot_index: int, frame_id: int) -> None:
+        if not self.external_semaphore_enabled and slot_index < len(self._rocm_release_timelines):
+            release_timeline = int(self._rocm_release_timelines[slot_index])
+            if release_timeline > 0:
+                # Wait only for this ring slot. Device-wide idle here stalls
+                # Filament and can starve the XR frame loop.
+                self.presenter.vulkan.wait_for_timeline(release_timeline)
+                if self._rocm_release_timelines[slot_index] == release_timeline:
+                    self._rocm_release_timelines[slot_index] = 0
         super()._claim_slot(slot_index, frame_id)
-        if not self.external_semaphore_enabled:
-            # Explicit diagnostic/capability fallback still orders Vulkan's
-            # last read before HIP overwrites the image, without CPU pixels.
-            self.presenter.vulkan.wait_idle()
+        if not self.external_semaphore_enabled and slot_index < len(self._rocm_release_timelines):
+            release_timeline = int(self._rocm_release_timelines[slot_index])
+            if release_timeline > 0:
+                try:
+                    self.presenter.vulkan.wait_for_timeline(release_timeline)
+                except Exception:
+                    # Do not strand the lease when a bounded wait expires;
+                    # the timeline remains recorded for the next attempt.
+                    super().release_frame(frame_id)
+                    raise
+                if self._rocm_release_timelines[slot_index] == release_timeline:
+                    self._rocm_release_timelines[slot_index] = 0
 
     def _convert_host_staging(
         self, runtime_result, *, frame_id: int, timestamp: float
@@ -1687,6 +1716,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._rocm_ready_pending.clear()
         self._buffer_frames.clear()
         self._host_frame_slots.clear()
+        self._rocm_release_timelines = []
         super().close()
         for host_slots in self._host_eye_slots:
             for host in host_slots:
@@ -2135,10 +2165,7 @@ class VulkanRuntimeOutputConsumer:
             last_error=f"{type(exc).__name__}: {exc}",
         )
         context = getattr(self.sink, "vulkan", None)
-        fatal = bool(getattr(context, "device_lost", False)) or type(exc).__name__ in {
-            "VkTimeout",
-            "VkNotReady",
-        }
+        fatal = bool(getattr(context, "device_lost", False)) or is_vulkan_device_lost_error(exc)
         if fatal:
             # A failed release may still own a producer-ring slot. Continuing
             # would allow the producer to overwrite an image the GPU may be

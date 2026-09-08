@@ -25,6 +25,7 @@ from viewer.vulkan_context import (
     ImageState,
     VulkanContext,
     VulkanCapabilityError,
+    is_vulkan_timeout_error,
     _cffi_handle_address,
     _require_timeline_semaphore_features,
     physical_device_supports_sampler_anisotropy,
@@ -7025,6 +7026,10 @@ class OpenXrVulkanPresenter(
             if self._vulkan_device_is_lost():
                 self._request_fatal_device_loss()
             error = f"{type(exc).__name__}: {exc}"
+            if is_vulkan_timeout_error(exc) and not self._vulkan_device_is_lost():
+                callback = self._on_breakdown_inc
+                if callback is not None:
+                    callback("openxr_vulkan_sync_timeout", 1)
             if error != self._last_runtime_output_conversion_error:
                 self._last_runtime_output_conversion_error = error
                 print(

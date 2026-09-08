@@ -27,6 +27,7 @@ from viewer.vulkan_context import (
     QueueFamilySelection,
     VulkanCapabilityError,
     VulkanContext,
+    VulkanTimelineTimeout,
     VulkanUnavailableError,
     _require_timeline_semaphore_features,
     format_vulkan_version,
@@ -6858,3 +6859,87 @@ def test_crop_state_is_persisted_per_openxr_environment() -> None:
     assert state["crop_height_percent"] == 9.0
     assert state["dynamic_crop"] is True
     assert calls[-1][0][0] == "persist_openxr_screen_state"
+
+
+def test_vulkan_timeline_timeout_releases_context_lock_without_device_loss() -> None:
+    class VkTimeout(Exception):
+        pass
+
+    class WaitInfo:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    lock_available = threading.Event()
+
+    class FakeVk:
+        VK_SUCCESS = 0
+        VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO = 1
+        VkSemaphoreWaitInfo = WaitInfo
+
+        @staticmethod
+        def vkWaitSemaphores(_device, _wait_info, _timeout_ns):
+            with context._lock:
+                lock_available.set()
+            raise VkTimeout("timeline wait expired")
+
+    context = object.__new__(VulkanContext)
+    context.vk = FakeVk()
+    context.device = "device"
+    context._timeline_semaphore = "timeline"
+    context._lock = threading.RLock()
+    context._wait_condition = threading.Condition(context._lock)
+    context._active_blocking_waits = 0
+    context._closed = False
+    context._device_lost = False
+    context._device_lost_error = None
+    errors = []
+
+    def wait() -> None:
+        try:
+            context.wait_for_timeline(7)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(
+        target=wait,
+    )
+    worker.start()
+    assert lock_available.wait(1.0)
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], VulkanTimelineTimeout)
+    assert context.device_lost is False
+    assert context._active_blocking_waits == 0
+
+
+def test_vulkan_timeline_timeout_is_recoverable_error() -> None:
+    class WaitInfo:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeVk:
+        VK_SUCCESS = 0
+        VK_TIMEOUT = 2
+        VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO = 1
+        VkSemaphoreWaitInfo = WaitInfo
+
+        @staticmethod
+        def vkWaitSemaphores(_device, _wait_info, _timeout_ns):
+            return 2
+
+    context = object.__new__(VulkanContext)
+    context.vk = FakeVk()
+    context.device = "device"
+    context._timeline_semaphore = "timeline"
+    context._lock = threading.RLock()
+    context._wait_condition = threading.Condition(context._lock)
+    context._active_blocking_waits = 0
+    context._closed = False
+    context._device_lost = False
+    context._device_lost_error = None
+
+    with pytest.raises(VulkanTimelineTimeout):
+        context.wait_for_timeline(7)
+    assert context.device_lost is False

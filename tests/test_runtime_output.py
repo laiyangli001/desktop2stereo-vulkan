@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 from app_runtime.runtime_output import (
     CudaVulkanOutputAdapter,
+    RocmVulkanOutputAdapter,
     VulkanRuntimeOutputConsumer,
 )
+from viewer.vulkan_context import VulkanTimelineTimeout
 
 
 def test_cuda_runtime_ready_event_uses_gpu_wait_without_host_sync():
@@ -200,6 +202,99 @@ def test_cuda_synchronized_copy_tracks_vulkan_release_timeline():
             },
         ),
     ]
+
+
+def test_rocm_synchronized_copy_tracks_vulkan_release_timeline():
+    released = []
+    submissions = []
+
+    class Context:
+        device_lost = False
+
+        @staticmethod
+        def release_external_image_from_sampling(resource, **kwargs):
+            submissions.append((resource, kwargs))
+            return 50 if resource == "left" else 52
+
+    adapter = object.__new__(RocmVulkanOutputAdapter)
+    adapter.backend_name = "rocm"
+    adapter.presenter = SimpleNamespace(vulkan=Context())
+    adapter._host_staging_enabled = False
+    adapter._released_source_frames = set()
+    adapter._prepared_source_eyes = {(7, 0), (7, 1)}
+    adapter._release_signaled = set()
+    adapter._rocm_release_timelines = [0]
+    adapter.left_release_semaphores = []
+    adapter.right_release_semaphores = []
+    adapter._source_frames = {
+        7: (
+            SimpleNamespace(resource="left"),
+            SimpleNamespace(resource="right"),
+            0,
+        )
+    }
+    adapter.release_frame = released.append
+
+    adapter.release_consumer_frame(7)
+
+    assert adapter._rocm_release_timelines == [52]
+    assert released == [7]
+    assert len(submissions) == 2
+
+
+def test_rocm_slot_claim_waits_for_slot_timeline_without_device_idle():
+    waits = []
+    adapter = object.__new__(RocmVulkanOutputAdapter)
+    adapter.external_semaphore_enabled = False
+    adapter._rocm_release_timelines = [37]
+    adapter.presenter = SimpleNamespace(
+        vulkan=SimpleNamespace(
+            wait_for_timeline=lambda value: waits.append(value),
+            wait_idle=lambda: (_ for _ in ()).throw(AssertionError("device idle is forbidden")),
+        )
+    )
+    adapter._lease_condition = threading.Condition()
+    adapter._active_leases = {}
+    adapter._closed = False
+
+    adapter._claim_slot(0, 8)
+
+    assert waits == [37]
+    assert adapter._rocm_release_timelines == [0]
+    assert adapter._active_leases == {0: 8}
+
+
+def test_consumer_keeps_running_for_recoverable_vulkan_timeout():
+    runtime_q = queue.Queue(maxsize=1)
+    shutdown = threading.Event()
+    stats = []
+
+    class PresenterSink:
+        output_ready = True
+        vulkan = SimpleNamespace(device_lost=False)
+
+        @staticmethod
+        def submit_runtime_result(_result, _timestamp):
+            raise VulkanTimelineTimeout("timeline wait expired")
+
+    runtime_q.put((SimpleNamespace(left_eye="cuda-left", right_eye="cuda-right"), 1.0))
+    consumer = VulkanRuntimeOutputConsumer(
+        runtime_q=runtime_q,
+        shutdown_event=shutdown,
+        source_stat_inc=lambda name, amount=1, **values: stats.append((name, amount, values)),
+        sink=PresenterSink(),
+    )
+    worker = threading.Thread(target=consumer.run)
+    worker.start()
+    deadline = time.monotonic() + 1.0
+    while not stats:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert worker.is_alive()
+    assert not shutdown.is_set()
+    shutdown.set()
+    worker.join(timeout=1.0)
+    assert not worker.is_alive()
 
 
 def test_screen_light_sample_completion_is_non_blocking_and_clamped():
