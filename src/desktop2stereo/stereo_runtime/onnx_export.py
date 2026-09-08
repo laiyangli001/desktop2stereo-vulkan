@@ -172,6 +172,33 @@ def _video_depth_anything_encoder(model_id: str) -> str:
     return "vitl"
 
 
+def _load_da3_checkpoint(model, model_path, torch) -> None:
+    """Load a DA3 checkpoint, including safetensors' shared-module aliases.
+
+    DA3's auxiliary head intentionally reuses one LayerNorm instance across
+    its pyramid levels. Safetensors stores that shared parameter once, while a
+    strict ``state_dict`` load expects every registered alias. ``load_model``
+    understands the sharing metadata and still keeps strict validation for all
+    non-aliased parameters.
+    """
+    if model_path.suffix.lower() == ".safetensors":
+        from safetensors.torch import load_model
+
+        load_model(model, str(model_path), strict=True)
+        return
+
+    checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=True)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(f"unsupported DA3 checkpoint format: {model_path}")
+    checkpoint = {
+        str(key).removeprefix("module."): value
+        for key, value in checkpoint.items()
+    }
+    model.load_state_dict(checkpoint, strict=True)
+
+
 @contextmanager
 def _quiet_onnx_export_warnings():
     import torch
@@ -223,21 +250,7 @@ def load_model_for_dtype(
         if model_path is None:
             raise FileNotFoundError(f"DA3 checkpoint not found for {model_id!r} in {model_dir}")
         model = DepthAnything3(model_name=_da3_preset(model_id))
-        if model_path.suffix.lower() == ".safetensors":
-            from safetensors.torch import load_file
-
-            checkpoint = load_file(str(model_path), device="cpu")
-        else:
-            checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=True)
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            checkpoint = checkpoint["state_dict"]
-        if not isinstance(checkpoint, dict):
-            raise RuntimeError(f"unsupported DA3 checkpoint format: {model_path}")
-        checkpoint = {
-            str(key).removeprefix("module."): value
-            for key, value in checkpoint.items()
-        }
-        model.load_state_dict(checkpoint, strict=True)
+        _load_da3_checkpoint(model, model_path, torch)
         model = model.to(device=device, dtype=dtype).eval()
         return DepthOnnxExportWrapper(model).eval()
 
