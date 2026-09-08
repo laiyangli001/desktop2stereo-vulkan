@@ -322,7 +322,7 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: InfiniDepth-Small
+Depth Model: InfiniDepth-Large
 Depth Strength: 0.25
 Depth Quick: Standard
 Depth Resolution: 336
