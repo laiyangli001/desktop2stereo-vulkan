@@ -159,6 +159,11 @@ class RocmVulkanImageImporter:
             ),
         )
 
+    @property
+    def uses_synchronous_buffer_copy(self) -> bool:
+        """Whether buffer copies complete before ``copy_tensor_to_buffer`` returns."""
+        return getattr(self._hip, "hipMemcpy", None) is not None
+
     def _memory_handle_type(self, target: Any) -> int:
         if os.name != "nt":
             return self._HIP_MEM_HANDLE_OPAQUE_FD

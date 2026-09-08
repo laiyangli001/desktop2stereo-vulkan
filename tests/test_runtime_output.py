@@ -265,6 +265,18 @@ def test_rocm_slot_claim_waits_for_slot_timeline_without_device_idle():
     assert adapter._active_leases == {0: 8}
 
 
+def test_rocm_staging_keeps_stream_sync_for_async_importer_only():
+    from viewer.rocm_vulkan_interop import RocmVulkanImageImporter
+
+    sync_importer = object.__new__(RocmVulkanImageImporter)
+    sync_importer._hip = SimpleNamespace(hipMemcpy=object())
+    assert sync_importer.uses_synchronous_buffer_copy is True
+
+    async_importer = object.__new__(RocmVulkanImageImporter)
+    async_importer._hip = SimpleNamespace(hipMemcpyAsync=object())
+    assert async_importer.uses_synchronous_buffer_copy is False
+
+
 def test_consumer_keeps_running_for_recoverable_vulkan_timeout():
     runtime_q = queue.Queue(maxsize=1)
     shutdown = threading.Event()

@@ -1439,7 +1439,8 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             else:
                 self.importer.copy_tensor_to_buffer(left, left_buffer)
                 self.importer.copy_tensor_to_buffer(right, right_buffer)
-                self.importer.synchronize()
+                if not bool(getattr(self.importer, "uses_synchronous_buffer_copy", False)):
+                    self.importer.synchronize()
                 copy_timelines = []
                 for eye_index, resource, buffer in (
                     (0, self.left_slot.resource, left_buffer),
