@@ -1006,6 +1006,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         super().__init__(presenter)
         self._rocm_ready_pending: set[tuple[int, int]] = set()
         self._rocm_release_timelines: list[int] = []
+        self._rocm_ready_timelines: dict[int, int] = {}
         self._eye_buffers: list[tuple[VulkanExportableBuffer, VulkanExportableBuffer]] = []
         self._buffer_frames: dict[int, tuple[VulkanExportableBuffer, VulkanExportableBuffer]] = {}
         self._host_eye_slots: list[tuple[VulkanHostImage, VulkanHostImage]] = []
@@ -1447,15 +1448,16 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                     copy_timelines.append(
                         self.presenter.vulkan.copy_buffer_to_image(buffer, resource)
                     )
-                # Both copies are ordered on the graphics queue; waiting on
-                # the final timeline covers both eyes without a second host
-                # wait or a device-wide idle.
-                self.presenter.vulkan.wait_for_timeline(max(copy_timelines))
+                # Both copies are ordered on the graphics queue. The final
+                # timeline is carried with the frame so the presenter can wait
+                # on the GPU queue instead of blocking this thread.
+                ready_timeline = max(copy_timelines)
                 for eye_index, _resource, _buffer in (
                     (0, self.left_slot.resource, left_buffer),
                     (1, self.right_slot.resource, right_buffer),
                 ):
                     self._prepared_source_eyes.add((int(frame_id), eye_index))
+                self._rocm_ready_timelines[int(frame_id)] = int(ready_timeline)
         except Exception:
             glow_release = glow_metadata.get("_vulkan_glow_release")
             if callable(glow_release):
@@ -1476,7 +1478,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
             timestamp=timestamp,
             left_eye=self.left_slot.resource,
             right_eye=self.right_slot.resource,
-            ready_timeline=None,
+            ready_timeline=int(self._rocm_ready_timelines[int(frame_id)]),
             metadata={
                 **dict(getattr(runtime_result, "debug_info", None) or {}),
                 "vulkan_output_ring_slot": slot_index,
@@ -1650,13 +1652,18 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         *,
         wait_for_timeline: int | None = None,
     ) -> None:
+        frame_key = int(frame_id)
+        effective_wait_for_timeline = wait_for_timeline
+        if effective_wait_for_timeline is None:
+            effective_wait_for_timeline = getattr(
+                self, "_rocm_ready_timelines", {}
+            ).get(frame_key)
         if not self._host_staging_enabled:
             return super().release_consumer_frame(
                 frame_id,
                 consumer_semaphores,
-                wait_for_timeline=wait_for_timeline,
+                wait_for_timeline=effective_wait_for_timeline,
             )
-        frame_key = int(frame_id)
         if frame_key in self._released_source_frames:
             return
         entry = self._source_frames.get(frame_key)
@@ -1678,7 +1685,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                     continue
                 context.release_external_image_from_sampling(
                     resource,
-                    wait_for_timeline=wait_for_timeline,
+                    wait_for_timeline=effective_wait_for_timeline,
                     wait_semaphore=(
                         waits[eye_index] if eye_index < len(waits) else None
                     ),
@@ -1691,6 +1698,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self.release_frame(frame_key)
         self._released_source_frames.add(frame_key)
         self._source_frames.pop(frame_key, None)
+        getattr(self, "_rocm_ready_timelines", {}).pop(frame_key, None)
 
     def release_frame(self, frame_id: int) -> None:
         frame_key = int(frame_id)
@@ -1718,6 +1726,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._rocm_ready_pending.difference_update(((frame_key, 0), (frame_key, 1)))
         self._buffer_frames.pop(frame_key, None)
         self._host_frame_slots.pop(frame_key, None)
+        getattr(self, "_rocm_ready_timelines", {}).pop(frame_key, None)
         super().release_frame(frame_key)
 
     def close(self) -> None:
@@ -1725,6 +1734,7 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
         self._buffer_frames.clear()
         self._host_frame_slots.clear()
         self._rocm_release_timelines = []
+        self._rocm_ready_timelines.clear()
         super().close()
         for host_slots in self._host_eye_slots:
             for host in host_slots:

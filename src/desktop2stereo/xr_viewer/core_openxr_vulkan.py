@@ -7818,6 +7818,7 @@ class OpenXrVulkanPresenter(
                 "Vulkan Projection Composer source preparation is unavailable"
             )
         source_inputs = (frame.left_eye, frame.right_eye)
+        source_ready_timeline = int(getattr(frame, "ready_timeline", None) or 0)
         status = (
             layered,
             int(source_inputs[0].width),
@@ -8111,8 +8112,10 @@ class OpenXrVulkanPresenter(
                     ),
                         wait_for_timeline=max(
                             int(surround_timeline),
-                        int(depth_sampling_timeline), int(panorama_timeline),
-                    ),
+                            int(depth_sampling_timeline),
+                            int(panorama_timeline),
+                            source_ready_timeline,
+                        ),
                     extra_wait_semaphores=filament_wait_semaphores,
                 )
             except Exception as exc:
@@ -8139,7 +8142,9 @@ class OpenXrVulkanPresenter(
                 extra_wait_semaphores=filament_wait_semaphores,
                 wait_for_timeline=max(
                     int(surround_timeline),
-                    int(depth_sampling_timeline), int(panorama_timeline),
+                    int(depth_sampling_timeline),
+                    int(panorama_timeline),
+                    source_ready_timeline,
                 ),
             )
         if defer_filament_resolve:
@@ -11369,6 +11374,11 @@ class OpenXrVulkanPresenter(
                             self.vulkan.copy_image(
                                 source,
                                 quad_swapchain.resources[image_index],
+                                wait_for_timeline=(
+                                    int(getattr(frame, "ready_timeline"))
+                                    if getattr(frame, "ready_timeline", None)
+                                    else None
+                                ),
                                 wait_semaphore=visible_semaphore,
                                 destination_array_layer=eye_index,
                                 flip_y=False,

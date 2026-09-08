@@ -224,6 +224,7 @@ def test_rocm_synchronized_copy_tracks_vulkan_release_timeline():
     adapter._prepared_source_eyes = {(7, 0), (7, 1)}
     adapter._release_signaled = set()
     adapter._rocm_release_timelines = [0]
+    adapter._rocm_ready_timelines = {7: 39}
     adapter.left_release_semaphores = []
     adapter.right_release_semaphores = []
     adapter._source_frames = {
