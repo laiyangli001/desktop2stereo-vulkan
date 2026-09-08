@@ -1439,14 +1439,22 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 self.importer.copy_tensor_to_buffer(left, left_buffer)
                 self.importer.copy_tensor_to_buffer(right, right_buffer)
                 self.importer.synchronize()
+                copy_timelines = []
                 for eye_index, resource, buffer in (
                     (0, self.left_slot.resource, left_buffer),
                     (1, self.right_slot.resource, right_buffer),
                 ):
-                    timeline = self.presenter.vulkan.copy_buffer_to_image(
-                        buffer, resource
+                    copy_timelines.append(
+                        self.presenter.vulkan.copy_buffer_to_image(buffer, resource)
                     )
-                    self.presenter.vulkan.wait_for_timeline(timeline)
+                # Both copies are ordered on the graphics queue; waiting on
+                # the final timeline covers both eyes without a second host
+                # wait or a device-wide idle.
+                self.presenter.vulkan.wait_for_timeline(max(copy_timelines))
+                for eye_index, _resource, _buffer in (
+                    (0, self.left_slot.resource, left_buffer),
+                    (1, self.right_slot.resource, right_buffer),
+                ):
                     self._prepared_source_eyes.add((int(frame_id), eye_index))
         except Exception:
             glow_release = glow_metadata.get("_vulkan_glow_release")
