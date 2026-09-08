@@ -322,10 +322,10 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: DA3-SMALL
+Depth Model: depth-anything-small
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 322
+Depth Resolution: 336
 Anti-aliasing: 1
 Depth Antialias Strength: 1.0
 Depth Pop: 0.0
