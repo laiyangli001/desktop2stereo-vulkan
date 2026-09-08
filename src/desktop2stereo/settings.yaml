@@ -322,7 +322,7 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Depth-Anything-V2-Small
+Depth Model: Distill-Any-Depth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
 Depth Resolution: 336
