@@ -340,7 +340,6 @@ def vit_small(patch_size=16, **kwargs):
     )
     return model
 
-
 def vit_base(patch_size=16, **kwargs):
     model = DinoVisionTransformer(
         patch_size=patch_size,
@@ -414,4 +413,3 @@ def vit_7b(patch_size=16, **kwargs):
         **kwargs,
     )
     return model
-
