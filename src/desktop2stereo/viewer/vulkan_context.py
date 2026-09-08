@@ -1687,18 +1687,10 @@ class VulkanContext:
             wait_semaphore=wait_semaphore,
         )
 
-    def copy_buffer_to_image(
-        self,
-        source: Any,
-        destination: Any,
-        *,
-        wait_for_timeline: int | None = None,
-        wait_semaphore: Any | None = None,
-        wait_semaphore_value: int | None = None,
-        signal_semaphore: Any | None = None,
-        signal_semaphore_value: int | None = None,
-    ) -> int:
-        """Copy a tightly packed RGBA buffer into a Vulkan image."""
+    def _prepare_buffer_to_image_copy(
+        self, source: Any, destination: Any
+    ) -> tuple[Any, ImageState, Callable[[Any], None]]:
+        """Validate and record one tightly packed RGBA buffer-to-image copy."""
         self._ensure_open()
         if getattr(source, "context", self) is not self:
             raise VulkanCapabilityError("Vulkan buffer belongs to a different context")
@@ -1800,6 +1792,32 @@ class VulkanContext:
                 ],
             )
 
+        next_state = ImageState(
+            layout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            access_mask=vk.VK_ACCESS_SHADER_READ_BIT,
+            stage_mask=(
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            ),
+            queue_family_index=self.queue_family_index,
+        )
+        return destination_key, next_state, record
+
+    def copy_buffer_to_image(
+        self,
+        source: Any,
+        destination: Any,
+        *,
+        wait_for_timeline: int | None = None,
+        wait_semaphore: Any | None = None,
+        wait_semaphore_value: int | None = None,
+        signal_semaphore: Any | None = None,
+        signal_semaphore_value: int | None = None,
+    ) -> int:
+        """Copy a tightly packed RGBA buffer into a Vulkan image."""
+        destination_key, next_state, record = self._prepare_buffer_to_image_copy(
+            source, destination
+        )
         timeline_value = self.submit_on(
             "graphics",
             record,
@@ -1809,18 +1827,35 @@ class VulkanContext:
             signal_semaphore=signal_semaphore,
             signal_semaphore_value=signal_semaphore_value,
         )
-        self._image_states.update(
-            destination_key,
-            ImageState(
-                layout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                access_mask=vk.VK_ACCESS_SHADER_READ_BIT,
-                stage_mask=(
-                    vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                    | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                ),
-                queue_family_index=self.queue_family_index,
-            ),
+        self._image_states.update(destination_key, next_state)
+        return timeline_value
+
+    def copy_buffer_to_image_pair(
+        self,
+        copies: Iterable[tuple[Any, Any]],
+        *,
+        wait_for_timeline: int | None = None,
+    ) -> int:
+        """Copy a pair of RGBA buffers in one graphics-queue submission."""
+        prepared = [
+            self._prepare_buffer_to_image_copy(source, destination)
+            for source, destination in copies
+        ]
+        if len(prepared) != 2:
+            raise ValueError("copy_buffer_to_image_pair requires exactly two copies")
+        destination_keys = [item[0] for item in prepared]
+        if destination_keys[0] == destination_keys[1]:
+            raise VulkanCapabilityError("buffer copy destinations must be distinct")
+
+        def record(command_buffer: Any) -> None:
+            for _destination_key, _next_state, copy_record in prepared:
+                copy_record(command_buffer)
+
+        timeline_value = self.submit_on(
+            "graphics", record, wait_for_timeline=wait_for_timeline
         )
+        for destination_key, next_state, _record in prepared:
+            self._image_states.update(destination_key, next_state)
         return timeline_value
 
     def submit(self, record: Callable[[Any], None]) -> None:

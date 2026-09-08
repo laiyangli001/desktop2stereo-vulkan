@@ -1441,18 +1441,15 @@ class RocmVulkanOutputAdapter(CudaVulkanOutputAdapter):
                 self.importer.copy_tensor_to_buffer(right, right_buffer)
                 if not bool(getattr(self.importer, "uses_synchronous_buffer_copy", False)):
                     self.importer.synchronize()
-                copy_timelines = []
-                for eye_index, resource, buffer in (
-                    (0, self.left_slot.resource, left_buffer),
-                    (1, self.right_slot.resource, right_buffer),
-                ):
-                    copy_timelines.append(
-                        self.presenter.vulkan.copy_buffer_to_image(buffer, resource)
+                ready_timeline = self.presenter.vulkan.copy_buffer_to_image_pair(
+                    (
+                        (left_buffer, self.left_slot.resource),
+                        (right_buffer, self.right_slot.resource),
                     )
+                )
                 # Both copies are ordered on the graphics queue. The final
                 # timeline is carried with the frame so the presenter can wait
                 # on the GPU queue instead of blocking this thread.
-                ready_timeline = max(copy_timelines)
                 for eye_index, _resource, _buffer in (
                     (0, self.left_slot.resource, left_buffer),
                     (1, self.right_slot.resource, right_buffer),
