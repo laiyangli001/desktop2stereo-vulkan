@@ -322,30 +322,30 @@ Model List:
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Small
+Depth Model: DA3-SMALL
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 336
-Anti-aliasing: 0
-Depth Antialias Strength: 0.0
+Depth Resolution: 322
+Anti-aliasing: 1
+Depth Antialias Strength: 1.0
 Depth Pop: 0.0
-Foreground Pop: 1.0
-Midground Pop: 1.0
-Background Pop: 1.0
-Depth Separation Preset: default
+Foreground Pop: 1.15
+Midground Pop: 1.05
+Background Pop: 1.05
+Depth Separation Preset: standard
 Convergence: 0.0
 Dynamic Convergence: false
 Dynamic Convergence Strength: 0.0
-Stereo Preset: traditional_fastest
-Stereo Quality: fast
+Stereo Preset: cinema
+Stereo Quality: quality_4k
 Stereo Compute Backend: auto
 Parallax Budget Preset: standard
 Temporal: false
 Temporal Strength: 0.0
 Auto Scene Reset: true
 Scene Reset Threshold: 0.22
-Edge Dilation: 0
-Mask Feather Radius: 0
+Edge Dilation: 1
+Mask Feather Radius: 1
 Hole Fill Mode: none
 Hole Fill Radius: 0
 Hole Fill Strength: 0.0
@@ -429,7 +429,7 @@ Stereo Output Identity:
   height: 2160
 Show Log Panel: true
 Input Display Resolution Tier: 4K
-Synthetic View: fast
+Synthetic View: quality_4k
 OpenVINO: null
 OpenXR Screen States:
   Default:
