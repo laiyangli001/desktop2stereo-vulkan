@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import os
@@ -72,6 +73,32 @@ def _breakdown_log_limit() -> int:
         return 5
 
 
+_TIMING_SAMPLE_LIMIT = 512
+_TIMING_SAMPLE_NAMES = {
+    "openxr_frame_total",
+    "openxr_projection_total",
+    "openxr_vulkan_composer_queue_submit",
+    "openxr_vulkan_composer_fence_wait",
+    "openxr_vulkan_output_convert",
+    "rt_total",
+    "rt_depth_total",
+    "rt_depth_model",
+    "rt_slot_wait",
+}
+
+
+def _percentile(values: tuple[float, ...], quantile: float) -> float:
+    """Return a deterministic interpolated percentile without NumPy."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 class FPSBreakdown:
     def __init__(self, *, enabled: bool, target_fps: int | float):
         self.enabled = enabled
@@ -102,6 +129,7 @@ class FPSBreakdown:
         self.log_count = 0
         self.log_limit = _breakdown_log_limit()
         self.log_delay = _breakdown_log_interval()
+        self._timing_samples: dict[str, deque[float]] = {}
 
     def inc(self, name: str, amount: int | float = 1) -> None:
         if not self.enabled:
@@ -113,8 +141,11 @@ class FPSBreakdown:
         if not self.enabled:
             return
         with self.lock:
-            self.stats[f"{name}_ms"] = self.stats.get(f"{name}_ms", 0.0) + seconds * 1000.0
+            value_ms = seconds * 1000.0
+            self.stats[f"{name}_ms"] = self.stats.get(f"{name}_ms", 0.0) + value_ms
             self.stats[f"{name}_count"] = self.stats.get(f"{name}_count", 0) + 1
+            if name in _TIMING_SAMPLE_NAMES:
+                self._timing_samples.setdefault(name, deque(maxlen=_TIMING_SAMPLE_LIMIT)).append(value_ms)
 
     def add_value(self, name: str, value: float) -> None:
         if not self.enabled:
@@ -169,6 +200,16 @@ class FPSBreakdown:
                 value = timing.get(key)
                 if value is not None:
                     self.stats[f"rt_{key}"] = float(value)
+                    sample_name = {
+                        "depth_total_ms": "rt_depth_total",
+                        "depth_model_ms": "rt_depth_model",
+                        "depth_slot_wait_ms": "rt_slot_wait",
+                        "total_ms": "rt_total",
+                    }.get(key)
+                    if sample_name:
+                        self._timing_samples.setdefault(
+                            sample_name, deque(maxlen=_TIMING_SAMPLE_LIMIT)
+                        ).append(float(value))
             self.stats["rt_backend"] = str(debug.get("backend", "unknown"))
             self.stats["rt_depth_backend"] = str(debug.get("runtime_depth_backend", "unknown"))
             self.stats["rt_depth_slot"] = (
@@ -264,6 +305,10 @@ class FPSBreakdown:
         with self.lock:
             self.log_count += 1
             stats = dict(self.stats)
+            timing_samples = {
+                name: tuple(values) for name, values in self._timing_samples.items()
+            }
+            self._timing_samples.clear()
             for key in list(self.stats.keys()):
                 if key in LATEST_KEYS:
                     continue
@@ -280,6 +325,13 @@ class FPSBreakdown:
         def avg_value(name: str) -> float:
             count = stats.get(f"{name}_count", 0)
             return stats.get(f"{name}_total", 0.0) / count if count else 0.0
+
+        def timing_stat(name: str, quantile: float) -> float:
+            return _percentile(timing_samples.get(name, ()), quantile)
+
+        def timing_max(name: str) -> float:
+            values = timing_samples.get(name, ())
+            return max(values) if values else 0.0
 
         quad_unavailable = ",".join(
             f"{key[len('openxr_quad_unavailable_'):]}:{value / elapsed:.1f}"
@@ -503,6 +555,21 @@ class FPSBreakdown:
             f"xr_no_layers={avg_ms('openxr_render_no_layers'):.2f}ms "
             f"xr_end={avg_ms('openxr_end_frame'):.2f}ms "
             f"xr_frame={avg_ms('openxr_frame_total'):.2f}ms "
+            f"xr_frame_p50={timing_stat('openxr_frame_total', 0.50):.2f}ms "
+            f"xr_frame_p95={timing_stat('openxr_frame_total', 0.95):.2f}ms "
+            f"xr_frame_max={timing_max('openxr_frame_total'):.2f}ms "
+            f"xr_projection_p50={timing_stat('openxr_projection_total', 0.50):.2f}ms "
+            f"xr_projection_p95={timing_stat('openxr_projection_total', 0.95):.2f}ms "
+            f"xr_projection_max={timing_max('openxr_projection_total'):.2f}ms "
+            f"vk_submit_p50={timing_stat('openxr_vulkan_composer_queue_submit', 0.50):.2f}ms "
+            f"vk_submit_p95={timing_stat('openxr_vulkan_composer_queue_submit', 0.95):.2f}ms "
+            f"vk_submit_max={timing_max('openxr_vulkan_composer_queue_submit'):.2f}ms "
+            f"vk_fence_p50={timing_stat('openxr_vulkan_composer_fence_wait', 0.50):.2f}ms "
+            f"vk_fence_p95={timing_stat('openxr_vulkan_composer_fence_wait', 0.95):.2f}ms "
+            f"vk_fence_max={timing_max('openxr_vulkan_composer_fence_wait'):.2f}ms "
+            f"vk_convert_p50={timing_stat('openxr_vulkan_output_convert', 0.50):.2f}ms "
+            f"vk_convert_p95={timing_stat('openxr_vulkan_output_convert', 0.95):.2f}ms "
+            f"vk_convert_max={timing_max('openxr_vulkan_output_convert'):.2f}ms "
             f"rt_loop={avg_ms('rt_loop'):.2f}ms "
             f"rt_cap2rgb={avg_ms('rt_cap2rgb'):.2f}ms "
             f"rt_prepare={avg_ms('rt_prepare'):.2f}ms "
@@ -536,6 +603,12 @@ class FPSBreakdown:
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "
+            f"rt_total_p50={timing_stat('rt_total', 0.50):.2f}ms "
+            f"rt_total_p95={timing_stat('rt_total', 0.95):.2f}ms "
+            f"rt_total_max={timing_max('rt_total'):.2f}ms "
+            f"rt_slot_wait_p50={timing_stat('rt_slot_wait', 0.50):.2f}ms "
+            f"rt_slot_wait_p95={timing_stat('rt_slot_wait', 0.95):.2f}ms "
+            f"rt_slot_wait_max={timing_max('rt_slot_wait'):.2f}ms "
             f"rt_sbs_host={stats.get('rt_sbs_host_ms', 0.0):.2f}ms "
             f"rt_sbs_host_copy={stats.get('rt_sbs_host_copy_ms', 0.0):.2f}ms "
             f"rt_sbs_host_numpy={stats.get('rt_sbs_host_numpy_ms', 0.0):.2f}ms "

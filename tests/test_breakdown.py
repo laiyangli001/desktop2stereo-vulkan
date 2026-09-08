@@ -92,3 +92,31 @@ def test_fps_breakdown_reports_parallel_slot_wait(capsys):
     assert "rt_slot_wait=18.25ms" in output
     assert "rt_parallel_effective_workers=1" in output
     assert "rt_parallel_backoff=1" in output
+
+
+def test_fps_breakdown_reports_bounded_openxr_timing_percentiles(capsys):
+    breakdown = FPSBreakdown(enabled=True, target_fps=60)
+    start = breakdown.last_log
+    for value_ms in (10.0, 20.0, 30.0):
+        breakdown.add_time("openxr_frame_total", value_ms / 1000.0)
+        breakdown.add_time("openxr_projection_total", value_ms / 1000.0)
+        breakdown.add_time("openxr_vulkan_composer_queue_submit", value_ms / 1000.0)
+        breakdown.add_time("openxr_vulkan_composer_fence_wait", value_ms / 1000.0)
+        breakdown.add_time("openxr_vulkan_output_convert", value_ms / 1000.0)
+    for value_ms in (12.0, 20.0, 30.0):
+        runtime_result = type(
+            "Result",
+            (),
+            {"timing": {"total_ms": value_ms, "depth_slot_wait_ms": value_ms / 2.0}, "debug_info": {}},
+        )()
+        breakdown.add_runtime_timing(runtime_result)
+
+    breakdown.log(now=start + 15.0)
+
+    output = capsys.readouterr().out
+    assert "xr_frame_p50=20.00ms" in output
+    assert "xr_frame_p95=29.00ms" in output
+    assert "xr_frame_max=30.00ms" in output
+    assert "vk_submit_p95=29.00ms" in output
+    assert "rt_total_p50=20.00ms" in output
+    assert "rt_slot_wait_p95=14.50ms" in output

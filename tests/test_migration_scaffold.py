@@ -34,6 +34,15 @@ def test_capability_report_identifies_new_project():
     assert "selected_backend" in report["gpu_producers"]
 
 
+def test_capability_report_marks_static_openxr_boundary_and_runtime_size():
+    report = build_capability_report()
+
+    assert isinstance(report["openxr"]["extensions"], list)
+    assert report["runtime_configuration"]["fallback_status"]["session_created"] is False
+    assert report["runtime_configuration"]["fallback_status"]["gpu_to_cpu"] == "not_probed"
+    assert report["runtime_configuration"]["openxr"]["target_size"] == "session_required"
+
+
 def test_current_style_source_layout_is_present():
     expected = [
         APP_ROOT / "main.py",
