@@ -115,8 +115,61 @@ class InfiniDepthOnnxExportWrapper(torch.nn.Module):
         return self.model(pixel_values, fp32=self.fp32)
 
 
+class VideoDepthAnythingOnnxExportWrapper(torch.nn.Module):
+    """Stateless single-frame wrapper for the VDA temporal checkpoint.
+
+    The runtime uses VDA's streaming cache, while an ONNX/MIGraphX graph must
+    be deterministic. A singleton temporal dimension is sufficient for the
+    first-frame path and keeps the compiled graph free of mutable Python state.
+    """
+
+    def __init__(self, model) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        sequence = pixel_values.unsqueeze(1)
+        features = self.model.forward_features(sequence)
+        depth, _ = self.model.forward_depth(features, sequence.shape)
+        return depth
+
+
 def _is_infinidepth_model(model_id: str) -> bool:
     return "infinidepth" in str(model_id).lower()
+
+
+def _is_video_depth_anything_model(model_id: str) -> bool:
+    return "video-depth-anything" in str(model_id).lower()
+
+
+def _is_da3_model(model_id: str) -> bool:
+    return "/da3" in str(model_id).lower() or str(model_id).lower().startswith("da3")
+
+
+def _da3_preset(model_id: str) -> str:
+    model_lower = str(model_id).lower()
+    if "nested" in model_lower:
+        return "da3nested-giant-large"
+    if "metric" in model_lower:
+        return "da3metric-large"
+    if "mono" in model_lower:
+        return "da3mono-large"
+    if "giant" in model_lower:
+        return "da3-giant"
+    if "base" in model_lower:
+        return "da3-base"
+    if "small" in model_lower:
+        return "da3-small"
+    return "da3-large"
+
+
+def _video_depth_anything_encoder(model_id: str) -> str:
+    model_lower = str(model_id).lower()
+    if "small" in model_lower:
+        return "vits"
+    if "base" in model_lower:
+        return "vitb"
+    return "vitl"
 
 
 @contextmanager
@@ -159,6 +212,67 @@ def load_model_for_dtype(
         model = InfiniDepthModel(model_path=model_path, encoder=_infinidepth_encoder_for_model(model_id)).to(device, dtype=dtype)
         model.eval()
         return InfiniDepthOnnxExportWrapper(model, fp32=dtype != torch.float16).eval()
+
+    if _is_da3_model(model_id):
+        from .model_artifacts import find_local_model_weight
+        from .model_registry import resolve_model_dir
+        from stereo_runtime.model_impl.depth_anything_3.api_n import DepthAnything3
+
+        model_dir = resolve_model_dir(model_id, cache_dir)
+        model_path = find_local_model_weight(model_dir)
+        if model_path is None:
+            raise FileNotFoundError(f"DA3 checkpoint not found for {model_id!r} in {model_dir}")
+        model = DepthAnything3(model_name=_da3_preset(model_id))
+        if model_path.suffix.lower() == ".safetensors":
+            from safetensors.torch import load_file
+
+            checkpoint = load_file(str(model_path), device="cpu")
+        else:
+            checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=True)
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            checkpoint = checkpoint["state_dict"]
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(f"unsupported DA3 checkpoint format: {model_path}")
+        checkpoint = {
+            str(key).removeprefix("module."): value
+            for key, value in checkpoint.items()
+        }
+        model.load_state_dict(checkpoint, strict=True)
+        model = model.to(device=device, dtype=dtype).eval()
+        return DepthOnnxExportWrapper(model).eval()
+
+    if _is_video_depth_anything_model(model_id):
+        from .model_artifacts import find_local_model_weight
+        from .model_registry import resolve_model_dir
+        from stereo_runtime.model_impl.video_depth_anything.vda2_s import VideoDepthAnything
+
+        model_path = find_local_model_weight(resolve_model_dir(model_id, cache_dir))
+        if model_path is None:
+            raise FileNotFoundError(
+                f"Video-Depth-Anything checkpoint not found for {model_id!r} in "
+                f"{resolve_model_dir(model_id, cache_dir)}"
+            )
+        model_configs = {
+            "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
+            "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
+            "vitl": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
+        }
+        encoder = _video_depth_anything_encoder(model_id)
+        model = VideoDepthAnything(**model_configs[encoder])
+        checkpoint = torch.load(str(model_path), map_location="cpu", weights_only=True)
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            checkpoint = checkpoint["state_dict"]
+        if isinstance(checkpoint, dict) and "model" in checkpoint and isinstance(checkpoint["model"], dict):
+            checkpoint = checkpoint["model"]
+        if not isinstance(checkpoint, dict):
+            raise RuntimeError(f"unsupported Video-Depth-Anything checkpoint format: {model_path}")
+        checkpoint = {
+            str(key).removeprefix("module."): value
+            for key, value in checkpoint.items()
+        }
+        model.load_state_dict(checkpoint, strict=True)
+        model = model.to(device=device, dtype=dtype).eval()
+        return VideoDepthAnythingOnnxExportWrapper(model).eval()
 
     model = auto_model_cls.from_pretrained(
         model_id,

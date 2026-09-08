@@ -9,7 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
 from stereo_runtime.model_artifacts import artifact_paths_for_model
-from stereo_runtime.onnx_export import _quiet_onnx_export_warnings, choose_export_dtype, export_depth_model_onnx, probe_model_dtype
+from stereo_runtime.onnx_export import (
+    _da3_preset,
+    _is_da3_model,
+    _quiet_onnx_export_warnings,
+    choose_export_dtype,
+    export_depth_model_onnx,
+    probe_model_dtype,
+)
 
 
 def test_choose_export_dtype_auto_cuda_defaults_fp16():
@@ -34,6 +41,13 @@ def test_choose_export_dtype_force_fp32_keyword():
     assert dtype == torch.float32
     assert name == "fp32"
     assert "requires fp32" in reason
+
+
+def test_da3_models_use_bundled_preset_mapping():
+    assert _is_da3_model("depth-anything/DA3-BASE") is True
+    assert _da3_preset("depth-anything/DA3-BASE") == "da3-base"
+    assert _da3_preset("depth-anything/DA3NESTED-GIANT-LARGE-1.1") == "da3nested-giant-large"
+    assert _da3_preset("depth-anything/DA3METRIC-LARGE") == "da3metric-large"
 
 
 def test_default_output_path_uses_actual_dtype_name():

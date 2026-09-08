@@ -61,10 +61,10 @@ DISABLE_OPENVINO_KEYWORDS = [
     "dpt-hybrid-midas-hf",
 ]
 
-DISABLE_MIGRAPHX_KEYWORDS = [
-    "dpt-hybrid-midas",
-    "video-depth-anything",
-]
+# MIGraphX is selected from the compiled ONNX graph, not from a model-family
+# allowlist. Unsupported operators/shapes must be reported by export/compile
+# instead of silently hiding the backend in the GUI.
+DISABLE_MIGRAPHX_KEYWORDS = []
 
 DISABLE_CUDNN_KEYWORDS = [
     "6950",

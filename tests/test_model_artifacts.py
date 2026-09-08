@@ -8,7 +8,14 @@ from stereo_runtime import (
     artifact_paths_for_model,
     prepare_model_artifacts,
 )
-from stereo_runtime.model_artifacts import ensure_model_downloaded, find_local_model_weight, select_existing_migraphx, select_existing_onnx, select_existing_trt
+from stereo_runtime.model_artifacts import (
+    ensure_model_downloaded,
+    ensure_onnx_exported,
+    find_local_model_weight,
+    select_existing_migraphx,
+    select_existing_onnx,
+    select_existing_trt,
+)
 from stereo_runtime.model_registry import ModelRegistry
 
 
@@ -30,6 +37,43 @@ def test_infinidepth_artifact_paths_use_patch_16_export_size():
     assert paths.onnx_fp16_path.name == "model_fp16_288x512.onnx"
     assert paths.onnx_fp32_path.name == "model_fp32_288x512.onnx"
     assert paths.trt_fp16_path.name == "model_fp16_288x512.trt"
+
+
+def test_video_model_cache_accepts_named_pth_checkpoint(tmp_path: Path):
+    spec = ModelRegistry.default().get("Video-Depth-Anything-Small")
+    model_dir = spec.model_dir(tmp_path) / "snapshots" / "local"
+    model_dir.mkdir(parents=True)
+    (model_dir / "video_depth_anything_vits.pth").write_bytes(b"weights")
+
+    assert find_local_model_weight(spec.model_dir(tmp_path)).name == "video_depth_anything_vits.pth"
+    assert ensure_model_downloaded(spec, cache_dir=tmp_path, local_files_only=True) == spec.model_dir(tmp_path)
+
+
+def test_onnx_export_uses_patch_aligned_artifact_size(monkeypatch, tmp_path: Path):
+    spec = ModelRegistry.default().get("Video-Depth-Anything-Small")
+    model_dir = spec.model_dir(tmp_path)
+    model_dir.mkdir(parents=True)
+    (model_dir / "video_depth_anything_vits.pth").write_bytes(b"weights")
+    calls = {}
+
+    def fake_export(**kwargs):
+        calls.update(kwargs)
+        output_path = Path(kwargs["output_path"])
+        output_path.write_bytes(b"onnx")
+        return SimpleNamespace(output_path=output_path)
+
+    monkeypatch.setattr("stereo_runtime.onnx_export.export_depth_model_onnx", fake_export)
+    ensure_onnx_exported(
+        spec,
+        cache_dir=tmp_path,
+        height=191,
+        width=336,
+        dtype="fp16",
+        local_files_only=True,
+        export_if_missing=True,
+    )
+
+    assert (calls["height"], calls["width"]) == (196, 336)
 
 
 def test_select_existing_onnx_prefers_fp16_for_auto(tmp_path: Path):

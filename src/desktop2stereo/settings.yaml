@@ -1,7 +1,7 @@
 Capture Mode: Monitor
-Monitor Index: 2
+Monitor Index: 1
 Monitor Identity:
-  stable_id: DISPLAY\TUP0270\7&314d3634&4&UID61698
+  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
   name: D270H
   manufacturer: TUP
   model: D270H
@@ -32,33 +32,6 @@ Model List:
     - 448
     - 518
   Distill-Any-Depth-Large:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  Depth-Anything-V2-Small:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  Depth-Anything-V2-Base:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  Depth-Anything-V2-Large:
     resolutions:
     - 196
     - 238
@@ -103,6 +76,33 @@ Model List:
     - 384
     - 448
     - 512
+  Depth-Anything-V2-Small:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
+  Depth-Anything-V2-Base:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
+  Depth-Anything-V2-Large:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
   Video-Depth-Anything-Small:
     resolutions:
     - 196
@@ -166,15 +166,6 @@ Model List:
     - 378
     - 434
     - 504
-  DA3METRIC-LARGE:
-    resolutions:
-    - 182
-    - 224
-    - 280
-    - 322
-    - 378
-    - 434
-    - 504
   DA3NESTED-GIANT-LARGE:
     resolutions:
     - 182
@@ -185,6 +176,15 @@ Model List:
     - 434
     - 504
   DA3MONO-LARGE:
+    resolutions:
+    - 182
+    - 224
+    - 280
+    - 322
+    - 378
+    - 434
+    - 504
+  DA3METRIC-LARGE:
     resolutions:
     - 182
     - 224
@@ -319,163 +319,10 @@ Model List:
     - 392
     - 448
     - 518
-  dpt-dinov2-small-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-base-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-large-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-giant-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-small-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-base-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-large-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-giant-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  depth-ai:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-hybrid-midas:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-beit-base-384:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-beit-large-512:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-large:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-large-redesign:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-nyu-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Small
+Depth Model: InfiniDepth-Small
 Depth Strength: 0.25
 Depth Quick: Standard
 Depth Resolution: 336
@@ -518,18 +365,18 @@ Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
 torch.compile: true
-TensorRT: true
+TensorRT: null
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: null
+MIGraphX: true
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
 Language: EN
-Run Mode: Local Viewer
+Run Mode: OpenXR Link
 XR Headset Model: Meta Quest 2
 XR Preview Window: false
 VSync: false
@@ -564,22 +411,22 @@ Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
 LSFG Support: false
-Capture Tool: WindowsCaptureCUDA
+Capture Tool: WindowsCaptureROCm
 Display Fit Mode: contain
 Stream Display Fit Mode: contain
 Fill 16:9: true
 Fix Viewer Aspect: true
 Stereo Output: 1
 Stereo Output Identity:
-  stable_id: DISPLAY\DELF017\7&314d3634&4&UID61700
-  name: Dell U2410(DP)
-  manufacturer: DEL
-  model: DELL U2410
-  serial: J257M0CR0TUL
-  left: 3840
+  stable_id: DISPLAY\TUP0270\7&34414894&e&UID1540
+  name: D270H
+  manufacturer: TUP
+  model: D270H
+  serial: '808728147'
+  left: 0
   top: 0
-  width: 1920
-  height: 1200
+  width: 3840
+  height: 2160
 Show Log Panel: true
 Input Display Resolution Tier: 4K
 Synthetic View: fast
@@ -591,7 +438,7 @@ OpenXR Screen States:
     - 0.0
     - -1.3
     width: 1.5
-    height: 0.9375
+    height: 0.84375
     rotation_deg:
     - 0.0
     - 0.0

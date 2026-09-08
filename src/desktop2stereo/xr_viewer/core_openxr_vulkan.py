@@ -4547,8 +4547,11 @@ class OpenXrVulkanPresenter(
             # the first HDR render call.
             self._ensure_vulkan_projection_screen_pass(
                 enable_panorama=(
-                    self._is_rocm_backend()
-                    or (bool(panorama_path) and not self._openxr_equirect_supported)
+                    bool(panorama_path)
+                    and (
+                        self._is_rocm_backend()
+                        or not self._openxr_equirect_supported
+                    )
                 )
             )
             if bridge is not None:
@@ -6296,17 +6299,15 @@ class OpenXrVulkanPresenter(
                     self._destroy_projection_swapchain(eye)
                 self._vulkan_controller_proxy_swapchains.clear()
                 raise
-        # ROCm always keeps its startup-created Vulkan panorama pipeline.
-        # Other backends only need it for a selected panorama asset when the
-        # runtime has no native equirect layer.  The Default environment has
-        # no panorama, so never create NVIDIA's optional pipeline merely
-        # because Quest Link lacks equirect support.
+        # Only create the optional panorama pipeline for a selected panorama.
+        # ROCm still requires the Vulkan implementation even when the runtime
+        # advertises native equirect support; Default has no panorama asset.
         self._ensure_vulkan_projection_screen_pass(
             enable_panorama=(
-                self._is_rocm_backend()
-                or (
-                    bool(self.config.filament_panorama_path)
-                    and not self._openxr_equirect_supported
+                bool(self.config.filament_panorama_path)
+                and (
+                    self._is_rocm_backend()
+                    or not self._openxr_equirect_supported
                 )
             )
         )

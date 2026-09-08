@@ -6,15 +6,15 @@ from typing import Any
 
 import torch
 
-from stereo_runtime.depth_onnx_provider import DistillPreprocessor, _dtype_from_onnx_name
+from stereo_runtime.depth_onnx_provider import ModelOnnxPreprocessor, _dtype_from_onnx_name
 from stereo_runtime.depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DepthProfileResult,
     DepthProviderInfo,
-    _normalize_depth,
+    _postprocess_generic_depth,
 )
 from stereo_runtime.depth_upsample import DepthUpsampleMode, upsample_depth
-from stereo_runtime.output import ensure_b1hw, ensure_bchw
+from stereo_runtime.output import ensure_bchw
 
 from .pytorch_rocm import create_pytorch_rocm_provider, is_rocm_torch_available
 
@@ -99,12 +99,20 @@ class MIGraphXEngine:
     @property
     def input_image_size(self) -> tuple[int, int] | None:
         shape = self.input_shape
-        if len(shape) != 4 or any(dim < 1 for dim in shape):
+        if len(shape) not in (4, 5) or any(dim < 1 for dim in shape[-2:]):
             return None
         return int(shape[-2]), int(shape[-1])
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.to(device=self.device)
+        if len(self.input_shape) == 5 and tensor.ndim == 4:
+            # Video models are exported with a singleton temporal dimension;
+            # the runtime still processes one frame at a time.
+            tensor = tensor.unsqueeze(1)
+        if tensor.ndim != len(self.input_shape):
+            raise RuntimeError(
+                f"MIGraphX input rank mismatch: graph={self.input_shape} tensor={tuple(tensor.shape)}"
+            )
         if tensor.dtype != self._mgx_in_dtype or not tensor.is_contiguous():
             tensor = tensor.contiguous().to(dtype=self._mgx_in_dtype)
         in_arg = self.mx.argument_from_pointer(self._in_shape, tensor.data_ptr())
@@ -133,6 +141,10 @@ class MIGraphXDepthProvider:
         force_rebuild: bool = False,
         depth_upsample: DepthUpsampleMode = "bilinear",
         depth_upsample_edge_strength: float = 0.35,
+        model_id: str = DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+        model_name: str | None = None,
+        depth_resolution: int = 518,
+        patch_size: int | None = 14,
     ) -> None:
         self.device = torch.device(device)
         # cuDNN autotuning is disabled for the ROCm depth path (per project policy).
@@ -144,17 +156,27 @@ class MIGraphXDepthProvider:
         self.force_rebuild = bool(force_rebuild)
         self.depth_upsample = depth_upsample
         self.depth_upsample_edge_strength = float(depth_upsample_edge_strength)
+        self.model_id = str(model_id)
+        self.model_name = str(model_name or model_id)
+        self.depth_resolution = max(1, int(depth_resolution))
+        self.patch_size = int(patch_size or (16 if "infinidepth" in self.model_id.lower() else 14))
         # MIGraphX graphs are built fp16 by default (build_migraphx_graph quantizes
         # to fp16 unless force_fp32), so the preprocessor must emit fp16 tensors to
         # feed the engine without a dtype cast on the hot path.
         self._preprocessor_dtype = _dtype_from_onnx_name(self.onnx_path, torch.float16)
-        self.preprocessor = DistillPreprocessor(device=self.device, dtype=self._preprocessor_dtype)
+        self.preprocessor = ModelOnnxPreprocessor(
+            model_id=self.model_id,
+            device=self.device,
+            dtype=self._preprocessor_dtype,
+            target_resolution=self.depth_resolution,
+            patch_size=self.patch_size,
+        )
         self.engine: MIGraphXEngine | None = None
         self.info = DepthProviderInfo(
             provider="MIGraphX",
-            model_name="Distill-Any-Depth-Base",
-            model_id=DISTILL_ANY_DEPTH_BASE_MODEL_ID,
-            depth_resolution=518,
+            model_name=self.model_name,
+            model_id=self.model_id,
+            depth_resolution=self.depth_resolution,
             cache_dir=str(self.cache_dir or ""),
             load_mode="local_files_only",
             depth_backend="migraphx_rocm",
@@ -198,7 +220,7 @@ class MIGraphXDepthProvider:
         rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
         _, _, height, width = rgb.shape
         engine = self.load()
-        input_size = engine.input_image_size or (294, 518)
+        input_size = engine.input_image_size or self.preprocessor.input_size(height, width)
         tensor = self.preprocessor.prepare(rgb, height=input_size[0], width=input_size[1]).contiguous()
         sync()
         preprocess_ms = (time.perf_counter() - start) * 1000.0
@@ -211,8 +233,7 @@ class MIGraphXDepthProvider:
         model_ms = (time.perf_counter() - start) * 1000.0
 
         start = time.perf_counter()
-        depth = ensure_b1hw(predicted)
-        depth = _normalize_depth(depth)
+        depth = _postprocess_generic_depth(predicted, self.model_id)
         depth = upsample_depth(
             depth,
             height,
@@ -249,8 +270,6 @@ def create_migraphx_rocm_provider(
         reason = "torch.version.hip is not available"
     elif not is_migraphx_available():
         reason = "migraphx is not installed"
-    elif model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
-        reason = "MIGraphX provider currently supports Distill-Any-Depth-Base only"
 
     if reason is not None:
         if not allow_pytorch_fallback:
@@ -270,9 +289,23 @@ def create_migraphx_rocm_provider(
         provider.info = replace(provider.info, fallback_reason=reason)
         return provider
 
-    if onnx_path is None or graph_path is None:
+    # Runtime configuration can contain stale/nonexistent explicit paths (for
+    # example after selecting a new model or input size). Resolve artifacts in
+    # that case before asking the engine to rebuild; a non-None path alone does
+    # not mean that the ONNX source exists.
+    onnx_missing_for_build = (
+        onnx_path is not None
+        and not Path(onnx_path).is_file()
+        and (build_graph or force_rebuild)
+    )
+    if onnx_path is None or graph_path is None or onnx_missing_for_build:
         from stereo_runtime.model_artifacts import prepare_model_artifacts
 
+        # ``depth_resolution`` is the configured long-edge target. Preserve the
+        # standard 16:9 export aspect ratio when direct callers do not provide
+        # already-built artifacts; model_artifacts applies the model patch size.
+        export_width = max(1, int(depth_resolution))
+        export_height = max(1, int(round(export_width * 294 / 518)))
         artifacts = prepare_model_artifacts(
             model_id,
             cache_dir=cache_dir or "./models",
@@ -283,10 +316,13 @@ def create_migraphx_rocm_provider(
             onnx_dtype="fp16",
             export_onnx_if_missing=True,
             artifact_backend="migraphx",
+            export_height=export_height,
+            export_width=export_width,
             build_migraphx_if_missing=build_graph or force_rebuild,
             force_rebuild_migraphx=force_rebuild,
         )
-        onnx_path = onnx_path or artifacts.selected_onnx_path
+        if onnx_path is None or not Path(onnx_path).is_file():
+            onnx_path = artifacts.selected_onnx_path
         graph_path = graph_path or artifacts.selected_migraphx_path or artifacts.paths.migraphx_fp16_path
 
     return MIGraphXDepthProvider(
@@ -298,6 +334,10 @@ def create_migraphx_rocm_provider(
         force_rebuild=force_rebuild,
         depth_upsample=depth_upsample,
         depth_upsample_edge_strength=depth_upsample_edge_strength,
+        model_id=model_id,
+        model_name=model_name,
+        depth_resolution=depth_resolution,
+        patch_size=patch_size,
     )
 
 

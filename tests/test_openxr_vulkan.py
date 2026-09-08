@@ -378,7 +378,8 @@ def test_projection_pass_is_precreated_with_panorama_support(monkeypatch) -> Non
     assert created == [(presenter.vulkan, 43, True, False)]
 
 
-def test_default_environment_skips_optional_nvidia_panorama_pipeline(monkeypatch) -> None:
+@pytest.mark.parametrize("is_rocm", [False, True])
+def test_default_environment_skips_optional_panorama_pipeline(monkeypatch, is_rocm) -> None:
     presenter = OpenXrVulkanPresenter()
     presenter._view_configuration_views = (
         SimpleNamespace(
@@ -408,7 +409,7 @@ def test_default_environment_skips_optional_nvidia_panorama_pipeline(monkeypatch
     monkeypatch.setattr(
         core_openxr_vulkan, "VulkanProjectionScreenPass", create_projection_pass
     )
-    monkeypatch.setattr(presenter, "_is_rocm_backend", lambda: False)
+    monkeypatch.setattr(presenter, "_is_rocm_backend", lambda: is_rocm)
     presenter._create_projection_swapchains_for_scale(1.0)
 
     assert created == [(presenter.vulkan, 43, False, False)]
@@ -416,6 +417,7 @@ def test_default_environment_skips_optional_nvidia_panorama_pipeline(monkeypatch
 
 def test_rocm_keeps_required_panorama_pipeline_with_native_equirect(monkeypatch) -> None:
     presenter = OpenXrVulkanPresenter()
+    presenter.config = replace(presenter.config, filament_panorama_path="test-panorama.hdr")
     presenter._view_configuration_views = (
         SimpleNamespace(
             recommended_image_rect_width=1000,

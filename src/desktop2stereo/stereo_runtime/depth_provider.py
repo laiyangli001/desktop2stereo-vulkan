@@ -197,6 +197,9 @@ def _find_local_model_weight(model_dir: str | Path) -> str | None:
         for path in root.rglob(filename):
             if _is_valid_model_weight_file(path):
                 return str(path)
+    for path in root.rglob("*.pth"):
+        if _is_valid_model_weight_file(path):
+            return str(path)
     return None
 
 
@@ -218,7 +221,7 @@ def _remove_invalid_model_weight(path: str | Path) -> None:
 
 
 def _download_hf_file_direct(model_id: str, filename: str, cache_dir: str | Path, endpoint: str) -> str:
-    import requests
+    from urllib.request import Request, urlopen
     from .model_registry import resolve_model_dir
 
     target_dir = resolve_model_dir(model_id, cache_dir)
@@ -227,12 +230,13 @@ def _download_hf_file_direct(model_id: str, filename: str, cache_dir: str | Path
     tmp = target.with_suffix(target.suffix + ".tmp")
     url = _hf_resolve_url(endpoint, model_id, filename)
     _progress_print(f"[Main] Direct model download fallback: {url} -> {target}")
-    response = requests.get(url, headers=HF_DOWNLOAD_HEADERS, stream=True, timeout=30)
-    response.raise_for_status()
-    with open(tmp, "wb") as handle:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                handle.write(chunk)
+    request = Request(url, headers=HF_DOWNLOAD_HEADERS)
+    with urlopen(request, timeout=30) as response, open(tmp, "wb") as handle:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
     if not _is_valid_model_weight_file(tmp):
         _remove_invalid_model_weight(tmp)
         raise FileNotFoundError(f"direct download produced empty model weight: {target}")
