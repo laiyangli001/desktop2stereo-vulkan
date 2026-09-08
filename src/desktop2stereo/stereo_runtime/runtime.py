@@ -120,6 +120,7 @@ class DepthRuntime:
             "depth_model_ms": float(profile.model_ms),
             "depth_slot_wait_ms": float(profile.slot_wait_ms),
             "depth_postprocess_ms": float(profile.postprocess_ms),
+            "depth_nonfinite_count": int(profile.nonfinite_count),
             "depth_total_ms": float(total_ms),
             "total_ms": float(total_ms),
         }
@@ -144,6 +145,8 @@ class DepthRuntime:
                     postprocess_ms=float(getattr(result, "postprocess_ms", 0.0)),
                     cuda_timing_events=dict(getattr(result, "cuda_timing_events", None) or {}),
                     slot_wait_ms=float(getattr(result, "slot_wait_ms", 0.0)),
+                    finite_depth=bool(getattr(result, "finite_depth", True)),
+                    nonfinite_count=int(getattr(result, "nonfinite_count", 0)),
                 )
 
         start = time.perf_counter()
@@ -210,6 +213,14 @@ class StereoRuntimeResult:
     # Owned zero-copy capture frame (SCK CVPixelBuffer+CVMetalTexture):
     # the warp viewer samples it directly instead of uploading packed RGB.
     viewer_bgra: Any | None = None
+    # The packer may write the fused output directly into a Vulkan source's
+    # mapped staging pages. Kept as a dataclass field so dataclasses.replace()
+    # in the packer does not discard the ownership token.
+    viewer_frame_direct: Any | None = None
+    capture_frame_id: int | None = None
+    depth_frame_id: int | None = None
+    depth_complete: bool = False
+    depth_finite: bool = True
     active_settings_version: int | None = None
     hot_reload_class: str | None = None
     hot_reload_changed_fields: tuple[str, ...] = ()
@@ -1352,6 +1363,7 @@ class StereoRuntime:
             "depth_model_ms": float(profile.model_ms),
             "depth_slot_wait_ms": float(profile.slot_wait_ms),
             "depth_postprocess_ms": float(profile.postprocess_ms),
+            "depth_nonfinite_count": int(profile.nonfinite_count),
             "depth_total_ms": float(depth_total_ms),
             "synthesis_ms": float(synthesis_ms),
             "total_ms": float(total_ms),
@@ -1376,6 +1388,12 @@ class StereoRuntime:
         _add_runtime_config_debug_info(debug, stereo_config)
         debug.update(convergence_debug)
         provider_info = self.provider_report()
+        # The configured backend is commonly "auto" on macOS. CoreML is
+        # selected lazily, so report it once the provider has become active;
+        # leave synthetic/test provider labels and existing vendor telemetry
+        # unchanged.
+        if provider_info.get("depth_backend") == "coreml":
+            debug["runtime_depth_backend"] = "coreml"
         _add_depth_contract_debug_info(debug, depth, provider_info)
         _add_preprocess_debug_info(debug, rgb_frame)
         if memory:
@@ -1515,6 +1533,7 @@ class StereoRuntime:
             viewer_depth=viewer_depth,
             viewer_frame_np=viewer_frame_np,
             viewer_bgra=viewer_bgra,
+            depth_finite=bool(profile.finite_depth),
             active_settings_version=int(self.active_settings_version),
             hot_reload_class=self.last_settings_change_class,
             hot_reload_changed_fields=tuple(self.last_settings_changed_fields),

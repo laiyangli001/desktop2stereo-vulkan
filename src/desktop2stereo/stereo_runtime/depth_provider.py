@@ -73,6 +73,10 @@ class DepthProfileResult:
     execution_slot: int | None = None
     execution_slot_count: int = 1
     slot_wait_ms: float = 0.0
+    # Provider-side guards may repair non-finite model output before it reaches
+    # normalization. Keep the result metadata explicit for viewer telemetry.
+    finite_depth: bool = True
+    nonfinite_count: int = 0
 
     @property
     def total_ms(self) -> float:
@@ -85,6 +89,8 @@ class DepthProfileResult:
             "postprocess_ms": float(self.postprocess_ms),
             "slot_wait_ms": float(self.slot_wait_ms),
             "total_ms": float(self.total_ms),
+            "finite_depth": bool(self.finite_depth),
+            "nonfinite_count": int(self.nonfinite_count),
         }
 
 

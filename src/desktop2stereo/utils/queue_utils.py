@@ -6,11 +6,20 @@ from typing import Any, Callable
 
 def _release_item(item: Any) -> None:
     """Release an optional borrowed capture resource before dropping an item."""
+    if isinstance(item, tuple) and len(item) == 2:
+        item = item[0]
     resource = getattr(item, "native_resource", None)
     release = getattr(resource, "release", None)
     if callable(release):
         try:
             release()
+        except Exception:
+            pass
+    direct = getattr(item, "viewer_frame_direct", None)
+    release_direct = getattr(direct, "_release_direct", None)
+    if callable(release_direct):
+        try:
+            release_direct()
         except Exception:
             pass
 

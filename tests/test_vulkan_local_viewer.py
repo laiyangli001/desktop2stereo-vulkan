@@ -503,6 +503,82 @@ def test_local_viewer_reports_queue_and_present_breakdown(monkeypatch) -> None:
     assert timings[0][1] >= 0.0
 
 
+def test_local_viewer_counts_successful_depth_presentations_and_intervals(monkeypatch) -> None:
+    shutdown = threading.Event()
+    runtime_q = queue.Queue()
+    runtime_q._d2s_ordered = True
+    for depth_complete in (True, False, True):
+        runtime_q.put(
+            (SimpleNamespace(sbs=object(), depth_complete=depth_complete), 0.0)
+        )
+    counts = []
+    timings = []
+
+    class FakeViewer:
+        calls = 0
+
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            self.calls += 1
+            if self.calls == 3:
+                shutdown.set()
+            return self.calls > 1
+
+        def poll_events(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    run_vulkan_local_viewer(
+        runtime_q=runtime_q,
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(
+            on_breakdown_inc=lambda name, amount: counts.append((name, amount)),
+            on_breakdown_add_time=lambda name, seconds: timings.append((name, seconds)),
+        ),
+    )
+
+    assert counts.count(("local_presented_frame", 1)) == 2
+    assert counts.count(("local_depth_presented_frame", 1)) == 1
+    assert [name for name, _ in timings].count("local_present_interval") == 1
+
+
+def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> None:
+    class FakeSource:
+        size = (4, 2)
+        format = None
+
+        def __init__(self):
+            self.calls = []
+
+        def present(self, pixels, *, direct=False):
+            self.calls.append((pixels, direct))
+            return True
+
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer.source_format = None
+    viewer._source = FakeSource()
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    frame = SimpleNamespace(
+        viewer_frame_direct=viewer._source,
+        viewer_frame_np=(bytearray(32), 4, 2),
+    )
+    monkeypatch.setattr(local_viewer_module, "frame_to_cuda_rgba", lambda _frame: None)
+    monkeypatch.setattr(local_viewer_module, "pack_frame_to_rgba8", lambda _frame: None)
+    monkeypatch.setattr(local_viewer_module, "frame_to_rgba_bytes", lambda _frame: (_ for _ in ()).throw(AssertionError("host fallback used")))
+
+    viewer.present(frame)
+    assert viewer._source.calls == [(None, True)]
+
+
 def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypatch) -> None:
     shutdown = threading.Event()
     runtime_q = queue.Queue()

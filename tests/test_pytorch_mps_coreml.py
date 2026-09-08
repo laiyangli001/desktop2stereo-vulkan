@@ -1,7 +1,10 @@
 """CoreML provider plumbing tests (ported macOS behavior)."""
 
+from types import SimpleNamespace
+
 from stereo_runtime.depth_provider import (
     DepthProviderConfig,
+    DepthProviderInfo,
     create_depth_provider,
 )
 from stereo_runtime.providers.apple.pytorch_mps import (
@@ -70,3 +73,40 @@ def test_create_depth_provider_mps_backend_returns_mps_provider() -> None:
     provider = create_depth_provider(cfg)
     assert isinstance(provider, GenericAutoDepthMpsProvider)
     assert provider.use_coreml is False
+
+
+def test_coreml_provider_info_reports_active_backend_without_fallback():
+    provider = object.__new__(GenericAutoDepthMpsProvider)
+    provider.info = DepthProviderInfo(
+        provider="test",
+        model_name="test",
+        model_id="test",
+        depth_resolution=336,
+        cache_dir="/tmp",
+    )
+
+    provider._set_coreml_info()
+
+    assert provider.info.depth_backend == "coreml"
+    assert provider.info.runtime == "coreml"
+    assert provider.info.execution_provider == "Apple Core ML"
+    assert provider.info.fallback_reason is None
+
+
+def test_coreml_engine_sanitizes_nonfinite_output():
+    import numpy as np
+    import torch
+
+    engine = object.__new__(CoreMLEngine)
+    engine.device = torch.device("mps")
+    engine.model = SimpleNamespace(
+        predict=lambda _inputs: {
+            "depth": np.array([[[np.nan, np.inf], [-np.inf, 0.5]]], dtype=np.float32)
+        }
+    )
+
+    output = engine(torch.zeros(1, 3, 2, 2))
+
+    assert output.nonfinite_count == 3
+    assert output.finite_depth is True
+    assert bool(torch.isfinite(output.predicted_depth).all())

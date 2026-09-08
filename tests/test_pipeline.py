@@ -29,6 +29,7 @@ from stereo_runtime.pipeline import (
     _runtime_pending_depth_limit,
     _runtime_parallel_adaptive_backoff_enabled,
     _cuda_event_ready,
+    _attach_capture_debug,
 )
 
 
@@ -44,6 +45,29 @@ def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
 
     assert source_size == (1920, 1200)
     assert _resolve_pipeline_render_size(source_size, config) == (1920, 1200)
+
+
+def test_attach_capture_debug_marks_depth_complete_for_current_frame():
+    result = SimpleNamespace(
+        depth=np.zeros((2, 2), dtype=np.float32),
+        depth_finite=True,
+        debug_info={},
+        timing={"depth_nonfinite_count": 0},
+    )
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        metadata={"capture_frame_id": 42},
+    )
+
+    _attach_capture_debug(result, captured, SimpleNamespace())
+
+    assert result.capture_frame_id == 42
+    assert result.depth_frame_id == 42
+    assert result.depth_complete is True
+    assert result.debug_info["depth_finite"] == 1
+    assert result.debug_info["depth_nonfinite_count"] == 0
 
 
 @pytest.mark.parametrize(
@@ -484,7 +508,40 @@ def test_pipeline_does_not_rebuild_before_threshold(monkeypatch):
     assert loop._consecutive_runtime_errors == 2
 
 
-def test_prepare_frame_input_uses_directml_native_bridge_and_records_decision():
+def test_prepare_frame_input_uses_directml_native_bridge_and_records_decision(monkeypatch):
+    from utils.display_info import DisplayInfo
+
+    monkeypatch.setattr(
+        "utils.display_info.enumerate_displays",
+        lambda: [
+            DisplayInfo(
+                capture_index=1,
+                display_number=1,
+                left=0,
+                top=0,
+                width=1920,
+                height=1080,
+                stable_id="cg:1552:41036:4251086178",
+                name="iMac",
+                manufacturer="1552",
+                model="iMac",
+                serial="4251086178",
+            ),
+            DisplayInfo(
+                capture_index=2,
+                display_number=2,
+                left=1920,
+                top=0,
+                width=1920,
+                height=1080,
+                stable_id="cg:2198:39711:3271970828",
+                name="VITURE",
+                manufacturer="2198",
+                model="VITURE",
+                serial="3271970828",
+            ),
+        ],
+    )
     class SharedResource:
         adapter_luid = 0x10
         format = "BGRA8"

@@ -18,6 +18,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from utils.queue_utils import _release_item
+
 
 class HostFramePacker:
     """Forward runtime results, packing device SBS -> host RGBA8 off-loop."""
@@ -127,6 +129,7 @@ class HostFramePacker:
                                 # removing the per-frame CPU memcpy from
                                 # the present loop entirely.
                                 _host_out = None
+                                _src = None
                                 try:
                                     from viewer.direct_sink import (
                                         DIRECT_SINK,
@@ -137,6 +140,7 @@ class HostFramePacker:
                                         _nbytes = _tw * _th * 4
                                         if len(_dv) >= _nbytes:
                                             _host_out = _dv[:_nbytes]
+                                            self.on_stat("direct_staging_claim", 1)
                                             object.__setattr__(
                                                 result,
                                                 "viewer_frame_direct",
@@ -152,7 +156,17 @@ class HostFramePacker:
                                                     "[HostFramePacker] direct GPU-write into Vulkan staging active",
                                                     flush=True,
                                                 )
+                                        else:
+                                            _src._release_direct()
+                                            self.on_stat("direct_staging_fallback", 1)
+                                    else:
+                                        if _src is not None:
+                                            _src._release_direct()
+                                        self.on_stat("direct_staging_fallback", 1)
                                 except Exception:
+                                    if _src is not None:
+                                        _src._release_direct()
+                                    self.on_stat("direct_staging_error", 1)
                                     _host_out = None
                                 if _host_out is None:
                                     object.__setattr__(
@@ -184,6 +198,7 @@ class HostFramePacker:
                                         _ds._release_direct()
                                     except Exception:
                                         pass
+                                self.on_stat("direct_staging_pack_error", 1)
                             if packed is not None:
                                 # StereoRuntimeResult is frozen; the
                                 # sanctioned late-binding escape hatch.
@@ -255,9 +270,11 @@ class HostFramePacker:
                                         except Exception:
                                             pass
                                 if isinstance(getattr(result, "timing", None), dict):
-                                    result.timing["rt_fused_pack_ms"] = (
+                                    _fused_pack_ms = (
                                         time.perf_counter() - _t0
                                     ) * 1000.0
+                                    result.timing["rt_fused_pack_ms"] = _fused_pack_ms
+                                    self.on_stat("fused_pack_ms", _fused_pack_ms)
                     except Exception as exc:
                         if os.environ.get("D2S_FUSED_DEBUG"):
                             print(f"[fused-pack] failed: {exc!r}", flush=True)
@@ -318,7 +335,7 @@ class HostFramePacker:
                 out_put(result, timeout=0.05)
             except queue.Full:
                 try:
-                    self.out_q.get_nowait()  # drop oldest, keep newest
+                    _release_item(self.out_q.get_nowait())  # drop oldest, keep newest
                     self.on_stat("packer_drop", 1)
                 except queue.Empty:
                     pass

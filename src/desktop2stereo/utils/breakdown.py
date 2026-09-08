@@ -41,6 +41,7 @@ LATEST_KEYS = {
     "rt_parallax_preset",
     "rt_parallax_budget_preset",
     "rt_depth_total_ms",
+    "rt_depth_nonfinite_count",
     "rt_depth_model_ms",
     "rt_depth_slot_wait_ms",
     "rt_synthesis_ms",
@@ -84,6 +85,7 @@ _TIMING_SAMPLE_NAMES = {
     "rt_depth_total",
     "rt_depth_model",
     "rt_slot_wait",
+    "local_present_interval",
 }
 
 
@@ -111,6 +113,9 @@ class FPSBreakdown:
             "viewer_get": 0,
             "viewer_drop": 0,
             "local_presented_frame": 0,
+            "local_depth_presented_frame": 0,
+            "local_direct_presented": 0,
+            "local_host_presented": 0,
             "loops": 0,
             "update_ms": 0.0,
             "render_ms": 0.0,
@@ -194,15 +199,19 @@ class FPSBreakdown:
         timing = getattr(runtime_result, "timing", None) or {}
         debug = getattr(runtime_result, "debug_info", None) or {}
         with self.lock:
-            for key in ("depth_total_ms", "depth_model_ms", "depth_slot_wait_ms", "synthesis_ms", "pack_ms", "total_ms",
+            for key in ("depth_total_ms", "depth_preprocess_ms", "depth_model_ms", "depth_slot_wait_ms", "depth_postprocess_ms", "synthesis_ms", "pack_ms", "total_ms",
                         "sbs_host_ms", "sbs_host_device_ms", "sbs_host_copy_ms", "sbs_host_numpy_ms",
-                        "packer_ms"):
+                        "packer_ms", "rt_fused_pack_ms"):
                 value = timing.get(key)
                 if value is not None:
-                    self.stats[f"rt_{key}"] = float(value)
+                    stat_key = key if key.startswith("rt_") else f"rt_{key}"
+                    self.stats[stat_key] = float(value)
                     sample_name = {
                         "depth_total_ms": "rt_depth_total",
+                        "depth_preprocess_ms": "rt_depth_preprocess",
                         "depth_model_ms": "rt_depth_model",
+                        "depth_postprocess_ms": "rt_depth_postprocess",
+                        "rt_fused_pack_ms": "rt_fused_pack",
                         "depth_slot_wait_ms": "rt_slot_wait",
                         "total_ms": "rt_total",
                     }.get(key)
@@ -212,6 +221,9 @@ class FPSBreakdown:
                         ).append(float(value))
             self.stats["rt_backend"] = str(debug.get("backend", "unknown"))
             self.stats["rt_depth_backend"] = str(debug.get("runtime_depth_backend", "unknown"))
+            self.stats["rt_depth_nonfinite_count"] = int(
+                timing.get("depth_nonfinite_count", 0) or 0
+            )
             self.stats["rt_depth_slot"] = (
                 debug.get("runtime_depth_execution_slot")
                 if debug.get("runtime_depth_execution_slot") is not None
@@ -375,7 +387,18 @@ class FPSBreakdown:
             f"viewer_get={rate('viewer_get'):.1f} "
             f"viewer_drop={rate('viewer_drop'):.1f} "
             f"local_present={rate('local_presented_frame'):.1f} "
+            f"depth_present={rate('local_depth_presented_frame'):.1f} "
+            f"direct_present={rate('local_direct_presented'):.1f} "
+            f"host_present={rate('local_host_presented'):.1f} "
+            f"direct_claim={rate('direct_staging_claim'):.1f} "
+            f"direct_fallback={rate('direct_staging_fallback'):.1f} "
+            f"direct_error={rate('direct_staging_error'):.1f} "
+            f"direct_pack_error={rate('direct_staging_pack_error'):.1f} "
+            f"packer_drop={rate('packer_drop'):.1f} "
             f"local_present_ms={avg_ms('local_present'):.2f}ms "
+            f"present_interval_p50={timing_stat('local_present_interval', 0.50):.2f}ms "
+            f"present_interval_p95={timing_stat('local_present_interval', 0.95):.2f}ms "
+            f"present_interval_max={timing_max('local_present_interval'):.2f}ms "
             f"local_present_pack_ms={avg_ms('local_present_pack'):.2f}ms "
             f"screen_new={rate('openxr_new_screen_frame'):.1f} "
             f"screen_reuse={rate('openxr_reused_screen_frame'):.1f} "
@@ -599,7 +622,10 @@ class FPSBreakdown:
             f"rt_gpu_openxr_pack={avg_ms('rt_gpu_openxr_pack'):.2f}ms "
             f"rt_backend={stats.get('rt_backend', 'unknown')} "
             f"rt_depth={stats.get('rt_depth_total_ms', 0.0):.2f}ms "
+            f"rt_pre={stats.get('rt_depth_preprocess_ms', 0.0):.2f}ms "
             f"rt_model={stats.get('rt_depth_model_ms', 0.0):.2f}ms "
+            f"rt_post={stats.get('rt_depth_postprocess_ms', 0.0):.2f}ms "
+            f"depth_nonfinite={int(stats.get('rt_depth_nonfinite_count', 0))} "
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "
@@ -614,6 +640,7 @@ class FPSBreakdown:
             f"rt_sbs_host_numpy={stats.get('rt_sbs_host_numpy_ms', 0.0):.2f}ms "
             f"rt_sbs_host_presync={stats.get('rt_sbs_host_presync_ms', 0.0):.2f}ms "
             f"packer={stats.get('packer_ms', 0.0):.2f}ms "
+            f"fused_pack={stats.get('rt_fused_pack_ms', 0.0):.2f}ms "
             f"rt_depth_backend={stats.get('rt_depth_backend', 'unknown')} "
             f"rt_depth_slot={stats.get('rt_depth_slot', 'n/a')}/{stats.get('rt_depth_slot_count', 1)} "
             f"rt_out={stats.get('rt_output_dtype', 'unknown')} "

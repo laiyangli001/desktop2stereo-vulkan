@@ -1370,6 +1370,8 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                 if name == "packer_ms":
                     # add_time appends _ms; store as packer_ms directly.
                     callbacks.breakdown_add_time("packer", value / 1000.0)
+                elif name == "fused_pack_ms":
+                    callbacks.breakdown_add_time("rt_fused_pack", value / 1000.0)
                 else:
                     callbacks.breakdown_inc(name, int(value))
 

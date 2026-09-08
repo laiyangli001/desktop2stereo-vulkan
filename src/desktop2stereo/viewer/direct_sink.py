@@ -56,5 +56,11 @@ class DirectSinkRegistry:
                     return src, src.direct_view
         return None, None
 
+    def release(self, source) -> None:
+        """Return a claimed but unpublished slot to the available pool."""
+        release = getattr(source, "_release_direct", None)
+        if callable(release):
+            release()
+
 
 DIRECT_SINK = DirectSinkRegistry()

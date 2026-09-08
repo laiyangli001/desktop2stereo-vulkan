@@ -71,7 +71,7 @@ class OpenGLLocalViewer:
         self._initialized = True
         print("[OpenGLLocalViewer] OpenGL fallback window initialized", flush=True)
 
-    def present(self, frame: Any) -> None:
+    def present(self, frame: Any) -> bool:
         if not self._initialized or self.window is None:
             raise RuntimeError("OpenGL viewer not initialized")
         self.poll_events()
@@ -98,9 +98,11 @@ class OpenGLLocalViewer:
             self._backend.submit_rgb(arr)
             # Present via glfw swap
             self.glfw.swap_buffers(self.window)
+            return True
         except Exception as exc:
             # Non-fatal per-frame errors should not kill viewer
             print(f"[OpenGLLocalViewer] present failed: {exc}", flush=True)
+            return False
 
     def poll_events(self) -> None:
         if self.glfw and self.window:

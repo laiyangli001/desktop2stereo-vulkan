@@ -609,6 +609,32 @@ def _attach_capture_debug(runtime_result, captured_frame: CapturedFrame | None, 
     debug_info = getattr(runtime_result, "debug_info", None)
     if isinstance(debug_info, dict):
         debug_info.update(_capture_debug_fields(captured_frame, frame_rgb))
+    if captured_frame is None:
+        return
+    metadata = captured_frame.metadata if isinstance(captured_frame.metadata, dict) else {}
+    capture_frame_id = metadata.get("capture_frame_id")
+    if capture_frame_id is None:
+        return
+    try:
+        capture_frame_id = int(capture_frame_id)
+    except (TypeError, ValueError):
+        return
+    depth_finite = bool(getattr(runtime_result, "depth_finite", True))
+    depth_frame_id = capture_frame_id
+    depth_complete = depth_finite and getattr(runtime_result, "depth", None) is not None
+    object.__setattr__(runtime_result, "capture_frame_id", capture_frame_id)
+    object.__setattr__(runtime_result, "depth_frame_id", depth_frame_id)
+    object.__setattr__(runtime_result, "depth_finite", depth_finite)
+    object.__setattr__(runtime_result, "depth_complete", depth_complete)
+    if isinstance(debug_info, dict):
+        timing = getattr(runtime_result, "timing", None) or {}
+        debug_info.update(
+            capture_frame_id=capture_frame_id,
+            depth_frame_id=depth_frame_id,
+            depth_complete=int(depth_complete),
+            depth_finite=int(depth_finite),
+            depth_nonfinite_count=int(timing.get("depth_nonfinite_count", 0)),
+        )
 
 
 def _attach_pipeline_debug(
@@ -1036,7 +1062,15 @@ class RuntimePipelineLoop:
             fallback_reasons.append(str(capture_reason))
         if directml_reason and str(directml_reason) not in fallback_reasons:
             fallback_reasons.append(str(directml_reason))
-        if stereo_reason and stereo_reason not in {"selected_by_priority", "explicit_request"}:
+        mac_fused_viewer = (
+            platform.system() == "Darwin"
+            and debug_info.get("sbs_backend") == "metal_shader_warp"
+            and os.environ.get("D2S_MAC_VIEWER", "vulkan").strip().lower() == "vulkan"
+            and os.environ.get("D2S_VK_FUSED_WARP", "1") not in {"0", "false", "off"}
+        )
+        if stereo_reason and stereo_reason not in {"selected_by_priority", "explicit_request"} and not (
+            mac_fused_viewer and stereo_reason == "not_resolved"
+        ):
             fallback_reasons.append(stereo_reason)
         gpu_copy_count = debug_info.get("capture_gpu_copy_count")
         try:
@@ -1050,6 +1084,12 @@ class RuntimePipelineLoop:
             and debug_info.get("capture_zero_copy_ready", False)
             and not gpu_to_cpu
         )
+        stereo_backend = debug_info.get(
+            "stereo_compute_backend",
+            getattr(runtime, "_resolved_stereo_compute_backend", "unknown"),
+        )
+        if mac_fused_viewer and stereo_reason == "not_resolved":
+            stereo_backend = "mps_fused_vulkan"
         payload = {
             "os": platform.system(),
             "device": str(getattr(getattr(runtime, "config", None), "device", "")),
@@ -1059,11 +1099,11 @@ class RuntimePipelineLoop:
                 "depth_backend",
                 debug_info.get("depth_backend_resolved", debug_info.get("runtime_depth_backend", "unknown")),
             ),
-            "stereo_backend": debug_info.get(
-                "stereo_compute_backend",
-                getattr(runtime, "_resolved_stereo_compute_backend", "unknown"),
+            "stereo_backend": stereo_backend,
+            "stereo_backend_reason": (
+                "mps_fused_vulkan" if mac_fused_viewer and stereo_reason == "not_resolved"
+                else stereo_reason or "not_reported"
             ),
-            "stereo_backend_reason": stereo_reason or "not_reported",
             "fallback": bool(attempts or fallback_reasons),
             "fallback_reasons": fallback_reasons,
             "adapter_luid": debug_info.get("capture_adapter_luid"),

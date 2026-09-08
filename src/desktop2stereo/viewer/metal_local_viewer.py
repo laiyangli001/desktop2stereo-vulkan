@@ -91,13 +91,14 @@ class MetalLocalViewer:
         self._initialized = True
         print("[MetalLocalViewer] Metal fallback window initialized", flush=True)
 
-    def present(self, frame: Any) -> None:
+    def present(self, frame: Any) -> bool:
         if not self._initialized or self.window is None:
             raise RuntimeError("Metal viewer not initialized")
         # Minimal present: poll + upload placeholder (real present via
         # MTLTexture replaceRegion / IOSurface blit will land here in
         # Milestone 5). For now just keep window responsive.
         self.poll_events()
+        return True
 
     def poll_events(self) -> None:
         if self.glfw and self.window:

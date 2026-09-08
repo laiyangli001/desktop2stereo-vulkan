@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import types
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from stereo_runtime.depth_provider import (
     DISTILL_ANY_DEPTH_BASE_MODEL_ID,
     DISTILL_ANY_DEPTH_BASE_RESOLUTION,
     DISTILL_ANY_DEPTH_PATCH_SIZE,
+    DepthProfileResult,
     DepthProviderInfo,
     DistillAnyDepthBase518,
     GenericAutoDepthProvider,
@@ -167,15 +170,25 @@ class CoreMLEngine:
         # from_numpy wraps the prediction buffer without a copy; only pay the
         # device transfer when postprocessing actually runs off-CPU.
         tensor = torch.from_numpy(np.ascontiguousarray(value))
+        nonfinite_count = 0
         if self.device.type != "cpu":
-            tensor = tensor.to(self.device)
+            if tensor.is_floating_point():
+                nonfinite_count = int((~torch.isfinite(tensor)).sum().item())
+            # CoreML returns a host tensor. Enqueue its small transfer to MPS
+            # instead of blocking the runtime thread behind the active MPS
+            # render queue; the fused viewer consumer synchronizes on use.
+            tensor = tensor.to(self.device, non_blocking=True)
         if tensor.is_floating_point():
             # fp16/fp32 engines can emit NaN/Inf on pathological inputs
             # (denormal overflow, 0/0 in attention). Sanitize here so depth
             # normalization downstream never sees non-finite values; far
             # plane (1.0) is the conservative fallback for a poisoned pixel.
             tensor = torch.nan_to_num(tensor, nan=1.0, posinf=1.0, neginf=0.0)
-        return SimpleNamespace(predicted_depth=tensor)
+        return SimpleNamespace(
+            predicted_depth=tensor,
+            finite_depth=True,
+            nonfinite_count=nonfinite_count,
+        )
 
 
 def _safe_model_tag(model_id: str) -> str:
@@ -311,6 +324,127 @@ class _CoreMLMixin:
     def _coreml_enabled(self) -> bool:
         return bool(getattr(self, "use_coreml", False)) and sys.platform == "darwin"
 
+    def _set_coreml_info(self, *, fallback_reason: str | None = None) -> None:
+        self.info = replace(
+            self.info,
+            depth_backend="coreml" if fallback_reason is None else "pytorch_mps",
+            runtime="coreml" if fallback_reason is None else "transformers-mps",
+            execution_provider=(
+                "Apple Core ML" if fallback_reason is None else "Apple MPS PyTorch"
+            ),
+            fallback_reason=fallback_reason,
+        )
+
+    def _predict_profile_coreml(
+        self,
+        rgb: torch.Tensor,
+        cpu_rgb: torch.Tensor | None = None,
+        raw_bgr: torch.Tensor | None = None,
+    ):
+        from stereo_runtime.depth_provider import (
+            _model_input_size,
+            _normalization_tensors_for_model,
+            _postprocess_generic_depth,
+            ensure_b1hw,
+        )
+        from stereo_runtime.depth_upsample import upsample_depth
+        from stereo_runtime.output import ensure_bchw
+        import torch.nn.functional as F
+
+        rgb = ensure_bchw(rgb, name="rgb").to(self.device)
+        if rgb.dtype != torch.float32:
+            rgb = rgb.float()
+        _, _, height, width = rgb.shape
+        resolution = int(
+            getattr(self, "depth_resolution", None)
+            or DISTILL_ANY_DEPTH_BASE_RESOLUTION
+        )
+        patch_size = int(getattr(self, "patch_size", None) or 14)
+        input_h, input_w = _model_input_size(height, width, resolution, patch_size)
+
+        start = time.perf_counter()
+        if raw_bgr is not None:
+            if raw_bgr.device.type != "cpu":
+                raise ValueError("CoreML raw capture staging must remain on CPU")
+            if raw_bgr.ndim != 3 or raw_bgr.shape[-1] not in (3, 4):
+                raise ValueError(
+                    f"CoreML raw capture must be HWC BGR/BGRA, got {tuple(raw_bgr.shape)}"
+                )
+            # Resize the host capture directly with the same linear filter
+            # used by the previous torch path. The result is model-sized, so
+            # this avoids a second full-resolution CPU tensor and its costly
+            # torch interpolation pass.
+            import cv2
+
+            raw_np = raw_bgr.detach().numpy()
+            resized = cv2.resize(
+                raw_np,
+                (int(input_w), int(input_h)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            if resized.shape[-1] == 4:
+                resized = cv2.cvtColor(resized, cv2.COLOR_BGRA2RGB)
+            else:
+                resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            cpu_rgb = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0)
+            cpu_rgb = cpu_rgb.float().mul_(1.0 / 255.0)
+        elif cpu_rgb is not None:
+            cpu_rgb = ensure_bchw(cpu_rgb, name="cpu_rgb").float().clamp(0, 1)
+        else:
+            raise ValueError("CoreML requires raw host capture or CPU RGB staging")
+        tensor = F.interpolate(
+            cpu_rgb,
+            size=(input_h, input_w),
+            mode="bilinear",
+            align_corners=False,
+            antialias=False,
+        )
+        mean, std = _normalization_tensors_for_model(
+            self.model_id, torch.device("cpu"), torch.float32
+        )
+        tensor = (tensor - mean) / std
+        preprocess_ms = (time.perf_counter() - start) * 1000.0
+
+        engine = self._coreml_engine_for_frame(rgb)
+        if engine is None:
+            raise RuntimeError("CoreML engine became unavailable")
+        start = time.perf_counter()
+        with torch.inference_mode():
+            predicted = engine(pixel_values=tensor).predicted_depth
+        model_ms = (time.perf_counter() - start) * 1000.0
+
+        start = time.perf_counter()
+        depth = _postprocess_generic_depth(ensure_b1hw(predicted), self.model_id)
+        depth = upsample_depth(
+            depth,
+            height,
+            width,
+            rgb=rgb,
+            mode=self.depth_upsample,
+            edge_strength=self.depth_upsample_edge_strength,
+        )
+        if depth.is_floating_point():
+            depth = torch.nan_to_num(depth, nan=1.0, posinf=1.0, neginf=0.0).clamp_(0, 1)
+        postprocess_ms = (time.perf_counter() - start) * 1000.0
+        return DepthProfileResult(
+            depth,
+            preprocess_ms,
+            model_ms,
+            postprocess_ms,
+            finite_depth=True,
+            nonfinite_count=int(getattr(predicted, "nonfinite_count", 0)),
+        )
+
+    def predict_profile(self, rgb: torch.Tensor):
+        if self._coreml_enabled():
+            cpu_rgb = getattr(rgb, "_d2s_coreml_cpu_rgb", None)
+            raw_bgr = getattr(rgb, "_d2s_coreml_raw_bgr", None)
+            if isinstance(raw_bgr, torch.Tensor) and raw_bgr.device.type == "cpu":
+                return self._predict_profile_coreml(rgb, raw_bgr=raw_bgr)
+            if isinstance(cpu_rgb, torch.Tensor) and cpu_rgb.device.type == "cpu":
+                return self._predict_profile_coreml(rgb, cpu_rgb)
+        return super().predict_profile(rgb)
+
     def _coreml_engine_for_frame(self, rgb: torch.Tensor):
         from stereo_runtime.depth_provider import (
             DISTILL_ANY_DEPTH_BASE_RESOLUTION,
@@ -356,6 +490,7 @@ class _CoreMLMixin:
         try:
             import coremltools as ct
         except Exception:
+            self._set_coreml_info(fallback_reason="coremltools_unavailable")
             print("[CoreML] coremltools is not installed; using PyTorch MPS", flush=True)
             engines[key] = None
             return None
@@ -396,6 +531,9 @@ class _CoreMLMixin:
                 mlmodel.save(str(model_path))
                 print(f"[CoreML] Model saved to {model_path}", flush=True)
             except Exception as exc:
+                self._set_coreml_info(
+                    fallback_reason=f"coreml_compile_failed:{type(exc).__name__}"
+                )
                 print(f"[CoreML] conversion failed ({exc}); using PyTorch MPS", flush=True)
                 engines[key] = None
                 return None
@@ -403,7 +541,9 @@ class _CoreMLMixin:
             print(f"[CoreML] Using cached model {model_path.name}", flush=True)
 
         engine = CoreMLEngine(model_path, self.device)
-        print("[CoreML] Ready (compute units: ALL)", flush=True)
+        self._set_coreml_info()
+        units_label = os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower()
+        print(f"[CoreML] Ready (compute units: {units_label})", flush=True)
         engines[key] = engine
         return engine
 

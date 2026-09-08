@@ -11,11 +11,14 @@ from pathlib import Path
 import os
 import queue
 import sys
+import threading
 import time
 from typing import Any, Callable
 
 from utils.display_info import resolve_glfw_monitor_index
+from utils.queue_utils import _release_item
 from viewer.cuda_vulkan_interop import CudaVulkanImageImporter
+from viewer.direct_sink import DIRECT_SINK, direct_staging_enabled
 from viewer.vulkan_resources import (
     VulkanExportableBuffer,
     VulkanExportableImage,
@@ -646,6 +649,7 @@ class VulkanLocalViewerConfig:
     on_capture_refresh_warning: Callable[[int, int], None] | None = None
     on_breakdown_inc: Callable[[str, int | float], None] | None = None
     on_breakdown_add_time: Callable[[str, float], None] | None = None
+    direct_staging: bool = True
     window_width: int = 1280
     window_height: int = 720
 
@@ -730,6 +734,7 @@ class VulkanLocalViewer:
         self.source_format: int | None = None
         self.image_available = self.render_finished = self.fence = None
         self._source: _TransferSource | None = None
+        self._direct_sources: list[_TransferSource] = []
         self._interop_extensions: tuple[str, ...] = ()
         self._target_monitor = None
         self._exclusive_fullscreen = False
@@ -1514,14 +1519,28 @@ class VulkanLocalViewer:
             flags=vk.VK_FENCE_CREATE_SIGNALED_BIT,
         ), None)
 
-    def present(self, frame: Any) -> None:
+    def present(self, frame: Any) -> bool:
         if self.window is None:
             raise RuntimeError("Vulkan local viewer has not been initialized")
         self.poll_events()
-        # Runtime-packed host frame: pure memcpy, no device sync.
-        host_np = getattr(frame, "viewer_frame_np", None)
+        direct_source = getattr(frame, "viewer_frame_direct", None)
+        if direct_source is not None and not (
+            direct_source is self._source or direct_source in self._direct_sources
+        ):
+            try:
+                direct_source._release_direct()
+            except Exception:
+                pass
+            direct_source = None
+        direct = direct_source is not None
+        # Runtime-packed host frame: pure memcpy, no device sync. A direct
+        # source already contains the final fused output in mapped pages.
+        host_np = None if direct else getattr(frame, "viewer_frame_np", None)
         cuda_rgba = None
-        if host_np is not None:
+        if direct:
+            pixels = None
+            width, height = direct_source.size
+        elif host_np is not None:
             pixels, width, height = host_np
         else:
             cuda_rgba = frame_to_cuda_rgba(frame)
@@ -1542,11 +1561,17 @@ class VulkanLocalViewer:
             or self._source.size != (width, height)
             or self._source.format != self.source_format
         ):
-            if self._source is not None:
-                self._source.close()
-            self._source = _TransferSource(self, width, height)
-        if not self._source.present(cuda_rgba if cuda_rgba is not None else pixels):
-            return
+            self._reset_sources(width, height)
+        source = direct_source if direct else self._source
+        if source is None:
+            raise RuntimeError("Vulkan local viewer has no transfer source")
+        if not source.present(
+            None if direct else (cuda_rgba if cuda_rgba is not None else pixels),
+            direct=direct,
+        ):
+            if direct:
+                source._release_direct()
+            return False
         now = time.perf_counter()
         self._fps_frames += 1
         fps = present_fps_if_due(self._fps_frames, now - self._fps_started)
@@ -1554,13 +1579,37 @@ class VulkanLocalViewer:
             self._report_present_fps(fps, self._fps_frames)
             self._fps_frames = 0
             self._fps_started = now
+        return True
+
+    def _reset_sources(self, width: int, height: int) -> None:
+        old_sources = [self._source, *self._direct_sources]
+        if any(source is not None for source in old_sources):
+            if self.device is not None:
+                self.vk.vkDeviceWaitIdle(self.device)
+            for source in old_sources:
+                if source is not None:
+                    source.close()
+        self._source = _TransferSource(self, width, height, direct_enabled=False)
+        self._direct_sources = []
+        if (
+            sys.platform == "darwin"
+            and self.config.direct_staging
+            and direct_staging_enabled()
+        ):
+            # Keep one non-direct fallback source and three direct slots. The
+            # ring lets the packer write frame N+1 while Vulkan consumes N.
+            self._direct_sources = [
+                _TransferSource(self, width, height, direct_enabled=True)
+                for _ in range(3)
+            ]
 
     def close(self) -> None:
         try:
             if self.device is not None:
                 self.vk.vkDeviceWaitIdle(self.device)
-                if self._source is not None:
-                    self._source.close()
+                for source in [self._source, *self._direct_sources]:
+                    if source is not None:
+                        source.close()
                 for semaphore in (self.image_available, self.render_finished):
                     if semaphore is not None:
                         self.vk.vkDestroySemaphore(self.device, semaphore, None)
@@ -1583,12 +1632,20 @@ class VulkanLocalViewer:
 
 
 class _TransferSource:
-    def __init__(self, owner: VulkanLocalViewer, width: int, height: int) -> None:
+    def __init__(
+        self,
+        owner: VulkanLocalViewer,
+        width: int,
+        height: int,
+        *,
+        direct_enabled: bool = False,
+    ) -> None:
         self.owner, self.size = owner, (width, height)
         self.format = int(owner.source_format)
         self.capacity = width * height * 4
         self.buffer = self.memory = self.image = self.image_memory = None
         self._mapped = None
+        self._mapped_view = None
         self._image_initialized = False
         self._interop_context: _LocalInteropContext | None = None
         self._external_buffer: VulkanExportableBuffer | None = None
@@ -1597,7 +1654,40 @@ class _TransferSource:
         self._rocm_interop = False
         self._cuda_active = False
         self._slow_present_count = 0
+        self._direct_enabled = bool(direct_enabled)
+        self._direct_lock = threading.Lock()
+        self._direct_state = "available"
         self._create()
+
+    @property
+    def direct_view(self):
+        return (self._mapped_view or self._mapped) if self._direct_enabled else None
+
+    def claim_direct(self) -> bool:
+        with self._direct_lock:
+            if (
+                not self._direct_enabled
+                or self._mapped is None
+                or self._direct_state != "available"
+            ):
+                return False
+            self._direct_state = "claimed"
+            return True
+
+    def _release_direct(self) -> None:
+        with self._direct_lock:
+            if self._direct_state == "claimed":
+                self._direct_state = "available"
+
+    def _mark_direct_submitted(self) -> None:
+        with self._direct_lock:
+            if self._direct_state == "claimed":
+                self._direct_state = "pending"
+
+    def _complete_direct(self) -> None:
+        with self._direct_lock:
+            if self._direct_state == "pending":
+                self._direct_state = "available"
 
     def _memory_type(self, bits: int, required: int) -> int:
         props = self.owner.vk.vkGetPhysicalDeviceMemoryProperties(self.owner.physical_device)
@@ -1618,6 +1708,14 @@ class _TransferSource:
         # in frame_to_rgba_bytes when used via memoryview.
         try:
             self._mapped = vk.vkMapMemory(device, self.memory, 0, self.capacity, 0)
+            try:
+                mapped_view = memoryview(self._mapped)
+                if mapped_view.format != "B":
+                    mapped_view = mapped_view.cast("B")
+                if not mapped_view.readonly:
+                    self._mapped_view = mapped_view
+            except Exception:
+                self._mapped_view = None
         except Exception as exc:
             print(
                 f"[VulkanLocalViewer] persistent map failed: "
@@ -1625,6 +1723,8 @@ class _TransferSource:
                 flush=True,
             )
             self._mapped = None
+        if self._direct_enabled and self._mapped is not None:
+            DIRECT_SINK.register(self)
         width, height = self.size
         source_format = self.format
         self.image = vk.vkCreateImage(device, vk.VkImageCreateInfo(sType=vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, imageType=vk.VK_IMAGE_TYPE_2D, format=source_format, extent=vk.VkExtent3D(width=width, height=height, depth=1), mipLevels=1, arrayLayers=1, samples=vk.VK_SAMPLE_COUNT_1_BIT, tiling=vk.VK_IMAGE_TILING_OPTIMAL, usage=vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT, sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE, initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED), None)
@@ -1726,7 +1826,7 @@ class _TransferSource:
     def _transition(self, cmd: Any, image: Any, old: int, new: int) -> None:
         self.transition_image(self.owner.vk, cmd, image, old, new)
 
-    def present(self, pixels: Any) -> bool:
+    def present(self, pixels: Any, *, direct: bool = False) -> bool:
         vk, o = self.owner.vk, self.owner
         frame_started = time.perf_counter()
         stage_started = frame_started
@@ -1735,6 +1835,10 @@ class _TransferSource:
         )
         fence_result = int(vk.VK_SUCCESS if fence_value is None else fence_value)
         fence_ms = (time.perf_counter() - stage_started) * 1000.0
+        if fence_result == int(vk.VK_SUCCESS):
+            for source in [o._source, *o._direct_sources]:
+                if source is not None:
+                    source._complete_direct()
         index_output = vk.ffi.new("uint32_t *")
         acquire = o._device_function(b"vkAcquireNextImageKHR", "VkResult(*)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *)")
         stage_started = time.perf_counter()
@@ -1742,6 +1846,8 @@ class _TransferSource:
         acquire_ms = (time.perf_counter() - stage_started) * 1000.0
         if o.is_swapchain_out_of_date(acquire_result):
             o.recreate_swapchain()
+            if direct:
+                self._release_direct()
             return False
         recreate_after_present = o.is_swapchain_recreate_result(acquire_result)
         if acquire_result != int(vk.VK_SUCCESS) and not recreate_after_present:
@@ -1772,7 +1878,7 @@ class _TransferSource:
                 gpu_source = False
                 gpu_buffer_source = False
                 pixels, _width, _height = frame_to_rgba_bytes(pixels)
-        if not gpu_source:
+        if not gpu_source and not direct:
             if not isinstance(pixels, (bytes, bytearray, memoryview)):
                 # CUDA/ROCm interop unavailable: the caller may hand us a GPU
                 # tensor; convert it to tightly packed RGBA8 host bytes first.
@@ -1788,7 +1894,7 @@ class _TransferSource:
             if payload.format != "B":
                 payload = payload.cast("B")
             if self._mapped is not None:
-                self._mapped[0 : payload.nbytes] = payload
+                (self._mapped_view or self._mapped)[0 : payload.nbytes] = payload
             else:
                 mapped = vk.vkMapMemory(o.device, self.memory, 0, self.capacity, 0)
                 # PyVulkan's vkMapMemory already returns a writable cffi buffer;
@@ -1970,7 +2076,11 @@ class _TransferSource:
         stage_started = time.perf_counter()
         submit_value = vk.vkQueueSubmit(o.queue, 1, [submit], o.fence)
         submit_result = int(vk.VK_SUCCESS if submit_value is None else submit_value)
+        if direct and submit_result != int(vk.VK_SUCCESS):
+            self._release_direct()
         submit_ms = (time.perf_counter() - stage_started) * 1000.0
+        if direct and submit_result == int(vk.VK_SUCCESS):
+            self._mark_direct_submitted()
         present_info = vk.VkPresentInfoKHR(sType=vk.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, waitSemaphoreCount=1, pWaitSemaphores=[o.render_finished], swapchainCount=1, pSwapchains=[o.swapchain], pImageIndices=[index])
         present = o._device_function(b"vkQueuePresentKHR", "VkResult(*)(VkQueue, const VkPresentInfoKHR *)")
         stage_started = time.perf_counter()
@@ -1997,12 +2107,16 @@ class _TransferSource:
             self._image_initialized = True
             return False
         if result != int(vk.VK_SUCCESS):
+            if direct:
+                self._release_direct()
             raise RuntimeError(f"Vulkan local-viewer present failed ({result})")
         self._image_initialized = True
         return True
 
     def close(self) -> None:
         vk, device = self.owner.vk, self.owner.device
+        DIRECT_SINK.unregister(self)
+        self._release_direct()
         self._disable_cuda_interop("close", announce=False)
         if getattr(self, "_mapped", None) is not None:
             try:
@@ -2010,6 +2124,7 @@ class _TransferSource:
             except Exception:
                 pass
             self._mapped = None
+            self._mapped_view = None
         if self.image is not None: vk.vkDestroyImage(device, self.image, None)
         if self.image_memory is not None: vk.vkFreeMemory(device, self.image_memory, None)
         if self.buffer is not None: vk.vkDestroyBuffer(device, self.buffer, None)
@@ -2041,9 +2156,11 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             if not bool(getattr(runtime_q, "_d2s_ordered", False)):
                 while True:
                     try:
-                        result, _started = runtime_q.get_nowait()
+                        candidate = runtime_q.get_nowait()
                     except queue.Empty:
                         break
+                    _release_item(result)
+                    result, _started = candidate
                     if config.on_breakdown_inc is not None:
                         config.on_breakdown_inc("viewer_get", 1)
                         config.on_breakdown_inc("viewer_drop", 1)
@@ -2051,10 +2168,14 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             # frame; present() unpacks viewer_frame_np directly.
             frame = (
                 result
-                if getattr(result, "viewer_frame_np", None) is not None
+                if (
+                    getattr(result, "viewer_frame_np", None) is not None
+                    or getattr(result, "viewer_frame_direct", None) is not None
+                )
                 else getattr(result, "sbs", None)
             )
             if frame is None:
+                _release_item(result)
                 continue
             if viewer is None:
                 # Primary: Vulkan. Fallback chain: Metal -> OpenGL (macOS).
@@ -2110,6 +2231,7 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                     on_sbs_fps=None,
                     on_breakdown_inc=None,
                     on_breakdown_add_time=None,
+                    direct_staging=False,
                     manage_glfw_lifecycle=False,
                     exclude_from_capture=False,
                 )
@@ -2131,13 +2253,33 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         flush=True,
                     )
             present_started = time.perf_counter()
-            viewer.present(frame)
+            presented = viewer.present(frame)
+            presented_at = time.perf_counter()
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
-                    "local_present", time.perf_counter() - present_started
+                    "local_present", presented_at - present_started
                 )
-            if config.on_breakdown_inc is not None:
+            # Older fallback viewers returned None for success. The Vulkan
+            # viewer returns an explicit bool, so failed submissions are not
+            # counted as presented frames.
+            if presented is not False and config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("local_presented_frame", 1)
+                if bool(getattr(result, "depth_complete", False)):
+                    config.on_breakdown_inc("local_depth_presented_frame", 1)
+                if bool(getattr(result, "viewer_frame_direct", None) is not None):
+                    config.on_breakdown_inc("local_direct_presented", 1)
+                else:
+                    config.on_breakdown_inc("local_host_presented", 1)
+            if (
+                presented is not False
+                and config.on_breakdown_add_time is not None
+            ):
+                previous_present = getattr(viewer, "_last_present_timestamp", None)
+                if previous_present is not None:
+                    config.on_breakdown_add_time(
+                        "local_present_interval", presented_at - previous_present
+                    )
+                viewer._last_present_timestamp = presented_at
             if preview_viewer is not None:
                 preview_frame = depth_preview_frame(result)
                 if preview_frame is None:

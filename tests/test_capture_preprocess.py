@@ -76,6 +76,22 @@ def test_capture_frame_to_rgb_tensor_path_records_capture_metadata_overrides():
     assert tensor._d2s_capture_zero_copy is False
 
 
+@pytest.mark.skipif(
+    not __import__("torch").backends.mps.is_available(),
+    reason="requires MPS",
+)
+def test_mps_tensor_keeps_raw_cpu_capture_for_coreml_staging():
+    torch = pytest.importorskip("torch")
+    frame = np.zeros((4, 6, 4), dtype=np.uint8)
+
+    tensor = capture_frame_to_rgb(frame, target_height=4, device="mps", output="tensor")
+
+    raw = tensor._d2s_coreml_raw_bgr
+    assert isinstance(raw, torch.Tensor)
+    assert raw.device.type == "cpu"
+    assert tuple(raw.shape) == (4, 6, 4)
+
+
 def test_capture_frame_to_rgb_tensor_path_accepts_torch_hwc():
     torch = pytest.importorskip("torch")
     frame = torch.tensor([[[10, 20, 30], [40, 50, 60]], [[10, 20, 30], [40, 50, 60]]], dtype=torch.uint8)

@@ -11,6 +11,7 @@ class PollingCaptureRunner:
         self.config = config
         self._source_factory = source_factory
         self._source = None
+        self._frame_id = 0
 
     @property
     def source(self):
@@ -78,6 +79,7 @@ class PollingCaptureRunner:
                             metadata={
                                 "backend": type(self._source).__name__,
                                 "zero_copy": False,
+                                "capture_frame_id": self._frame_id,
                                 **({
                                     "native_depth_profile": native_depth_profile,
                                     "native_depth_backend": "openvino_d3d11_remote",
@@ -85,6 +87,7 @@ class PollingCaptureRunner:
                             },
                         )
                     )
+                    self._frame_id += 1
                 except Exception as exc:
                     if on_error is not None:
                         on_error(exc)

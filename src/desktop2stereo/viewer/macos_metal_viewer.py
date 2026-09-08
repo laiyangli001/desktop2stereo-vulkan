@@ -431,7 +431,7 @@ class MetalLocalViewer:
 
     # ── frame flow ──
 
-    def present(self, frame: Any) -> None:
+    def present(self, frame: Any) -> bool:
         if self.window is None or not self._initialized_flag():
             raise RuntimeError("Metal local viewer has not been initialized")
         self.poll_events()
@@ -446,8 +446,9 @@ class MetalLocalViewer:
             and self._warp_pipeline is not None
             and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
         ):
-            self._present_warp(rgb, depth, bgra=getattr(frame, "viewer_bgra", None))
-            return
+            return self._present_warp(
+                rgb, depth, bgra=getattr(frame, "viewer_bgra", None)
+            )
 
         # Runtime-packed host frame: pure memcpy, no device sync.
         host_np = getattr(frame, "viewer_frame_np", None)
@@ -477,7 +478,7 @@ class MetalLocalViewer:
 
         drawable = self.layer.nextDrawable()
         if drawable is None:
-            return
+            return False
 
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
         scale = self._ns_window.backingScaleFactor()
@@ -528,6 +529,7 @@ class MetalLocalViewer:
             self._report_present_fps(fps, self._fps_frames)
             self._fps_frames = 0
             self._fps_started = now
+        return True
 
     def _initialized_flag(self) -> bool:
         return self.pipeline is not None
@@ -631,7 +633,7 @@ class MetalLocalViewer:
             return 2
         return 7  # SBS warp (per-eye draws with explicit eye offsets)
 
-    def _present_warp(self, rgb: Any, depth: Any, bgra: Any = None) -> None:
+    def _present_warp(self, rgb: Any, depth: Any, bgra: Any = None) -> bool:
         import torch  # local: module stays importable without torch
 
         # Zero-copy fast path: sample the captured SCK BGRA texture directly
@@ -714,7 +716,7 @@ class MetalLocalViewer:
         if drawable is None:
             if bgra is not None:
                 _release_bgra()
-            return
+            return False
         fb_w, fb_h = self.glfw.get_framebuffer_size(self.window)
         scale = self._ns_window.backingScaleFactor()
         dw_px, dh_px = max(1, int(fb_w * scale)), max(1, int(fb_h * scale))
@@ -779,6 +781,7 @@ class MetalLocalViewer:
             self._report_present_fps(fps, self._fps_frames)
             self._fps_frames = 0
             self._fps_started = now
+        return True
 
     def _report_present_fps(self, fps: float, frame_count: int) -> None:
         capture_target = (
@@ -905,13 +908,15 @@ def run_metal_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Any) 
                     flush=True,
                 )
             present_started = time.perf_counter()
-            viewer.present(frame)
+            presented = viewer.present(frame)
             if config.on_breakdown_add_time is not None:
                 config.on_breakdown_add_time(
                     "local_present", time.perf_counter() - present_started
                 )
-            if config.on_breakdown_inc is not None:
+            if presented is not False and config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("local_presented_frame", 1)
+                if bool(getattr(result, "depth_complete", False)):
+                    config.on_breakdown_inc("local_depth_presented_frame", 1)
     except StopIteration:
         shutdown_event.set()
     finally:
