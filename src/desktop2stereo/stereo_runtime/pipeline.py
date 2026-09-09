@@ -1135,6 +1135,11 @@ class RuntimePipelineLoop:
             "resource_kind": debug_info.get("capture_resource_kind"),
             "resource_format": debug_info.get("capture_resource_format"),
             "capture_size": debug_info.get("capture_size"),
+            "output_format": debug_info.get("runtime_output_format"),
+            "depth_finite": bool(debug_info.get("depth_finite", True)),
+            "depth_nonfinite_count": int(
+                debug_info.get("native_coreml_nonfinite_count", 0) or 0
+            ),
             "gpu_to_cpu": gpu_to_cpu or directml_gpu_to_cpu,
             "gpu_copy_count": gpu_copy_count,
             "directml_gpu_copy_count": debug_info.get("directml_gpu_copy_count", 0),

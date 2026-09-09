@@ -1063,7 +1063,13 @@ class VulkanLocalViewer:
             if self.config.show_fps_provider is not None
             else self.config.show_fps
         )
-        if not show_fps:
+        benchmark_fps = os.environ.get("D2S_BENCHMARK", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not show_fps and not benchmark_fps:
             return capture_target
         target_text = (
             f" capture_target={capture_target}" if capture_target is not None else ""

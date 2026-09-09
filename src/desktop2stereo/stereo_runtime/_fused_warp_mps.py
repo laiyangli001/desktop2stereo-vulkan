@@ -147,12 +147,20 @@ def pack_target(src_w: int, src_h: int, output_format: str = "half_sbs") -> tupl
 
     Mirrors the NVIDIA local-mode contract: SBS geometry follows the
     RUNTIME input resolution and the selected format -- never the viewer
-    window. 1080p in -> half_sbs 1920x1080, full_sbs 3840x1080.
+    window. 1080p in -> half_sbs/half_tab 1920x1080, full_sbs 3840x1080,
+    and full_tab 1920x2160. Mono and diagnostic modes preserve source size.
     """
     sw, sh = int(src_w), int(src_h)
-    if str(output_format) == "full_sbs":
+    output_format = str(output_format)
+    if output_format == "full_sbs":
         return sw * 2, sh
-    return sw - sw % 2, sh
+    if output_format == "full_tab":
+        return sw, sh * 2
+    if output_format in {"half_sbs", "half_tab"}:
+        # The packed half modes preserve the source frame dimensions while
+        # requiring an even split for the local viewer's eye regions.
+        return (sw - sw % 2, sh) if output_format == "half_sbs" else (sw, sh)
+    return sw, sh
 
 
 def fused_sbs_pack(rgb_f32_chw, depth_f32, host_out=None, out_size=None,

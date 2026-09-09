@@ -8,6 +8,18 @@
 extern "C" {
 #endif
 
+enum {
+    D2S_OUTPUT_HALF_SBS = 0,
+    D2S_OUTPUT_FULL_SBS = 1,
+    D2S_OUTPUT_HALF_TAB = 2,
+    D2S_OUTPUT_FULL_TAB = 3,
+    D2S_OUTPUT_MONO = 4,
+    D2S_OUTPUT_DEPTH_MAP = 5,
+    D2S_OUTPUT_ANAGLYPH = 6,
+    D2S_OUTPUT_INTERLEAVED = 7,
+    D2S_OUTPUT_LEIA = 8,
+};
+
 typedef struct {
     int32_t slot;
     int32_t source_width;
@@ -48,6 +60,7 @@ typedef struct {
     int32_t occlusion_enabled;
     float depth_pop;
     float antialias_strength;
+    int32_t anaglyph_method;
 } D2SCoreMLIOWarpConfig;
 
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,

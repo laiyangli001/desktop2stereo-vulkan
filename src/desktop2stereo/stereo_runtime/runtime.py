@@ -82,29 +82,6 @@ class DepthRuntime:
         """Return whether the macOS native Core ML bridge is ready for size."""
         if not isinstance(size, (tuple, list)) or len(size) != 2:
             return False
-        # Native packing is stateless and samples the capture texture directly.
-        # Route features that need the public tensor compositor through the
-        # existing Python/CoreML path instead of silently changing semantics.
-        if str(getattr(self.stereo_config, "output_format", "half_sbs")) not in {
-            "half_sbs",
-            "full_sbs",
-        }:
-            return False
-        if any(
-            bool(getattr(self.stereo_config, field_name, False))
-            for field_name in (
-                "temporal",
-                "refine",
-                "cross_eyed",
-                "output_quality_enabled",
-                "dynamic_convergence_enabled",
-            )
-        ):
-            return False
-        if isinstance(getattr(self.stereo_config, "convergence", None), torch.Tensor):
-            return False
-        if not _viewer_color_adjustments_neutral(self.config):
-            return False
         checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
         if not callable(checker):
             return False
@@ -1099,6 +1076,36 @@ class StereoRuntime:
         """Return whether the macOS native Core ML bridge is ready for size."""
         if not isinstance(size, (tuple, list)) or len(size) != 2:
             return False
+        # All local-viewer display modes have a native GPU pack implementation.
+        # Stateful or color-transforming features still use the established
+        # compositor because they cannot be represented by this stateless pass.
+        if str(getattr(self.stereo_config, "output_format", "half_sbs")) not in {
+            "half_sbs",
+            "full_sbs",
+            "half_tab",
+            "full_tab",
+            "mono",
+            "depth_map",
+            "anaglyph",
+            "interleaved",
+            "leia",
+        }:
+            return False
+        if any(
+            bool(getattr(self.stereo_config, field_name, False))
+            for field_name in (
+                "temporal",
+                "refine",
+                "cross_eyed",
+                "output_quality_enabled",
+                "dynamic_convergence_enabled",
+            )
+        ):
+            return False
+        if isinstance(getattr(self.stereo_config, "convergence", None), torch.Tensor):
+            return False
+        if not _viewer_color_adjustments_neutral(self.config):
+            return False
         checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
         if not callable(checker):
             return False
@@ -1372,10 +1379,12 @@ class StereoRuntime:
                 "native_coreml_host_handoff_copy_count": 1,
                 "native_coreml_gpu_copy_count": 1,
                 "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
+                "depth_finite": int(bool(native_depth.finite_depth)),
                 "native_coreml_normalize_lo": float(native_depth.normalize_lo),
                 "native_coreml_normalize_hi": float(native_depth.normalize_hi),
                 "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
                 "runtime_depth_backend": "coreml",
+                "runtime_output_format": str(self.stereo_config.output_format),
                 **native_warp_debug,
             }
             native_error = getattr(self, "_native_io_last_error", None)
@@ -2734,14 +2743,9 @@ def _configure_native_coreml_warp(
             fill_radius=getattr(config, "hole_fill_radius", 3),
             fill_strength=getattr(config, "hole_fill_strength", 1.0),
         )
-        native_parallax_gain = _native_half_sbs_parallax_gain(config)
         values = {
             "depth_strength": max(0.0, float(getattr(config, "depth_strength", 1.0))),
-            # Half-SBS reduces each eye to half the source width after the
-            # warp. Compensate only the native macOS pack so the displayed
-            # disparity matches the full-resolution viewer calibration.
-            "max_disparity_px": float(budget.max_disparity_px)
-            * native_parallax_gain,
+            "max_disparity_px": float(budget.max_disparity_px),
             "convergence": float(getattr(config, "convergence", 0.0)),
             "edge_threshold": float(getattr(config, "edge_threshold", 0.04)),
             "fill_strength": float(fill_strength),
@@ -2771,11 +2775,13 @@ def _configure_native_coreml_warp(
             "antialias_strength": float(
                 getattr(config, "depth_antialias_strength", 0.0)
             ),
+            "anaglyph_method": str(
+                getattr(config, "anaglyph_method", "red_cyan")
+            ),
         }
         configure(**values)
         return {
             "native_coreml_stereo_postprocess": "vulkan_layered_equivalent",
-            "native_coreml_parallax_gain": native_parallax_gain,
             "native_coreml_layers": values["layers"],
             "native_coreml_occlusion_enabled": values["occlusion_enabled"],
             "native_coreml_hole_fill_mode": values["hole_fill_mode"],
@@ -2787,17 +2793,6 @@ def _configure_native_coreml_warp(
             "native_coreml_stereo_postprocess": "legacy_native_warp",
             "native_coreml_stereo_postprocess_error": f"{type(exc).__name__}: {exc}",
         }
-
-
-def _native_half_sbs_parallax_gain(config: Any) -> float:
-    """Compensate native Half-SBS horizontal reduction without changing other paths."""
-    if str(getattr(config, "output_format", "half_sbs")) != "half_sbs":
-        return 1.0
-    try:
-        raw = float(os.environ.get("D2S_MAC_NATIVE_PARALLAX_GAIN", "2.0"))
-    except (TypeError, ValueError):
-        raw = 2.0
-    return max(1.0, min(4.0, raw))
 
 
 def _provider_report(depth_provider: Any) -> dict[str, Any]:

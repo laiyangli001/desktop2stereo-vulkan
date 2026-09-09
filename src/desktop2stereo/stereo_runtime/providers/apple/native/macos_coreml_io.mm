@@ -46,6 +46,7 @@ typedef struct {
     uint32_t depth_height;
     uint32_t output_width;
     uint32_t output_height;
+    uint32_t output_format;
     D2SCoreMLIOWarpConfig stereo;
 } D2SWarpParams;
 
@@ -79,6 +80,7 @@ struct WarpParams {
     uint depth_height;
     uint output_width;
     uint output_height;
+    uint output_format;
     float depth_strength;
     float max_disparity_px;
     float convergence;
@@ -98,6 +100,7 @@ struct WarpParams {
     int occlusion_enabled;
     float depth_pop;
     float antialias_strength;
+    int anaglyph_method;
 };
 
 kernel void d2s_preprocess(
@@ -414,7 +417,8 @@ static inline float3 output_eye_pixel(
     // half-SBS uses the same four-tap Lanczos2 reduction as make_sbs after
     // full-resolution layered warping. This avoids a second, mismatched
     // bilinear reduction at silhouettes.
-    if (p.output_width != p.source_width) {
+    uint eye_width = p.output_width / 2u;
+    if (p.output_format != 0u || p.source_width != eye_width * 2u) {
         return eye_pixel(color, depth, x, y, eye_sign, screen_edge, p);
     }
     float base = floor(x);
@@ -423,6 +427,28 @@ static inline float3 output_eye_pixel(
     float3 x1 = eye_pixel(color, depth, base + 1.0f, y, eye_sign, screen_edge, p);
     float3 x2 = eye_pixel(color, depth, base + 2.0f, y, eye_sign, screen_edge, p);
     return (-xm1 + 9.0f * x0 + 9.0f * x1 - x2) * 0.0625f;
+}
+
+static inline float3 output_eye_pixel_vertical(
+    texture2d<float, access::sample> color, device float *depth,
+    float x, float y, float eye_sign, bool screen_edge,
+    uint eye_height, constant WarpParams& p) {
+    if (p.output_format != 2u || p.source_height != eye_height * 2u) {
+        return eye_pixel(color, depth, x, y, eye_sign, screen_edge, p);
+    }
+    float base = floor(y);
+    float3 ym1 = eye_pixel(color, depth, x, base - 1.0f, eye_sign, screen_edge, p);
+    float3 y0 = eye_pixel(color, depth, x, base, eye_sign, screen_edge, p);
+    float3 y1 = eye_pixel(color, depth, x, base + 1.0f, eye_sign, screen_edge, p);
+    float3 y2 = eye_pixel(color, depth, x, base + 2.0f, eye_sign, screen_edge, p);
+    return (-ym1 + 9.0f * y0 + 9.0f * y1 - y2) * 0.0625f;
+}
+
+static inline float3 finite_color(float3 value) {
+    if (!isfinite(value.r)) value.r = 0.0f;
+    if (!isfinite(value.g)) value.g = 0.0f;
+    if (!isfinite(value.b)) value.b = 0.0f;
+    return clamp(value, float3(0.0f), float3(1.0f));
 }
 
 kernel void d2s_warp_pack(
@@ -435,20 +461,87 @@ kernel void d2s_warp_pack(
     if (gid >= total) return;
     uint x = gid % p.output_width;
     uint y = gid / p.output_width;
-    uint eye_width = p.output_width / 2u;
-    bool left = x < eye_width;
-    uint eye_x = left ? x : x - eye_width;
-    float source_x = (float(eye_x) + 0.5f) *
-                         (float(p.source_width) / float(eye_width)) - 0.5f;
-    float source_y = (float(y) + 0.5f) *
-                         (float(p.source_height) / float(p.output_height)) - 0.5f;
-    float eye_sign = left ? -1.0f : (p.symmetric != 0 ? 1.0f : 0.9f);
-    bool screen_edge = p.screen_edge_suppression > 0 &&
-        (eye_x < uint(p.screen_edge_suppression) || y < uint(p.screen_edge_suppression) ||
-         eye_x >= eye_width - uint(p.screen_edge_suppression) ||
-         y >= p.output_height - uint(p.screen_edge_suppression));
-    float3 pixel = output_eye_pixel(
-        color, depth, source_x, source_y, eye_sign, screen_edge, p);
+    float3 pixel = float3(0.0f);
+    if (p.output_format == 5u) {
+        float value = processed_depth_at(depth, float(x), float(y), p);
+        pixel = float3(isfinite(value) ? value : 1.0f);
+    } else if (p.output_format == 4u) {
+        uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                        min(p.source_width, p.source_height));
+        bool screen_edge = edge > 0u &&
+            (x < edge || y < edge || x >= p.source_width - edge ||
+             y >= p.source_height - edge);
+        pixel = eye_pixel(color, depth, float(x), float(y), 1.0f, screen_edge, p);
+    } else if (p.output_format == 6u) {
+        uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                        min(p.source_width, p.source_height));
+        bool screen_edge = edge > 0u &&
+            (x < edge || y < edge || x >= p.source_width - edge ||
+             y >= p.source_height - edge);
+        float3 left_pixel = eye_pixel(color, depth, float(x), float(y), 1.0f,
+                                      screen_edge, p);
+        float3 right_pixel = eye_pixel(color, depth, float(x), float(y),
+                                       p.symmetric != 0 ? -1.0f : -0.9f,
+                                       screen_edge, p);
+        if (p.anaglyph_method == 1) {
+            pixel = float3(right_pixel.r, left_pixel.g, right_pixel.b);
+        } else if (p.anaglyph_method == 2) {
+            pixel = float3(left_pixel.r, left_pixel.g, right_pixel.b);
+        } else if (p.anaglyph_method == 3) {
+            float left_gray = (left_pixel.r + left_pixel.g + left_pixel.b) / 3.0f;
+            float right_gray = (right_pixel.r + right_pixel.g + right_pixel.b) / 3.0f;
+            pixel = float3(left_gray, right_gray, right_gray);
+        } else {
+            pixel = float3(left_pixel.r, right_pixel.g, right_pixel.b);
+        }
+    } else if (p.output_format == 7u || p.output_format == 8u) {
+        uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                        min(p.source_width, p.source_height));
+        bool screen_edge = edge > 0u &&
+            (x < edge || y < edge || x >= p.source_width - edge ||
+             y >= p.source_height - edge);
+        // Match CUDA Triton: Interleaved is row-interleaved, Leia is
+        // column-interleaved.
+        bool left = p.output_format == 7u ? (y % 2u == 0u) : (x % 2u == 0u);
+        pixel = eye_pixel(color, depth, float(x), float(y),
+                          left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f),
+                          screen_edge, p);
+    } else if (p.output_format == 2u || p.output_format == 3u) {
+        uint eye_height = p.output_height / 2u;
+        bool left = y < eye_height;
+        uint eye_y = left ? y : y - eye_height;
+        float source_x = float(x);
+        float source_y = p.output_format == 2u
+            ? (float(eye_y) + 0.5f) * (float(p.source_height) / float(eye_height)) - 0.5f
+            : float(eye_y);
+        uint actual_eye_height = left ? eye_height : p.output_height - eye_height;
+        uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                        min(p.output_width, actual_eye_height));
+        bool screen_edge = edge > 0u &&
+            (x < edge || eye_y < edge || x >= p.output_width - edge ||
+             eye_y >= actual_eye_height - edge);
+        pixel = output_eye_pixel_vertical(
+            color, depth, source_x, source_y,
+            left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f),
+            screen_edge, actual_eye_height, p);
+    } else {
+        uint eye_width = p.output_width / 2u;
+        bool left = x < eye_width;
+        uint eye_x = left ? x : x - eye_width;
+        float source_x = (float(eye_x) + 0.5f) *
+                             (float(p.source_width) / float(eye_width)) - 0.5f;
+        float source_y = float(y);
+        uint edge = min(uint(max(p.screen_edge_suppression, 0)),
+                        min(eye_width, p.output_height));
+        bool screen_edge = edge > 0u &&
+            (eye_x < edge || y < edge || eye_x >= eye_width - edge ||
+             y >= p.output_height - edge);
+        pixel = output_eye_pixel(
+            color, depth, source_x, source_y,
+            left ? 1.0f : (p.symmetric != 0 ? -1.0f : -0.9f),
+            screen_edge, p);
+    }
+    pixel = finite_color(pixel);
     uint offset = gid * 4u;
     output[offset + 0u] = uchar(clamp(pixel.r * 255.0f + 0.5f, 0.0f, 255.0f));
     output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
@@ -916,6 +1009,7 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
             MTLPixelFormatBGRA8Unorm, width, height, 0, &cv_texture);
         if (texture_status != kCVReturnSuccess || cv_texture == NULL) {
             d2s_set_error(ctx, @"ScreenCaptureKit pixel buffer could not become a Metal texture");
+            d2s_release_slot(slot);
             return D2S_COREML_ERROR;
         }
         slot->color_cv_texture = cv_texture;
@@ -1061,15 +1155,41 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
     @autoreleasepool {
         D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
         if (ctx == NULL || destination == NULL || slot_index < 0 || slot_index >= 3 ||
-            output_width <= 0 || output_height <= 0 || output_format < 0 || output_format > 1) {
+            output_width <= 0 || output_height <= 0 || output_format < D2S_OUTPUT_HALF_SBS ||
+            output_format > D2S_OUTPUT_LEIA) {
             return D2S_COREML_ERROR;
         }
         D2SSlot *slot = &ctx->slots[slot_index];
+        uint32_t source_width;
+        uint32_t source_height;
+        BOOL expected_size = NO;
         {
             D2SLockGuard lock(&ctx->mutex);
-            if (slot->state != 1 ||
+            if (slot->state != 1 || slot->pixel_buffer == NULL) {
+                d2s_set_error(ctx, @"native CoreML pack slot is not ready");
+                return D2S_COREML_ERROR;
+            }
+            source_width = (uint32_t)CVPixelBufferGetWidth(slot->pixel_buffer);
+            source_height = (uint32_t)CVPixelBufferGetHeight(slot->pixel_buffer);
+            switch (output_format) {
+                case D2S_OUTPUT_FULL_SBS:
+                    expected_size = (output_width == (int32_t)(source_width * 2u) &&
+                                     output_height == (int32_t)source_height);
+                    break;
+                case D2S_OUTPUT_FULL_TAB:
+                    expected_size = (output_width == (int32_t)source_width &&
+                                     output_height == (int32_t)(source_height * 2u));
+                    break;
+                default:
+                    expected_size = (output_width == (int32_t)source_width &&
+                                     output_height == (int32_t)source_height);
+                    break;
+            }
+            if (
                 destination_size < (size_t)output_width * output_height * 4u ||
-                output_width % 2 != 0) {
+                !expected_size ||
+                ((output_format == D2S_OUTPUT_HALF_SBS ||
+                  output_format == D2S_OUTPUT_FULL_SBS) && output_width % 2 != 0)) {
                 d2s_set_error(ctx, @"native CoreML pack slot or destination is invalid");
                 return D2S_COREML_ERROR;
             }
@@ -1087,15 +1207,16 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
         D2SCoreMLIOWarpConfig default_stereo = {
             1.0f, 48.0f, 0.0f, 0.04f, 0.0f,
             0, 0, 1, 2, 0.08f,
-            1.0f, 1.0f, 1.0f, 2, 0, 2, 1, 0.0f, 0.0f,
+            1.0f, 1.0f, 1.0f, 2, 0, 2, 1, 0.0f, 0.0f, 0,
         };
         D2SWarpParams params = {
-            (uint32_t)CVPixelBufferGetWidth(slot->pixel_buffer),
-            (uint32_t)CVPixelBufferGetHeight(slot->pixel_buffer),
+            source_width,
+            source_height,
             (uint32_t)ctx->depth_width,
             (uint32_t)ctx->depth_height,
             (uint32_t)output_width,
             (uint32_t)output_height,
+            (uint32_t)output_format,
             warp_config != NULL ? *warp_config : default_stereo,
         };
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];

@@ -24,6 +24,24 @@ _NATIVE_DIR = Path(__file__).resolve().parent
 _SOURCE = _NATIVE_DIR / "macos_coreml_io.mm"
 _HEADER = _NATIVE_DIR / "macos_coreml_io.h"
 
+_NATIVE_OUTPUT_FORMATS = {
+    "half_sbs": 0,
+    "full_sbs": 1,
+    "half_tab": 2,
+    "full_tab": 3,
+    "mono": 4,
+    "depth_map": 5,
+    "anaglyph": 6,
+    "interleaved": 7,
+    "leia": 8,
+}
+_NATIVE_ANAGLYPH_METHODS = {
+    "red_cyan": 0,
+    "green_magenta": 1,
+    "amber_blue": 2,
+    "gray": 3,
+}
+
 
 class _NativeResult(ctypes.Structure):
     _fields_ = [
@@ -68,11 +86,26 @@ class _NativeWarpConfig(ctypes.Structure):
         ("occlusion_enabled", ctypes.c_int32),
         ("depth_pop", ctypes.c_float),
         ("antialias_strength", ctypes.c_float),
+        ("anaglyph_method", ctypes.c_int32),
     ]
 
 
 class NativeCoreMLBusy(RuntimeError):
     """The bounded native resource ring has no reusable slot yet."""
+
+
+def native_output_format_id(output_format: str) -> int:
+    try:
+        return _NATIVE_OUTPUT_FORMATS[str(output_format).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(f"native CoreML output format is unsupported: {output_format}") from exc
+
+
+def native_anaglyph_method_id(method: str) -> int:
+    try:
+        return _NATIVE_ANAGLYPH_METHODS[str(method).strip().lower()]
+    except KeyError as exc:
+        raise ValueError(f"native CoreML anaglyph method is unsupported: {method}") from exc
 
 
 def native_io_enabled() -> bool:
@@ -193,7 +226,7 @@ class NativeCoreMLFrame:
     output_zero_copy: bool
     normalize_lo: float = 0.0
     normalize_hi: float = 1.0
-    warp_config: dict[str, float | int] | None = None
+    warp_config: dict[str, float | int | str] | None = None
     released: bool = False
 
     @property
@@ -218,7 +251,7 @@ class NativeCoreMLFrame:
             output_format,
         )
 
-    def configure_warp(self, **values: float | int) -> None:
+    def configure_warp(self, **values: float | int | str) -> None:
         """Attach the shared stereo parameters before presenter-side packing."""
         self.warp_config = dict(values)
 
@@ -444,6 +477,7 @@ class NativeCoreMLIOBridge:
             int(values.get("occlusion_enabled", 1)),
             float(values.get("depth_pop", 0.0)),
             float(values.get("antialias_strength", 0.0)),
+            native_anaglyph_method_id(values.get("anaglyph_method", "red_cyan")),
         )
         handle = self._begin_call(allow_closing=True)
         try:
@@ -454,7 +488,7 @@ class NativeCoreMLIOBridge:
                 int(destination_size),
                 int(output_width),
                 int(output_height),
-                1 if str(output_format) == "full_sbs" else 0,
+                native_output_format_id(output_format),
                 ctypes.byref(config),
                 eye_offset,
                 depth_strength,
