@@ -2734,9 +2734,14 @@ def _configure_native_coreml_warp(
             fill_radius=getattr(config, "hole_fill_radius", 3),
             fill_strength=getattr(config, "hole_fill_strength", 1.0),
         )
+        native_parallax_gain = _native_half_sbs_parallax_gain(config)
         values = {
             "depth_strength": max(0.0, float(getattr(config, "depth_strength", 1.0))),
-            "max_disparity_px": float(budget.max_disparity_px),
+            # Half-SBS reduces each eye to half the source width after the
+            # warp. Compensate only the native macOS pack so the displayed
+            # disparity matches the full-resolution viewer calibration.
+            "max_disparity_px": float(budget.max_disparity_px)
+            * native_parallax_gain,
             "convergence": float(getattr(config, "convergence", 0.0)),
             "edge_threshold": float(getattr(config, "edge_threshold", 0.04)),
             "fill_strength": float(fill_strength),
@@ -2770,6 +2775,7 @@ def _configure_native_coreml_warp(
         configure(**values)
         return {
             "native_coreml_stereo_postprocess": "vulkan_layered_equivalent",
+            "native_coreml_parallax_gain": native_parallax_gain,
             "native_coreml_layers": values["layers"],
             "native_coreml_occlusion_enabled": values["occlusion_enabled"],
             "native_coreml_hole_fill_mode": values["hole_fill_mode"],
@@ -2781,6 +2787,17 @@ def _configure_native_coreml_warp(
             "native_coreml_stereo_postprocess": "legacy_native_warp",
             "native_coreml_stereo_postprocess_error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _native_half_sbs_parallax_gain(config: Any) -> float:
+    """Compensate native Half-SBS horizontal reduction without changing other paths."""
+    if str(getattr(config, "output_format", "half_sbs")) != "half_sbs":
+        return 1.0
+    try:
+        raw = float(os.environ.get("D2S_MAC_NATIVE_PARALLAX_GAIN", "2.0"))
+    except (TypeError, ValueError):
+        raw = 2.0
+    return max(1.0, min(4.0, raw))
 
 
 def _provider_report(depth_provider: Any) -> dict[str, Any]:

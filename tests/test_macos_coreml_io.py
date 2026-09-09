@@ -166,6 +166,7 @@ def test_runtime_native_warp_configuration_uses_vulkan_controls() -> None:
     config = SimpleNamespace(
         depth_strength=0.25,
         max_disparity_px=None,
+        output_format="half_sbs",
         convergence=0.0,
         parallax_preset="standard",
         edge_threshold=0.04,
@@ -191,7 +192,54 @@ def test_runtime_native_warp_configuration_uses_vulkan_controls() -> None:
     assert calls[0]["layers"] == 2
     assert calls[0]["hole_fill_mode"] == 2
     assert calls[0]["occlusion_enabled"] == 1
+    assert calls[0]["max_disparity_px"] == 96.0
+    assert debug["native_coreml_parallax_gain"] == 2.0
+
+
+def test_native_full_sbs_keeps_public_parallax_budget() -> None:
+    from stereo_runtime.runtime import _configure_native_coreml_warp
+
+    calls = []
+
+    class Native:
+        def configure_warp(self, **values):
+            calls.append(values)
+
+    config = SimpleNamespace(
+        output_format="full_sbs",
+        depth_strength=0.25,
+        max_disparity_px=None,
+        convergence=0.0,
+        parallax_preset="standard",
+        hole_fill="none",
+        hole_fill_mode="none",
+        hole_fill_radius=0,
+        hole_fill_strength=0.0,
+        mask_feather_radius=1,
+        symmetric=True,
+        layers=2,
+        foreground_shift_scale=1.0,
+        midground_shift_scale=1.0,
+        background_shift_scale=1.0,
+        edge_dilation=1,
+        screen_edge_mask_suppression=0,
+        occlusion=True,
+        depth_pop=0.0,
+        depth_antialias_strength=0.0,
+    )
+    debug = _configure_native_coreml_warp(Native(), config, width=1920, height=1080)
+
     assert calls[0]["max_disparity_px"] == 48.0
+    assert debug["native_coreml_parallax_gain"] == 1.0
+
+
+def test_layered_native_backend_is_not_reported_as_coreml_fallback() -> None:
+    from pathlib import Path
+
+    pipeline = Path(__file__).parents[1] / "src/desktop2stereo/stereo_runtime/pipeline.py"
+    source = pipeline.read_text()
+
+    assert 'startswith(\n                "native_coreml_metal"' in source
 
 
 def test_native_busy_code_is_explicit_not_a_cpu_fallback(monkeypatch) -> None:

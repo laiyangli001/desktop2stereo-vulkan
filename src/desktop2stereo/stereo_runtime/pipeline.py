@@ -1062,7 +1062,7 @@ class RuntimePipelineLoop:
         native_coreml_vulkan = bool(
             debug_info.get("native_coreml_io")
             and str(debug_info.get("runtime_output_pack_backend", "")).startswith(
-                "native_coreml_metal_vulkan"
+                "native_coreml_metal"
             )
         )
         fallback_reasons = []
