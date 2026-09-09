@@ -1,12 +1,11 @@
 """Registry connecting the packer thread to the Vulkan viewer's staging.
 
-The last non-zero-copy hop in the macOS Vulkan present path was a CPU
-memcpy of every packed frame into the persistently mapped staging buffer
-before ``vkCmdCopyBufferToImage``. When the mapped pages are 16K-aligned
-(they are, on MoltenVK), the packer can write the warp output DIRECTLY
-into them via the MPS ``copy_`` path -- the same GPU-side write the
-IOSurface stage uses -- and the viewer submits ``CopyBufferToImage``
-with no CPU touch of the payload.
+The native macOS path keeps capture, Core ML preprocessing/inference, depth
+sanitization, and warp packing on the GPU. MoltenVK does not expose its
+mapped transfer allocation as a valid Metal ``MTLBuffer`` on this host, so
+the bridge records one explicit GPU-warp-to-Vulkan mapped-buffer handoff
+copy. The viewer still submits ``CopyBufferToImage`` from the claimed ring
+slot without a CPU color conversion or NumPy packing fallback.
 
 Hand-off safety: a source is "pending" from the moment the packer takes
 it until the viewer's fence confirms the GPU finished reading it (the

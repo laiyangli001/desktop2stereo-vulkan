@@ -1524,6 +1524,67 @@ class VulkanLocalViewer:
             raise RuntimeError("Vulkan local viewer has not been initialized")
         self.poll_events()
         direct_source = getattr(frame, "viewer_frame_direct", None)
+        native_frame = getattr(frame, "viewer_native", None)
+        if native_frame is not None and direct_source is None:
+            try:
+                from stereo_runtime._fused_warp_mps import pack_target
+
+                output_format = str(
+                    getattr(frame, "output_format", "half_sbs") or "half_sbs"
+                )
+                source_size = getattr(native_frame, "source_size", None)
+                if source_size is None:
+                    source_size = getattr(frame, "output_eye_size", None)
+                if not isinstance(source_size, (tuple, list)) or len(source_size) != 2:
+                    raise RuntimeError("native CoreML result has no source dimensions")
+                target_size = pack_target(
+                    int(source_size[0]), int(source_size[1]), output_format
+                )
+                # Native frames arrive before the first viewer frame has
+                # initialized the transfer ring. Create/register the direct
+                # Vulkan sources before asking the registry for a slot.
+                if (
+                    self._source is None
+                    or self._source.size != tuple(target_size)
+                    or self._source.format != self.source_format
+                ):
+                    self._reset_sources(*target_size)
+                direct_source, direct_view = DIRECT_SINK.acquire(*target_size)
+                if direct_source is None or direct_view is None:
+                    raise RuntimeError("no Vulkan direct staging slot is available")
+                pack_started = time.perf_counter()
+                native_frame.pack(direct_view, target_size, output_format)
+                if self.config.on_breakdown_inc is not None:
+                    self.config.on_breakdown_inc("direct_staging_claim", 1)
+                if self.config.on_breakdown_add_time is not None:
+                    self.config.on_breakdown_add_time(
+                        "local_present_pack", time.perf_counter() - pack_started
+                    )
+                native_frame.release()
+                native_frame = None
+                # The native slot is no longer needed after Metal completed its
+                # write. The Vulkan source now owns the present payload.
+                object.__setattr__(frame, "viewer_frame_direct", direct_source)
+                object.__setattr__(frame, "viewer_native", None)
+            except Exception as exc:
+                if direct_source is not None:
+                    try:
+                        direct_source._release_direct()
+                    except Exception:
+                        pass
+                    direct_source = None
+                if native_frame is not None:
+                    try:
+                        native_frame.release()
+                    except Exception:
+                        pass
+                print(
+                    f"[VulkanLocalViewer] native CoreML present unavailable: {exc}",
+                    flush=True,
+                )
+                if self.config.on_breakdown_inc is not None:
+                    self.config.on_breakdown_inc("native_present_unavailable", 1)
+                return False
         if direct_source is not None and not (
             direct_source is self._source or direct_source in self._direct_sources
         ):
@@ -2136,47 +2197,62 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     viewer: VulkanLocalViewer | None = None
     preview_viewer: VulkanLocalViewer | None = None
     preview_disabled = not bool(config.window_preview)
+    cached_result = None
+    cached_frame = None
     try:
         while not shutdown_event.is_set():
+            reused = False
             try:
-                result, _started = runtime_q.get(timeout=0.05)
-            except queue.Empty:
-                if viewer is not None:
-                    viewer.poll_events()
-                if preview_viewer is not None:
-                    try:
-                        preview_viewer.poll_events()
-                    except StopIteration:
-                        preview_viewer.close()
-                        preview_viewer = None
-                        preview_disabled = True
-                continue
-            if config.on_breakdown_inc is not None:
-                config.on_breakdown_inc("viewer_get", 1)
-            if not bool(getattr(runtime_q, "_d2s_ordered", False)):
-                while True:
-                    try:
-                        candidate = runtime_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    _release_item(result)
-                    result, _started = candidate
-                    if config.on_breakdown_inc is not None:
-                        config.on_breakdown_inc("viewer_get", 1)
-                        config.on_breakdown_inc("viewer_drop", 1)
-            # Pass the whole result when the runtime shipped a host-packed
-            # frame; present() unpacks viewer_frame_np directly.
-            frame = (
-                result
-                if (
-                    getattr(result, "viewer_frame_np", None) is not None
-                    or getattr(result, "viewer_frame_direct", None) is not None
+                result, _started = runtime_q.get(
+                    timeout=0.005 if cached_frame is not None else 0.05
                 )
-                else getattr(result, "sbs", None)
-            )
-            if frame is None:
-                _release_item(result)
-                continue
+            except queue.Empty:
+                if viewer is not None and cached_frame is not None:
+                    # Keep submitting the last valid GPU frame while depth
+                    # inference is producing the next result. This path never
+                    # increments the fresh depth-present counter.
+                    result = cached_result
+                    frame = cached_frame
+                    reused = True
+                else:
+                    if viewer is not None:
+                        viewer.poll_events()
+                    if preview_viewer is not None:
+                        try:
+                            preview_viewer.poll_events()
+                        except StopIteration:
+                            preview_viewer.close()
+                            preview_viewer = None
+                            preview_disabled = True
+                    continue
+            if not reused:
+                if config.on_breakdown_inc is not None:
+                    config.on_breakdown_inc("viewer_get", 1)
+                if not bool(getattr(runtime_q, "_d2s_ordered", False)):
+                    while True:
+                        try:
+                            candidate = runtime_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        _release_item(result)
+                        result, _started = candidate
+                        if config.on_breakdown_inc is not None:
+                            config.on_breakdown_inc("viewer_get", 1)
+                            config.on_breakdown_inc("viewer_drop", 1)
+                # Pass the whole result when the runtime shipped a host-packed
+                # frame; present() unpacks viewer_frame_np directly.
+                frame = (
+                    result
+                    if (
+                        getattr(result, "viewer_frame_np", None) is not None
+                        or getattr(result, "viewer_frame_direct", None) is not None
+                        or getattr(result, "viewer_native", None) is not None
+                    )
+                    else getattr(result, "sbs", None)
+                )
+                if frame is None:
+                    _release_item(result)
+                    continue
             if viewer is None:
                 # Primary: Vulkan. Fallback chain: Metal -> OpenGL (macOS).
                 # Keeps Vulkan as main viewer; Metal/OpenGL are fallbacks when
@@ -2264,10 +2340,14 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
             # counted as presented frames.
             if presented is not False and config.on_breakdown_inc is not None:
                 config.on_breakdown_inc("local_presented_frame", 1)
-                if bool(getattr(result, "depth_complete", False)):
+                if not reused and bool(getattr(result, "depth_complete", False)):
                     config.on_breakdown_inc("local_depth_presented_frame", 1)
+                if reused:
+                    config.on_breakdown_inc("local_reused_presented", 1)
                 if bool(getattr(result, "viewer_frame_direct", None) is not None):
                     config.on_breakdown_inc("local_direct_presented", 1)
+                elif bool(getattr(result, "viewer_native", None) is not None):
+                    config.on_breakdown_inc("local_native_presented", 1)
                 else:
                     config.on_breakdown_inc("local_host_presented", 1)
             if (
@@ -2280,7 +2360,12 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
                         "local_present_interval", presented_at - previous_present
                     )
                 viewer._last_present_timestamp = presented_at
-            if preview_viewer is not None:
+            if presented is not False and not reused and cached_result is not result:
+                if cached_result is not None:
+                    _release_item(cached_result)
+                cached_result = result
+                cached_frame = frame
+            if preview_viewer is not None and not reused:
                 preview_frame = depth_preview_frame(result)
                 if preview_frame is None:
                     continue
@@ -2306,6 +2391,8 @@ def run_vulkan_local_viewer(*, runtime_q: Any, shutdown_event: Any, config: Vulk
     except StopIteration:
         shutdown_event.set()
     finally:
+        if cached_result is not None:
+            _release_item(cached_result)
         if preview_viewer is not None:
             preview_viewer.close()
         if viewer is not None:

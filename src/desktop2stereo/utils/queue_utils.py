@@ -8,18 +8,33 @@ def _release_item(item: Any) -> None:
     """Release an optional borrowed capture resource before dropping an item."""
     if isinstance(item, tuple) and len(item) == 2:
         item = item[0]
-    resource = getattr(item, "native_resource", None)
-    release = getattr(resource, "release", None)
-    if callable(release):
-        try:
-            release()
-        except Exception:
-            pass
+    released_ids = set()
+    for resource in (
+        getattr(item, "native_resource", None),
+        getattr(item, "sck_zero_copy", None),
+    ):
+        resource_id = id(resource)
+        if resource is None or resource_id in released_ids:
+            continue
+        released_ids.add(resource_id)
+        release = getattr(resource, "release", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:
+                pass
     direct = getattr(item, "viewer_frame_direct", None)
     release_direct = getattr(direct, "_release_direct", None)
     if callable(release_direct):
         try:
             release_direct()
+        except Exception:
+            pass
+    native = getattr(item, "viewer_native", None)
+    release_native = getattr(native, "release", None)
+    if callable(release_native):
+        try:
+            release_native()
         except Exception:
             pass
 

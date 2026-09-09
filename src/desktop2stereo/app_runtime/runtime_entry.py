@@ -615,6 +615,11 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
         # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
         # the warp viewer can sample the capture directly (zero-copy).
         os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
+        # Native Core ML consumes the IOSurface directly. The capture callback
+        # therefore skips its CPU base-address read; it re-materializes only
+        # if the bridge capability preflight fails.
+        if bool(settings.get("CoreML", False)):
+            os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
     elif configured_run_mode in {"Local Viewer", "Viewer"}:
         # The Vulkan local viewer consumes GPU RGBA8 directly.  Pack on the
         # producer GPU so the external buffer transfers 1 byte/channel rather

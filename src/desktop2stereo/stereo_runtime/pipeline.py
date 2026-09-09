@@ -303,6 +303,7 @@ class RuntimePipelineContext:
     output_transport: str | None = None
     settings_update_q: object | None = None
     render_size_config: RenderSizeConfig | None = None
+    capture_size_hint: tuple[int, int] | None = None
     runtime_config: object | None = None
     openxr_presenter_pressure: Callable[[], bool] | None = None
 
@@ -568,6 +569,7 @@ def _capture_debug_fields(captured_frame: CapturedFrame | None, frame_rgb) -> di
         fields.update(
             capture_tool=captured_frame.capture_tool,
             capture_mode=captured_frame.capture_mode,
+            capture_frame_status=metadata.get("capture_frame_status"),
             capture_frame_raw_device=captured_frame.frame_raw_device,
             capture_frame_raw_type=captured_frame.frame_raw_type,
             capture_frame_raw_dtype=captured_frame.frame_raw_dtype,
@@ -1021,6 +1023,8 @@ class RuntimePipelineLoop:
         self._logged_rgb_shape = False
         self._logged_drop_only = False
         self._last_render_size = None
+        self._native_preflight_size = None
+        self._native_preflight_ready = False
         self._last_source_target_key = None
         self._has_source_target_key = False
         self._last_cuda_ready_event = None
@@ -1055,6 +1059,12 @@ class RuntimePipelineLoop:
         stereo_reason = str(
             getattr(runtime, "_stereo_compute_backend_reason", "") or ""
         )
+        native_coreml_vulkan = bool(
+            debug_info.get("native_coreml_io")
+            and str(debug_info.get("runtime_output_pack_backend", "")).startswith(
+                "native_coreml_metal_vulkan"
+            )
+        )
         fallback_reasons = []
         if provider_report.get("fallback_reason"):
             fallback_reasons.append(str(provider_report["fallback_reason"]))
@@ -1070,7 +1080,7 @@ class RuntimePipelineLoop:
         )
         if stereo_reason and stereo_reason not in {"selected_by_priority", "explicit_request"} and not (
             mac_fused_viewer and stereo_reason == "not_resolved"
-        ):
+        ) and not (native_coreml_vulkan and stereo_reason == "not_resolved"):
             fallback_reasons.append(stereo_reason)
         gpu_copy_count = debug_info.get("capture_gpu_copy_count")
         try:
@@ -1090,11 +1100,14 @@ class RuntimePipelineLoop:
         )
         if mac_fused_viewer and stereo_reason == "not_resolved":
             stereo_backend = "mps_fused_vulkan"
+        if native_coreml_vulkan:
+            stereo_backend = "coreml_metal_vulkan"
         payload = {
             "os": platform.system(),
             "device": str(getattr(getattr(runtime, "config", None), "device", "")),
             "capture_mode": debug_info.get("capture_mode"),
             "capture_tool": debug_info.get("capture_tool"),
+            "capture_frame_status": debug_info.get("capture_frame_status"),
             "depth_backend": provider_report.get(
                 "depth_backend",
                 debug_info.get("depth_backend_resolved", debug_info.get("runtime_depth_backend", "unknown")),
@@ -1102,9 +1115,15 @@ class RuntimePipelineLoop:
             "stereo_backend": stereo_backend,
             "stereo_backend_reason": (
                 "mps_fused_vulkan" if mac_fused_viewer and stereo_reason == "not_resolved"
+                else "native_coreml_metal_vulkan_gpu_warp_host_handoff" if native_coreml_vulkan
                 else stereo_reason or "not_reported"
             ),
             "fallback": bool(attempts or fallback_reasons),
+            "coreml_fallback": bool(
+                not native_coreml_vulkan
+                or provider_report.get("depth_backend") != "coreml"
+                or provider_report.get("fallback_reason")
+            ),
             "fallback_reasons": fallback_reasons,
             "adapter_luid": debug_info.get("capture_adapter_luid"),
             "adapter_uuid": debug_info.get("capture_adapter_uuid"),
@@ -1129,6 +1148,22 @@ class RuntimePipelineLoop:
                 debug_info.get("directml_zero_copy_ready", False)
             ),
             "directml_resource_mode": debug_info.get("directml_resource_mode"),
+            "coreml_input_shared": int(bool(debug_info.get("native_coreml_input_shared", False))),
+            "coreml_output_backing_used": int(
+                bool(debug_info.get("native_coreml_output_backing", False))
+            ),
+            "coreml_output_zero_copy": int(
+                bool(debug_info.get("native_coreml_output_zero_copy", False))
+            ),
+            "metal_vulkan_alias": bool(
+                debug_info.get("native_coreml_metal_vulkan_alias", False)
+            ),
+            "metal_vulkan_host_handoff_copy_count": int(
+                debug_info.get("native_coreml_host_handoff_copy_count", 0) or 0
+            ),
+            "metal_vulkan_gpu_copy_count": int(
+                debug_info.get("native_coreml_gpu_copy_count", 0) or 0
+            ),
         }
         try:
             print(
@@ -1298,6 +1333,31 @@ class RuntimePipelineLoop:
         load = getattr(self.context.stereo_runtime, "load", None)
         if callable(load):
             load()
+        # Build the native Core ML bridge before capture starts when the
+        # configured render size is fixed.  Bridge/model creation can take
+        # seconds on the first run and must not consume the live-frame budget.
+        ctx = self.context
+        render_config = getattr(ctx, "render_size_config", None)
+        native_ready = getattr(ctx.stereo_runtime, "native_coreml_io_ready", None)
+        if (
+            platform.system() == "Darwin"
+            and ctx.run_mode in {"Local Viewer", "Viewer"}
+            and callable(native_ready)
+            and render_config is not None
+        ):
+            capture_hint = getattr(ctx, "capture_size_hint", None)
+            try:
+                native_preflight_key = resolve_render_size(capture_hint, render_config)
+            except (TypeError, ValueError):
+                native_preflight_key = None
+            if native_preflight_key is not None and min(native_preflight_key) > 0:
+                native_preflight_start = time.perf_counter()
+                self._native_preflight_ready = bool(native_ready(native_preflight_key))
+                ctx.breakdown_add_time(
+                    "rt_native_preflight",
+                    time.perf_counter() - native_preflight_start,
+                )
+                self._native_preflight_size = native_preflight_key
         self._ensure_parallel_depth_scheduler()
         self._prepared = True
 
@@ -1396,6 +1456,7 @@ class RuntimePipelineLoop:
         ctx = self.context
         while not ctx.shutdown_event.is_set():
             ctx.log_source_health()
+            native_sck = False
             try:
                 diag_stage = _runtime_diag_stage()
                 if ctx.shutdown_event.is_set():
@@ -1472,16 +1533,63 @@ class RuntimePipelineLoop:
                 self._last_source_target_key = source_target_key
                 self._has_source_target_key = True
                 frame_input = _prepare_frame_input(ctx, captured_frame, frame_raw)
-                frame_rgb = ctx.capture_frame_to_rgb(
-                    frame_input,
-                    render_size,
-                    device=ctx.device,
-                    use_torch=ctx.use_cudart,
-                    output="tensor",
-                    frame_raw_device=captured_frame.frame_raw_device if captured_frame else None,
-                    capture_copy_mode=_capture_copy_mode(captured_frame),
-                    capture_zero_copy=_capture_zero_copy(captured_frame),
+                native_sck = bool(
+                    captured_frame is not None
+                    and frame_raw is None
+                    and getattr(captured_frame, "sck_zero_copy", None) is not None
+                    and ctx.run_mode in {"Local Viewer", "Viewer"}
                 )
+                native_ready = False
+                if native_sck and callable(
+                    getattr(ctx.stereo_runtime, "native_coreml_io_ready", None)
+                ):
+                    native_preflight_key = (int(render_size[0]), int(render_size[1]))
+                    if native_preflight_key != self._native_preflight_size:
+                        native_preflight_start = time.perf_counter()
+                        self._native_preflight_ready = bool(
+                            ctx.stereo_runtime.native_coreml_io_ready(render_size)
+                        )
+                        ctx.breakdown_add_time(
+                            "rt_native_preflight",
+                            time.perf_counter() - native_preflight_start,
+                        )
+                        self._native_preflight_size = native_preflight_key
+                    native_ready = self._native_preflight_ready
+                if native_sck and not native_ready and not getattr(self, "_native_preflight_logged", False):
+                    self._native_preflight_logged = True
+                    provider = getattr(ctx.stereo_runtime, "depth_provider", None)
+                    info = getattr(provider, "info", None)
+                    print(
+                        "[RuntimePipeline] native CoreML preflight unavailable: "
+                        f"reason={getattr(info, 'native_io_reason', None)!r}",
+                        flush=True,
+                    )
+                if native_ready:
+                    import torch
+
+                    frame_rgb = torch.empty(
+                        (1, 3, int(render_size[1]), int(render_size[0])),
+                        device="meta",
+                        dtype=torch.float32,
+                    )
+                    setattr(frame_rgb, "_d2s_preprocess_backend", "native_coreml_metal")
+                else:
+                    if native_sck:
+                        # Capability preflight failed, so make the explicitly
+                        # retained IOSurface available to the existing Python
+                        # Core ML path instead of silently producing blanks.
+                        frame_input = captured_frame.sck_zero_copy.to_cpu_frame()
+                        native_sck = False
+                    frame_rgb = ctx.capture_frame_to_rgb(
+                        frame_input,
+                        render_size,
+                        device=ctx.device,
+                        use_torch=ctx.use_cudart,
+                        output="tensor",
+                        frame_raw_device=captured_frame.frame_raw_device if captured_frame else None,
+                        capture_copy_mode=_capture_copy_mode(captured_frame),
+                        capture_zero_copy=_capture_zero_copy(captured_frame),
+                    )
                 if not self._logged_rgb_shape and os.environ.get('D2S_DEBUG', '0') in ('1', 'true', 'yes', 'on'):
                     self._logged_rgb_shape = True
                     print(
@@ -1551,7 +1659,15 @@ class RuntimePipelineLoop:
 
                 runtime_start_time = time.perf_counter()
                 prepare_start_time = time.perf_counter()
-                runtime_rgb = ctx.prepare_rgb_for_stereo_runtime(frame_rgb, device=ctx.device)
+                if native_sck:
+                    # The native bridge consumes the IOSurface and only needs
+                    # the shape placeholder for runtime metadata. Copying a
+                    # meta tensor to MPS here would defeat the native path.
+                    runtime_rgb = frame_rgb
+                else:
+                    runtime_rgb = ctx.prepare_rgb_for_stereo_runtime(
+                        frame_rgb, device=ctx.device
+                    )
                 ctx.breakdown_add_time("rt_prepare", time.perf_counter() - prepare_start_time)
                 # Native TensorRT may create its engine lazily after the first
                 # input shape is known. Re-check here so slot_count=2 can
@@ -1678,12 +1794,55 @@ class RuntimePipelineLoop:
                         if original_stereo_config is not None:
                             ctx.stereo_runtime.stereo_config = original_stereo_config
                 else:
-                    runtime_result = ctx.stereo_runtime.process_rgb_frame(
-                        runtime_rgb,
-                        skip_sbs_output=False,
-                        depth_profile=depth_profile,
-                        pixel_buffer=getattr(captured_frame, "sck_zero_copy", None),
-                    )
+                    native_capture = getattr(captured_frame, "sck_zero_copy", None)
+                    try:
+                        runtime_result = ctx.stereo_runtime.process_rgb_frame(
+                            runtime_rgb,
+                            skip_sbs_output=False,
+                            depth_profile=depth_profile,
+                            pixel_buffer=native_capture,
+                            capture_frame_id=(
+                                captured_frame.metadata.get("capture_frame_id")
+                                if captured_frame is not None
+                                and isinstance(captured_frame.metadata, dict)
+                                else None
+                            ),
+                        )
+                    except Exception:
+                        if not native_sck or native_capture is None:
+                            raise
+                        # Native capability can change after a successful
+                        # preflight (driver/resource pressure). Materialize
+                        # this retained frame once, release its native lease,
+                        # and retry through the existing Python Core ML path.
+                        frame_raw = native_capture.to_cpu_frame()
+                        native_capture.release()
+                        frame_rgb = ctx.capture_frame_to_rgb(
+                            frame_raw,
+                            render_size,
+                            device=ctx.device,
+                            use_torch=ctx.use_cudart,
+                            output="tensor",
+                            frame_raw_device="cpu",
+                            capture_copy_mode="cpu_fallback",
+                            capture_zero_copy=False,
+                        )
+                        runtime_rgb = ctx.prepare_rgb_for_stereo_runtime(
+                            frame_rgb, device=ctx.device
+                        )
+                        native_sck = False
+                        runtime_result = ctx.stereo_runtime.process_rgb_frame(
+                            runtime_rgb,
+                            skip_sbs_output=False,
+                            depth_profile=None,
+                            pixel_buffer=None,
+                            capture_frame_id=(
+                                captured_frame.metadata.get("capture_frame_id")
+                                if captured_frame is not None
+                                and isinstance(captured_frame.metadata, dict)
+                                else None
+                            ),
+                        )
                 ctx.breakdown_add_time("rt_call", time.perf_counter() - runtime_call_start_time)
                 _attach_pipeline_debug(
                     runtime_result,
@@ -1814,6 +1973,22 @@ class RuntimePipelineLoop:
             except (RuntimeSettingsPipelineRebuildRequired, RuntimeSettingsRestartRequired):
                 raise
             except Exception as exc:
+                if native_sck and type(exc).__name__ == "NativeCoreMLBusy":
+                    # The native ring is deliberately bounded. Drop this
+                    # stale capture while the presenter drains an older
+                    # native result; never materialize a CPU color frame just
+                    # to recover from transient native backpressure.
+                    native_capture = getattr(
+                        locals().get("captured_frame"), "sck_zero_copy", None
+                    )
+                    if native_capture is not None:
+                        try:
+                            native_capture.release()
+                        except Exception:
+                            pass
+                    ctx.breakdown_inc("native_io_busy")
+                    ctx.source_stat_inc("native_io_busy")
+                    continue
                 self._consecutive_runtime_errors += 1
                 fatal_error = _is_fatal_runtime_preparation_error(exc)
                 ctx.source_stat_inc(

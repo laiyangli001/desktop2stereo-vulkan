@@ -7,7 +7,7 @@ from .platform_env import configure_platform_environment
 from .settings import load_settings
 
 
-def _normalize_legacy_settings(settings: dict) -> dict:
+def _normalize_legacy_settings(settings: dict, *, os_name: str | None = None) -> dict:
     """Expose the flat settings contract while the new schema is being migrated."""
     if "Stream Quality" in settings:
         return settings
@@ -54,7 +54,7 @@ def _normalize_legacy_settings(settings: dict) -> dict:
         "Recompile TensorRT": False,
         "MIGraphX": False,
         "Recompile MIGraphX": False,
-        "CoreML": False,
+        "CoreML": os_name == "Darwin",
         "Recompile CoreML": False,
         "OpenVINO": False,
         "Recompile OpenVINO": False,
@@ -106,7 +106,7 @@ def _normalize_legacy_settings(settings: dict) -> dict:
 
 
 def bootstrap_settings(path: str, *, os_name: str) -> dict:
-    settings = _normalize_legacy_settings(load_settings(path))
+    settings = _normalize_legacy_settings(load_settings(path), os_name=os_name)
     configure_platform_environment(os_name)
     configure_huggingface_endpoint()
     if str(settings.get("Debug Mode", False) or False).strip().lower() in ("1", "true", "yes", "on"):

@@ -10,7 +10,11 @@ import cv2
 import objc
 from Foundation import NSObject
 from Quartz import CoreVideo as CV
-from CoreMedia import CMTimeMake, CMSampleBufferGetImageBuffer
+from CoreMedia import (
+    CMTimeMake,
+    CMSampleBufferGetImageBuffer,
+    CMSampleBufferGetSampleAttachmentsArray,
+)
 from AppKit import NSScreen
 
 # Optional Metal zero-copy path (Milestone 2)
@@ -126,20 +130,40 @@ class _OwnedSCKFrame:
     them, so frames dropped anywhere along the queue chain cannot leak.
     """
 
-    __slots__ = ("texture", "pixel_buffer", "_released")
+    __slots__ = ("texture", "pixel_buffer", "frame_status", "_released")
 
-    def __init__(self, cv_texture, pixel_buffer):
+    def __init__(self, cv_texture, pixel_buffer, frame_status=None):
         self.texture = cv_texture
         self.pixel_buffer = pixel_buffer
+        self.frame_status = frame_status
         self._released = False
         CV.CVPixelBufferRetain(pixel_buffer)
-        cv_texture.retain()
+        if cv_texture is not None:
+            cv_texture.retain()
 
     def mtl_texture(self):
         """Return the live MTLTexture (BGRA8Unorm), or None after release."""
         if self._released or self.texture is None:
             return None
         return CV.CVMetalTextureGetTexture(self.texture)
+
+    def to_cpu_frame(self):
+        """Materialize BGRA bytes only for an explicit native-path fallback."""
+        if self._released or self.pixel_buffer is None:
+            raise RuntimeError("ScreenCaptureKit frame is no longer available")
+        w = CV.CVPixelBufferGetWidth(self.pixel_buffer)
+        h = CV.CVPixelBufferGetHeight(self.pixel_buffer)
+        bpr = CV.CVPixelBufferGetBytesPerRow(self.pixel_buffer)
+        size = bpr * h
+        CV.CVPixelBufferLockBaseAddress(self.pixel_buffer, 0)
+        try:
+            address = CV.CVPixelBufferGetBaseAddress(self.pixel_buffer)
+            frame = np.frombuffer(address.as_buffer(size), dtype=np.uint8).reshape(h, bpr)
+            if bpr != w * 4:
+                return np.ascontiguousarray(frame[:, : w * 4].reshape(h, w, 4))
+            return frame.reshape(h, w, 4).copy()
+        finally:
+            CV.CVPixelBufferUnlockBaseAddress(self.pixel_buffer, 0)
 
     def release(self):
         if self._released:
@@ -174,6 +198,7 @@ class _SCKFrameReceiver(NSObject):
         self._latest_owned = None
         self._latest_texture_size = (0, 0)
         self._frame_count = 0
+        self._frame_status_counts = {}
         self._texture_diag_logged = False
         self._condition = threading.Condition(self._lock)
         return self
@@ -185,6 +210,26 @@ class _SCKFrameReceiver(NSObject):
             imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
             if imageBuffer is None:
                 return
+            frame_status = None
+            try:
+                attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, False)
+                if attachments:
+                    status = attachments[0].get(SCK.SCStreamFrameInfoStatus)
+                    if status is not None:
+                        frame_status = int(status)
+            except Exception:
+                # Status is diagnostic only; an OS-version-specific attachment
+                # shape must never discard an otherwise valid IOSurface.
+                frame_status = None
+            with self._condition:
+                status_key = (
+                    str(frame_status)
+                    if frame_status is not None
+                    else "unknown"
+                )
+                self._frame_status_counts[status_key] = (
+                    self._frame_status_counts.get(status_key, 0) + 1
+                )
 
             # Zero-copy Metal texture path (survey doc milestone 5): every
             # frame is wrapped as an owned CVPixelBuffer+CVMetalTexture pair
@@ -193,7 +238,28 @@ class _SCKFrameReceiver(NSObject):
             # D2S_SCK_ZEROCOPY_TEX=0 reverts to v2.5 parity (CPU readout only;
             # the old D2S_SCK_METAL_TEXTURE_DIAG=1 diagnostic still prints).
             zc_enabled = os.environ.get("D2S_SCK_ZEROCOPY_TEX", "1") != "0"
+            native_only = os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
             diag_enabled = os.environ.get("D2S_SCK_METAL_TEXTURE_DIAG") == "1"
+            if native_only and zc_enabled:
+                # Native Core ML creates the CVMetalTexture from this same
+                # IOSurface at consumption time. Avoid wrapping it once here
+                # and again in the bridge on the SCK callback thread.
+                owned = _OwnedSCKFrame(None, imageBuffer, frame_status)
+                replaced = None
+                with self._condition:
+                    replaced = self._latest_owned
+                    self._latest_owned = owned
+                    self._latest_texture_size = (
+                        CV.CVPixelBufferGetWidth(imageBuffer),
+                        CV.CVPixelBufferGetHeight(imageBuffer),
+                    )
+                    self._frame_count += 1
+                    self._condition.notify_all()
+                if replaced is not None:
+                    replaced.release()
+                return
             if (
                 (zc_enabled or (diag_enabled and self._frame_count == 0))
                 and _get_metal_device() is not None
@@ -229,7 +295,7 @@ class _SCKFrameReceiver(NSObject):
                                         flush=True,
                                     )
                                 if zc_enabled:
-                                    owned = _OwnedSCKFrame(cv_tex, imageBuffer)
+                                    owned = _OwnedSCKFrame(cv_tex, imageBuffer, frame_status)
                                     replaced = None
                                     with self._condition:
                                         replaced = self._latest_owned
@@ -254,6 +320,10 @@ class _SCKFrameReceiver(NSObject):
                             flush=True,
                         )
 
+            # The native Core ML bridge consumes the retained IOSurface
+            # directly. Do not map/read the same 8 MB frame on the CPU when
+            # the zero-copy lease was established successfully. If the
+            # bridge later rejects this frame, it can call to_cpu_frame().
             w = CV.CVPixelBufferGetWidth(imageBuffer)
             h = CV.CVPixelBufferGetHeight(imageBuffer)
             bpr = CV.CVPixelBufferGetBytesPerRow(imageBuffer)
@@ -297,9 +367,20 @@ class _SCKFrameReceiver(NSObject):
         memcpy per frame; D2S_SCK_LATEST_FRAME_COPY=1 restores it.
         """
         defensive_copy = os.environ.get("D2S_SCK_LATEST_FRAME_COPY") == "1"
+        native_only = os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
         with self._condition:
-            if self._latest_frame is None and timeout > 0:
+            if (
+                self._latest_frame is None
+                and (not native_only or self._latest_owned is None)
+                and timeout > 0
+            ):
                 self._condition.wait(timeout=timeout)
+            # Native-only callers take ownership through take_latest_zero_copy()
+            # immediately after this wake-up. Do not expose or copy a CPU frame.
+            if native_only:
+                return None
             if self._latest_frame is not None:
                 if defensive_copy:
                     return self._latest_frame.copy()
@@ -315,13 +396,20 @@ class _SCKFrameReceiver(NSObject):
         with self._condition:
             return self._latest_mtl_texture, self._latest_texture_size
 
-    def take_latest_zero_copy(self):
+    def take_latest_zero_copy(self, timeout=0.0):
         """Transfer the newest owned zero-copy frame, or None.
 
         Ownership of the +1 refs moves to the caller; it must call
         ``release()`` when done drawing (or let GC do it).
         """
         with self._condition:
+            if self._latest_owned is None and timeout > 0.0:
+                deadline = time.monotonic() + float(timeout)
+                while self._latest_owned is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0.0:
+                        break
+                    self._condition.wait(timeout=remaining)
             owned = self._latest_owned
             self._latest_owned = None
         return owned
@@ -329,6 +417,11 @@ class _SCKFrameReceiver(NSObject):
     @property
     def frame_count(self):
         return self._frame_count
+
+    @property
+    def frame_status_counts(self):
+        with self._condition:
+            return dict(self._frame_status_counts)
 
 class DesktopGrabber:
     def __init__(self, output_resolution=1080, fps=60, window_title=None,
@@ -409,6 +502,18 @@ class DesktopGrabber:
         config.setShowsCursor_(self.with_cursor)
         config.setPixelFormat_(CV.kCVPixelFormatType_32BGRA)
         config.setMinimumFrameInterval_(CMTimeMake(1, max(1, self.fps)))
+        # Keep the SCK producer low-latency. A bounded queue prevents retained
+        # IOSurfaces from back-pressuring the display stream. The default
+        # depth 3 is the ScreenCaptureKit setting verified on this host;
+        # lower values remain an explicit diagnostic override.
+        if hasattr(config, "setQueueDepth_"):
+            try:
+                queue_depth = max(
+                    1, min(8, int(os.environ.get("D2S_SCK_QUEUE_DEPTH", "3")))
+                )
+            except (TypeError, ValueError):
+                queue_depth = 3
+            config.setQueueDepth_(queue_depth)
 
         self._receiver = _SCKFrameReceiver.alloc().init()
         self._stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(
@@ -471,6 +576,10 @@ class DesktopGrabber:
         frame = self._receiver.get_latest_frame(timeout=1.0 / max(1, self.fps))
 
         if frame is None:
+            if os.environ.get("D2S_SCK_NATIVE_ONLY", "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }:
+                return None, (int(self.width), int(self.height))
             if self._last_frame is not None:
                 return self._last_frame.copy(), self.scaled_height
             h = self.scaled_height
@@ -496,6 +605,22 @@ class DesktopGrabber:
         if receiver is None:
             return None
         return receiver.take_latest_zero_copy()
+
+    def grab_native_zero_copy(self, timeout=0.0):
+        """Atomically wait for and take the newest retained IOSurface."""
+        self._update_window_filter()
+        receiver = self._receiver
+        if receiver is None:
+            return None, (int(self.width), int(self.height))
+        owned = receiver.take_latest_zero_copy(timeout=timeout)
+        return owned, (int(self.width), int(self.height))
+
+    @property
+    def frame_status_counts(self):
+        receiver = self._receiver
+        if receiver is None:
+            return {}
+        return receiver.frame_status_counts
 
     def stop(self):
         if self._stream is not None:

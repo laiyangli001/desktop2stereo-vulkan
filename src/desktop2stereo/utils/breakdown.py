@@ -44,6 +44,14 @@ LATEST_KEYS = {
     "rt_depth_nonfinite_count",
     "rt_depth_model_ms",
     "rt_depth_slot_wait_ms",
+    "rt_native_io",
+    "rt_native_input_shared",
+    "rt_native_output_backing",
+    "rt_native_output_zero_copy",
+    "rt_native_nonfinite_count",
+    "rt_metal_vulkan_alias",
+    "rt_metal_vulkan_host_handoff_copy_count",
+    "rt_metal_vulkan_gpu_copy_count",
     "rt_synthesis_ms",
     "rt_total_ms",
     "openxr_async_effects_enabled",
@@ -114,6 +122,7 @@ class FPSBreakdown:
             "viewer_drop": 0,
             "local_presented_frame": 0,
             "local_depth_presented_frame": 0,
+            "local_reused_presented": 0,
             "local_direct_presented": 0,
             "local_host_presented": 0,
             "loops": 0,
@@ -223,6 +232,28 @@ class FPSBreakdown:
             self.stats["rt_depth_backend"] = str(debug.get("runtime_depth_backend", "unknown"))
             self.stats["rt_depth_nonfinite_count"] = int(
                 timing.get("depth_nonfinite_count", 0) or 0
+            )
+            self.stats["rt_native_io"] = int(bool(debug.get("native_coreml_io", False)))
+            self.stats["rt_native_input_shared"] = int(
+                bool(debug.get("native_coreml_input_shared", False))
+            )
+            self.stats["rt_native_output_backing"] = int(
+                bool(debug.get("native_coreml_output_backing", False))
+            )
+            self.stats["rt_native_output_zero_copy"] = int(
+                bool(debug.get("native_coreml_output_zero_copy", False))
+            )
+            self.stats["rt_native_nonfinite_count"] = int(
+                debug.get("native_coreml_nonfinite_count", 0) or 0
+            )
+            self.stats["rt_metal_vulkan_alias"] = int(
+                bool(debug.get("native_coreml_metal_vulkan_alias", False))
+            )
+            self.stats["rt_metal_vulkan_host_handoff_copy_count"] = int(
+                debug.get("native_coreml_host_handoff_copy_count", 0) or 0
+            )
+            self.stats["rt_metal_vulkan_gpu_copy_count"] = int(
+                debug.get("native_coreml_gpu_copy_count", 0) or 0
             )
             self.stats["rt_depth_slot"] = (
                 debug.get("runtime_depth_execution_slot")
@@ -388,12 +419,16 @@ class FPSBreakdown:
             f"viewer_drop={rate('viewer_drop'):.1f} "
             f"local_present={rate('local_presented_frame'):.1f} "
             f"depth_present={rate('local_depth_presented_frame'):.1f} "
+            f"reused_present={rate('local_reused_presented'):.1f} "
             f"direct_present={rate('local_direct_presented'):.1f} "
+            f"native_present={rate('local_native_presented'):.1f} "
             f"host_present={rate('local_host_presented'):.1f} "
             f"direct_claim={rate('direct_staging_claim'):.1f} "
             f"direct_fallback={rate('direct_staging_fallback'):.1f} "
             f"direct_error={rate('direct_staging_error'):.1f} "
             f"direct_pack_error={rate('direct_staging_pack_error'):.1f} "
+            f"native_present_unavailable={rate('native_present_unavailable'):.1f} "
+            f"native_io_busy={rate('native_io_busy'):.1f} "
             f"packer_drop={rate('packer_drop'):.1f} "
             f"local_present_ms={avg_ms('local_present'):.2f}ms "
             f"present_interval_p50={timing_stat('local_present_interval', 0.50):.2f}ms "
@@ -595,6 +630,7 @@ class FPSBreakdown:
             f"vk_convert_max={timing_max('openxr_vulkan_output_convert'):.2f}ms "
             f"rt_loop={avg_ms('rt_loop'):.2f}ms "
             f"rt_cap2rgb={avg_ms('rt_cap2rgb'):.2f}ms "
+            f"rt_native_preflight={avg_ms('rt_native_preflight'):.2f}ms "
             f"rt_prepare={avg_ms('rt_prepare'):.2f}ms "
             f"pre={stats.get('rt_preprocess_backend', 'unknown')} "
             f"rt_call={avg_ms('rt_call'):.2f}ms "
@@ -626,6 +662,14 @@ class FPSBreakdown:
             f"rt_model={stats.get('rt_depth_model_ms', 0.0):.2f}ms "
             f"rt_post={stats.get('rt_depth_postprocess_ms', 0.0):.2f}ms "
             f"depth_nonfinite={int(stats.get('rt_depth_nonfinite_count', 0))} "
+            f"native_io={int(stats.get('rt_native_io', 0))} "
+            f"native_input_shared={int(stats.get('rt_native_input_shared', 0))} "
+            f"native_output_backing={int(stats.get('rt_native_output_backing', 0))} "
+            f"native_output_zero_copy={int(stats.get('rt_native_output_zero_copy', 0))} "
+            f"native_nonfinite={int(stats.get('rt_native_nonfinite_count', 0))} "
+            f"metal_vulkan_alias={int(stats.get('rt_metal_vulkan_alias', 0))} "
+            f"metal_vulkan_handoff_copies={int(stats.get('rt_metal_vulkan_host_handoff_copy_count', 0))} "
+            f"metal_vulkan_gpu_copies={int(stats.get('rt_metal_vulkan_gpu_copy_count', 0))} "
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "

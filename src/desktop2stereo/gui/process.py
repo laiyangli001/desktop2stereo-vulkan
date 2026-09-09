@@ -16,7 +16,13 @@ import traceback
 import flet as ft
 from utils import OS_NAME, DEFAULT_PORT, shutdown_event, read_yaml
 from . import devices as devices_module
-from .config import DEFAULTS, DEFAULT_MODEL_LIST, default_base_depth_model, save_yaml
+from .config import (
+    DEFAULTS,
+    DEFAULT_MODEL_LIST,
+    default_base_depth_model,
+    default_coreml_enabled,
+    save_yaml,
+)
 from .paths import (
     BASE_DIR,
     DIAG_LOG,
@@ -2208,6 +2214,7 @@ class GUIProcessMixin:
             if "Distill-Any-Depth-Base" in DEFAULT_MODEL_LIST
             else default_base_depth_model()
         )
+        dynamic_defaults["CoreML"] = default_coreml_enabled(OS_NAME)
         # Reset uses the Cinema preset with hole filling disabled.
         dynamic_defaults["Hole Fill Mode"] = "none"
         dynamic_defaults["Run Mode"] = getattr(self, "run_mode_key", "Local Viewer")

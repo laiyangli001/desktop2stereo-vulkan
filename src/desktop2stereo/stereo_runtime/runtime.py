@@ -42,9 +42,11 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DepthRuntimeResult:
-    depth: torch.Tensor
+    depth: Any
     timing: dict[str, float] = field(default_factory=dict)
     provider_info: dict[str, Any] = field(default_factory=dict)
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
 
 
 class DepthRuntime:
@@ -75,6 +77,18 @@ class DepthRuntime:
         if callable(load):
             load()
         self._loaded = True
+
+    def native_coreml_io_ready(self, size: tuple[int, int] | list[int]) -> bool:
+        """Return whether the macOS native Core ML bridge is ready for size."""
+        if not isinstance(size, (tuple, list)) or len(size) != 2:
+            return False
+        checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(int(size[0]), int(size[1])))
+        except Exception:
+            return False
 
     def set_inference_active(self, active: bool) -> None:
         self._active = bool(active)
@@ -128,9 +142,43 @@ class DepthRuntime:
         self.last_timing = timing
         self.last_memory = memory
         self.stats.update(timing, memory)
-        return DepthRuntimeResult(depth=profile.depth, timing=timing, provider_info=self.provider_report())
+        return DepthRuntimeResult(
+            depth=profile.depth,
+            timing=timing,
+            provider_info=self.provider_report(),
+            native_resource_handle=getattr(profile, "native_resource_handle", None),
+            native_zero_copy=bool(getattr(profile, "native_zero_copy", False)),
+        )
 
-    def _predict_depth_profile(self, rgb_frame: torch.Tensor) -> DepthProfileResult:
+    def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        if native_capture is not None and capture_frame_id is not None:
+            native_predict = getattr(self.depth_provider, "predict_profile_native", None)
+            if callable(native_predict):
+                try:
+                    native_result = native_predict(
+                        rgb_frame, native_capture, int(capture_frame_id)
+                    )
+                    if isinstance(native_result, DepthProfileResult):
+                        return native_result
+                except Exception as exc:
+                    self._native_io_last_error = f"{type(exc).__name__}: {exc}"
+                    if type(exc).__name__ == "NativeCoreMLBusy":
+                        raise
+                    if not getattr(self, "_native_io_error_logged", False):
+                        self._native_io_error_logged = True
+                        print(
+                            f"[CoreMLNativeIO] prediction failed; using Python fallback: "
+                            f"{self._native_io_last_error}",
+                            flush=True,
+                        )
+                    if getattr(rgb_frame, "device", None) is not None and rgb_frame.device.type == "meta":
+                        raise
         predict_profile = getattr(self.depth_provider, "predict_profile", None)
         if callable(predict_profile):
             result = predict_profile(rgb_frame)
@@ -193,7 +241,7 @@ class DepthRuntime:
 
 @dataclass(frozen=True)
 class StereoRuntimeResult:
-    depth: torch.Tensor
+    depth: Any
     left_eye: torch.Tensor
     right_eye: torch.Tensor
     sbs: torch.Tensor
@@ -217,6 +265,14 @@ class StereoRuntimeResult:
     # mapped staging pages. Kept as a dataclass field so dataclasses.replace()
     # in the packer does not discard the ownership token.
     viewer_frame_direct: Any | None = None
+    # Native CoreML/Metal local-viewer result. The bridge owns the capture
+    # texture and normalized model-resolution depth until it is packed or
+    # released by the presenter queue.
+    viewer_native: Any | None = None
+    # Opaque native resource handle and its measured ownership mode. These
+    # fields keep the native handoff explicit for callers and telemetry.
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
     capture_frame_id: int | None = None
     depth_frame_id: int | None = None
     depth_complete: bool = False
@@ -1016,6 +1072,18 @@ class StereoRuntime:
             load()
         self._loaded = True
 
+    def native_coreml_io_ready(self, size: tuple[int, int] | list[int]) -> bool:
+        """Return whether the macOS native Core ML bridge is ready for size."""
+        if not isinstance(size, (tuple, list)) or len(size) != 2:
+            return False
+        checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(int(size[0]), int(size[1])))
+        except Exception:
+            return False
+
     def set_inference_active(self, active: bool) -> None:
         """Pause or resume depth and stereo processing for headset idle state."""
         self._active = bool(active)
@@ -1214,6 +1282,7 @@ class StereoRuntime:
         skip_sbs_output: bool = False,
         depth_profile: DepthProfileResult | None = None,
         pixel_buffer: Any | None = None,
+        capture_frame_id: int | None = None,
     ) -> StereoRuntimeResult:
         if not self._active:
             raise RuntimeError("StereoRuntime inference is paused")
@@ -1230,11 +1299,6 @@ class StereoRuntime:
                 and hasattr(pixel_buffer, "mtl_texture")
             ):
                 viewer_bgra = pixel_buffer
-            else:
-                try:
-                    pixel_buffer.release()
-                except Exception:
-                    pass
 
         self._reset_cuda_peak_if_needed()
         rgb_frame = _validate_runtime_rgb_frame(rgb_frame)
@@ -1243,7 +1307,89 @@ class StereoRuntime:
         _record_cuda_event(cuda_events, "start", rgb_frame)
         total_start = time.perf_counter()
         depth_start = time.perf_counter()
-        profile = depth_profile or self._predict_depth_profile(rgb_frame)
+        profile = depth_profile or self._predict_depth_profile(
+            rgb_frame,
+            native_capture=pixel_buffer,
+            capture_frame_id=capture_frame_id,
+        )
+        native_depth = getattr(profile, "native_depth", None)
+        if native_depth is not None:
+            # The bridge retained the CVPixelBuffer while moving it into its
+            # native slot. Release the capture lease now; the native slot is
+            # released only after the Vulkan transfer has completed.
+            if pixel_buffer is not None:
+                try:
+                    pixel_buffer.release()
+                except Exception:
+                    pass
+            width, height = _runtime_frame_size(rgb_frame) or (0, 0)
+            provider_info = self.provider_report()
+            debug = {
+                "backend": self.stereo_config.backend,
+                "sbs_backend": "native_coreml_metal",
+                "runtime_output_pack_backend": "native_coreml_metal_vulkan_gpu_warp_host_handoff",
+                "runtime_output_dtype": "native",
+                "native_coreml_io": True,
+                "native_coreml_input_shared": int(bool(native_depth.input_shared)),
+                "native_coreml_output_backing": int(
+                    bool(native_depth.output_backing_used)
+                ),
+                "native_coreml_output_zero_copy": int(
+                    bool(native_depth.output_zero_copy)
+                ),
+                # The native warp is GPU-side, but MoltenVK does not expose
+                # its mapped allocation as a Metal MTLBuffer on this host.
+                "native_coreml_metal_vulkan_alias": 0,
+                "native_coreml_host_handoff_copy_count": 1,
+                "native_coreml_gpu_copy_count": 1,
+                "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
+                "native_coreml_normalize_lo": float(native_depth.normalize_lo),
+                "native_coreml_normalize_hi": float(native_depth.normalize_hi),
+                "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
+                "runtime_depth_backend": "coreml",
+            }
+            native_error = getattr(self, "_native_io_last_error", None)
+            if native_error:
+                debug["native_coreml_previous_error"] = str(native_error)
+            timing = {
+                "depth_preprocess_ms": float(profile.preprocess_ms),
+                "depth_model_ms": float(profile.model_ms),
+                "depth_postprocess_ms": float(profile.postprocess_ms),
+                "depth_total_ms": float(profile.total_ms),
+                "synthesis_ms": 0.0,
+                "pack_ms": 0.0,
+                "total_ms": float(profile.total_ms),
+                "depth_nonfinite_count": int(profile.nonfinite_count),
+            }
+            return StereoRuntimeResult(
+                depth=native_depth,
+                left_eye=rgb_frame,
+                right_eye=rgb_frame,
+                sbs=rgb_frame,
+                output_eye_size=(int(width), int(height)),
+                output_display_size=(int(width), int(height)),
+                output_format=str(self.stereo_config.output_format),
+                output_dtype="native",
+                output_pack_backend="native_coreml_metal_vulkan_gpu_warp_host_handoff",
+                viewer_native=native_depth,
+                native_resource_handle=native_depth,
+                native_zero_copy=bool(native_depth.output_zero_copy),
+                depth_finite=bool(profile.finite_depth),
+                capture_frame_id=capture_frame_id,
+                depth_frame_id=capture_frame_id,
+                depth_complete=bool(profile.finite_depth),
+                debug_info=debug,
+                timing=timing,
+                provider_info=provider_info,
+            )
+        elif pixel_buffer is not None and viewer_bgra is None:
+            # Native prediction either was unavailable or fell back to the
+            # regular tensor path. The fallback no longer needs the retained
+            # IOSurface lease; release it after inference has decided.
+            try:
+                pixel_buffer.release()
+            except Exception:
+                pass
         depth_total_ms = (
             float(profile.total_ms)
             if depth_profile is not None
@@ -2072,7 +2218,35 @@ class StereoRuntime:
         self._openxr_depth_temporal = out.detach()
         return out
 
-    def _predict_depth_profile(self, rgb_frame: torch.Tensor) -> DepthProfileResult:
+    def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        if native_capture is not None and capture_frame_id is not None:
+            native_predict = getattr(self.depth_provider, "predict_profile_native", None)
+            if callable(native_predict):
+                try:
+                    native_result = native_predict(
+                        rgb_frame, native_capture, int(capture_frame_id)
+                    )
+                    if isinstance(native_result, DepthProfileResult):
+                        return native_result
+                except Exception as exc:
+                    self._native_io_last_error = f"{type(exc).__name__}: {exc}"
+                    if type(exc).__name__ == "NativeCoreMLBusy":
+                        raise
+                    if not getattr(self, "_native_io_error_logged", False):
+                        self._native_io_error_logged = True
+                        print(
+                            f"[CoreMLNativeIO] prediction failed; using Python fallback: "
+                            f"{self._native_io_last_error}",
+                            flush=True,
+                        )
+                    if getattr(rgb_frame, "device", None) is not None and rgb_frame.device.type == "meta":
+                        raise
         predict_profile = getattr(self.depth_provider, "predict_profile", None)
         if callable(predict_profile):
             result = predict_profile(rgb_frame)

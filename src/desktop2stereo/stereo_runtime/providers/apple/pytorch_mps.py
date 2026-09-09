@@ -8,6 +8,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 
@@ -150,6 +151,41 @@ class CoreMLEngine:
             compute_units=units,
         )
         self.device = torch.device(device)
+        self.native_io = None
+        self.native_io_reason = "not_attempted"
+
+    def enable_native_io(
+        self, model_path: str | Path, input_width: int, input_height: int
+    ) -> None:
+        """Try native shared-buffer IO without changing Python CoreML fallback."""
+        if sys.platform != "darwin" or os.environ.get(
+            "D2S_COREML_NATIVE_IO", "1"
+        ).strip().lower() in {"0", "false", "off"}:
+            self.native_io_reason = "disabled"
+            return
+        try:
+            from .native import NativeCoreMLIOBridge
+
+            bridge, reason = NativeCoreMLIOBridge.try_create(
+                model_path, int(input_width), int(input_height)
+            )
+            self.native_io = bridge
+            self.native_io_reason = reason or "active"
+        except Exception as exc:
+            self.native_io = None
+            self.native_io_reason = f"{type(exc).__name__}: {exc}"
+
+    def predict_native(self, pixel_buffer: Any, frame_id: int):
+        bridge = getattr(self, "native_io", None)
+        if bridge is None:
+            return None
+        return bridge.predict(pixel_buffer, int(frame_id))
+
+    def close(self) -> None:
+        bridge = getattr(self, "native_io", None)
+        if bridge is not None:
+            bridge.close()
+        self.native_io = None
 
     def __call__(self, pixel_values: torch.Tensor):
         import numpy as np
@@ -445,6 +481,66 @@ class _CoreMLMixin:
                 return self._predict_profile_coreml(rgb, cpu_rgb)
         return super().predict_profile(rgb)
 
+    def predict_profile_native(
+        self, rgb: torch.Tensor, pixel_buffer: Any, frame_id: int
+    ) -> DepthProfileResult | None:
+        """Run Core ML from an IOSurface-backed capture without host pixels."""
+        if not self._coreml_enabled() or pixel_buffer is None:
+            if not getattr(self, "_native_io_skip_logged", False):
+                self._native_io_skip_logged = True
+                print(
+                    "[CoreMLNativeIO] native prediction skipped: "
+                    f"coreml={self._coreml_enabled()} pixel_buffer={pixel_buffer is not None}",
+                    flush=True,
+                )
+            return None
+        engine = self._coreml_engine_for_frame(rgb)
+        native_frame = engine.predict_native(pixel_buffer, int(frame_id))
+        if native_frame is None:
+            return None
+        self.info = replace(
+            self.info,
+            native_io_binding=bool(native_frame.input_shared),
+            native_output_backing=bool(native_frame.output_backing_used),
+            native_io_reason="active",
+        )
+        return DepthProfileResult(
+            depth=native_frame,
+            preprocess_ms=float(native_frame.preprocess_ms),
+            model_ms=float(native_frame.model_ms),
+            postprocess_ms=float(native_frame.postprocess_ms),
+            finite_depth=bool(native_frame.finite_depth),
+            nonfinite_count=int(native_frame.nonfinite_count),
+            native_depth=native_frame,
+            native_resource_handle=native_frame,
+            native_zero_copy=bool(native_frame.output_zero_copy),
+        )
+
+    def native_io_ready_for_frame(self, width: int, height: int) -> bool:
+        """Preflight the native engine without materializing capture pixels."""
+        if not self._coreml_enabled():
+            return False
+        try:
+            shape = (1, 3, int(height), int(width))
+            probe = torch.empty(shape, device="meta", dtype=torch.float32)
+            engine = self._coreml_engine_for_frame(probe)
+            return engine is not None and engine.native_io is not None
+        except Exception as exc:
+            self.native_io_reason = f"{type(exc).__name__}: {exc}"
+            return False
+
+    def close(self) -> None:
+        engines = getattr(self, "_coreml_engines", None)
+        if engines:
+            for engine in tuple(engines.values()):
+                close = getattr(engine, "close", None)
+                if callable(close):
+                    close()
+            engines.clear()
+        parent_close = getattr(super(), "close", None)
+        if callable(parent_close):
+            parent_close()
+
     def _coreml_engine_for_frame(self, rgb: torch.Tensor):
         from stereo_runtime.depth_provider import (
             DISTILL_ANY_DEPTH_BASE_RESOLUTION,
@@ -541,9 +637,23 @@ class _CoreMLMixin:
             print(f"[CoreML] Using cached model {model_path.name}", flush=True)
 
         engine = CoreMLEngine(model_path, self.device)
+        engine.enable_native_io(model_path, input_w, input_h)
         self._set_coreml_info()
+        self.info = replace(
+            self.info,
+            native_io_binding=engine.native_io is not None,
+            native_io_reason=engine.native_io_reason,
+        )
         units_label = os.environ.get("D2S_COREML_COMPUTE_UNITS", "all").strip().lower()
-        print(f"[CoreML] Ready (compute units: {units_label})", flush=True)
+        native_label = (
+            "native_io=active"
+            if engine.native_io is not None
+            else f"native_io=fallback:{engine.native_io_reason}"
+        )
+        print(
+            f"[CoreML] Ready (compute units: {units_label}; {native_label})",
+            flush=True,
+        )
         engines[key] = engine
         return engine
 

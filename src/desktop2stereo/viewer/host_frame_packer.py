@@ -79,6 +79,9 @@ class HostFramePacker:
                 getattr(result, "viewer_rgb", None) is not None
                 or getattr(result, "viewer_bgra", None) is not None
                 or getattr(result, "viewer_frame_np", None) is not None
+                # Native Core ML frames own their Metal color/depth resources
+                # and are packed directly by the Vulkan presenter.
+                or getattr(result, "viewer_native", None) is not None
             )
             # Fused warp-pack for DEFERRED frames (darwin+vulkan): one Metal
             # kernel turns the shipped rgb+depth tensors into final Half-SBS

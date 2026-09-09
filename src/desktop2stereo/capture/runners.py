@@ -54,19 +54,35 @@ class PollingCaptureRunner:
                         continue
 
                     capture_start_time = time.perf_counter()
-                    frame_raw, size = self._source.grab()
+                    native_grab = getattr(self._source, "grab_native_zero_copy", None)
+                    if callable(native_grab):
+                        # Native-only sources must wait and take under one
+                        # producer lock; separate grab/take calls can miss a
+                        # callback edge and halve the effective frame rate.
+                        zero_copy, size = native_grab(
+                            timeout=1.0 / max(1, self.config.fps)
+                        )
+                        frame_raw = None
+                    else:
+                        frame_raw, size = self._source.grab()
+                        zero_copy = None
                     native_depth_profile = None
                     pop_native_depth = getattr(
                         self._source, "pop_native_depth_profile", None
                     )
                     if callable(pop_native_depth):
                         native_depth_profile = pop_native_depth()
-                    zero_copy = None
-                    take_zero_copy = getattr(self._source, "take_latest_zero_copy", None)
-                    if callable(take_zero_copy):
-                        zero_copy = take_zero_copy()
+                    if native_grab is None:
+                        take_zero_copy = getattr(self._source, "take_latest_zero_copy", None)
+                        if callable(take_zero_copy):
+                            zero_copy = take_zero_copy()
                     if shutdown_event.is_set():
                         break
+                    # Native-only ScreenCaptureKit intentionally has no CPU
+                    # frame. Do not publish an empty poll between IOSurface
+                    # callbacks; the next callback owns the real frame.
+                    if frame_raw is None and zero_copy is None:
+                        continue
                     on_frame(
                         capture_frame_from_raw(
                             frame_raw,
@@ -75,10 +91,27 @@ class PollingCaptureRunner:
                             config=self.config,
                             copy_mode=FrameCopyMode.COPY,
                             original_format=str(getattr(self._source, "frame_format", "") or ""),
+                            capture_size=(
+                                (int(size[0]), int(size[1]))
+                                if isinstance(size, (tuple, list)) and len(size) >= 2
+                                else None
+                            ),
                             sck_zero_copy=zero_copy,
                             metadata={
                                 "backend": type(self._source).__name__,
-                                "zero_copy": False,
+                                "capture_frame_status": getattr(
+                                    zero_copy, "frame_status", None
+                                ),
+                                "zero_copy": zero_copy is not None,
+                                "zero_copy_ready": zero_copy is not None,
+                                "gpu_to_cpu": False if zero_copy is not None else None,
+                                "gpu_copy_count": 0 if zero_copy is not None else None,
+                                "resource_kind": (
+                                    "iosurface_metal" if zero_copy is not None else None
+                                ),
+                                "resource_format": (
+                                    "BGRA8Unorm" if zero_copy is not None else None
+                                ),
                                 "capture_frame_id": self._frame_id,
                                 **({
                                     "native_depth_profile": native_depth_profile,

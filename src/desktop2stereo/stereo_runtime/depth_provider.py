@@ -56,6 +56,9 @@ class DepthProviderInfo:
     fallback_reason: str | None = None
     io_binding: bool = False
     dlpack: bool = False
+    native_io_binding: bool = False
+    native_output_backing: bool = False
+    native_io_reason: str | None = None
     output_device: str | None = None
     trt_lib_dirs: list[str] | None = None
 
@@ -65,7 +68,7 @@ class DepthProviderInfo:
 
 @dataclass(frozen=True)
 class DepthProfileResult:
-    depth: torch.Tensor
+    depth: Any
     preprocess_ms: float
     model_ms: float
     postprocess_ms: float
@@ -77,6 +80,9 @@ class DepthProfileResult:
     # normalization. Keep the result metadata explicit for viewer telemetry.
     finite_depth: bool = True
     nonfinite_count: int = 0
+    native_depth: Any | None = None
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
 
     @property
     def total_ms(self) -> float:
@@ -91,6 +97,8 @@ class DepthProfileResult:
             "total_ms": float(self.total_ms),
             "finite_depth": bool(self.finite_depth),
             "nonfinite_count": int(self.nonfinite_count),
+            "native_io_binding": bool(self.native_depth is not None),
+            "native_zero_copy": bool(self.native_zero_copy),
         }
 
 
@@ -1223,6 +1231,36 @@ class AutoDepthProvider:
 
     def predict(self, rgb: torch.Tensor) -> torch.Tensor:
         return self.predict_profile(rgb).depth
+
+    def native_io_ready_for_frame(self, width: int, height: int) -> bool:
+        """Forward the optional macOS native bridge capability to the active provider."""
+        provider = self._activate_next()
+        checker = getattr(provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        return bool(checker(int(width), int(height)))
+
+    def predict_profile_native(
+        self, rgb: torch.Tensor, pixel_buffer: Any, frame_id: int
+    ) -> DepthProfileResult | None:
+        """Forward native capture inference without changing fallback behavior."""
+        provider = self._activate_next()
+        predict = getattr(provider, "predict_profile_native", None)
+        if not callable(predict):
+            if not getattr(self, "_native_io_missing_logged", False):
+                self._native_io_missing_logged = True
+                print(
+                    f"[CoreMLNativeIO] active provider has no native method: {type(provider).__name__}",
+                    flush=True,
+                )
+            return None
+        result = predict(rgb, pixel_buffer, int(frame_id))
+        self.info = replace(provider.info, fallback_reason=(
+            "; ".join(
+                f"{item['backend']}: {item['reason']}" for item in self._attempts
+            ) or None
+        ))
+        return result
 
     def close(self) -> None:
         if self._provider is not None:

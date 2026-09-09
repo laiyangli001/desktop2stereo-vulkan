@@ -311,4 +311,10 @@ def build_runtime_pipeline_context(
         output_transport=getattr(app_context, "output_transport", None),
         settings_update_q=app_context.settings_update_q,
         render_size_config=app_context.render_size_config,
+        capture_size_hint=(
+            tuple(int(value) for value in app_context.capture_config.output_resolution)
+            if isinstance(app_context.capture_config.output_resolution, (tuple, list))
+            and len(app_context.capture_config.output_resolution) == 2
+            else None
+        ),
     )
