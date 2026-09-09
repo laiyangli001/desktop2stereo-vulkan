@@ -82,6 +82,29 @@ class DepthRuntime:
         """Return whether the macOS native Core ML bridge is ready for size."""
         if not isinstance(size, (tuple, list)) or len(size) != 2:
             return False
+        # Native packing is stateless and samples the capture texture directly.
+        # Route features that need the public tensor compositor through the
+        # existing Python/CoreML path instead of silently changing semantics.
+        if str(getattr(self.stereo_config, "output_format", "half_sbs")) not in {
+            "half_sbs",
+            "full_sbs",
+        }:
+            return False
+        if any(
+            bool(getattr(self.stereo_config, field_name, False))
+            for field_name in (
+                "temporal",
+                "refine",
+                "cross_eyed",
+                "output_quality_enabled",
+                "dynamic_convergence_enabled",
+            )
+        ):
+            return False
+        if isinstance(getattr(self.stereo_config, "convergence", None), torch.Tensor):
+            return False
+        if not _viewer_color_adjustments_neutral(self.config):
+            return False
         checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
         if not callable(checker):
             return False
@@ -1323,11 +1346,17 @@ class StereoRuntime:
                 except Exception:
                     pass
             width, height = _runtime_frame_size(rgb_frame) or (0, 0)
+            native_warp_debug = _configure_native_coreml_warp(
+                native_depth,
+                self.stereo_config,
+                width=int(width),
+                height=int(height),
+            )
             provider_info = self.provider_report()
             debug = {
                 "backend": self.stereo_config.backend,
-                "sbs_backend": "native_coreml_metal",
-                "runtime_output_pack_backend": "native_coreml_metal_vulkan_gpu_warp_host_handoff",
+                "sbs_backend": "native_coreml_metal_layered",
+                "runtime_output_pack_backend": "native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
                 "runtime_output_dtype": "native",
                 "native_coreml_io": True,
                 "native_coreml_input_shared": int(bool(native_depth.input_shared)),
@@ -1347,6 +1376,7 @@ class StereoRuntime:
                 "native_coreml_normalize_hi": float(native_depth.normalize_hi),
                 "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
                 "runtime_depth_backend": "coreml",
+                **native_warp_debug,
             }
             native_error = getattr(self, "_native_io_last_error", None)
             if native_error:
@@ -1370,7 +1400,7 @@ class StereoRuntime:
                 output_display_size=(int(width), int(height)),
                 output_format=str(self.stereo_config.output_format),
                 output_dtype="native",
-                output_pack_backend="native_coreml_metal_vulkan_gpu_warp_host_handoff",
+                output_pack_backend="native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
                 viewer_native=native_depth,
                 native_resource_handle=native_depth,
                 native_zero_copy=bool(native_depth.output_zero_copy),
@@ -2670,6 +2700,87 @@ StereoLabRuntimeResult = StereoRuntimeResult
 StereoLabOpenXRRuntimeResult = OpenXRRuntimeResult
 StereoLabDepthRuntime = DepthRuntime
 StereoLabDepthRuntimeResult = DepthRuntimeResult
+
+
+def _configure_native_coreml_warp(
+    native_depth: Any,
+    config: Any,
+    *,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Use the same layered-warp controls as the Vulkan CUDA/ROCm path."""
+    configure = getattr(native_depth, "configure_warp", None)
+    if not callable(configure):
+        return {"native_coreml_stereo_postprocess": "legacy_native_warp"}
+    try:
+        from .vulkan_stereo_pass import (
+            resolve_vulkan_hole_fill_mode,
+            resolve_vulkan_hole_fill_parameters,
+        )
+
+        budget = resolve_parallax_budget(
+            render_width=int(width),
+            render_height=int(height),
+            preset=getattr(config, "parallax_preset", "standard"),
+            convergence=float(getattr(config, "convergence", 0.0)),
+            max_disparity_px=getattr(config, "max_disparity_px", None),
+        )
+        hole_fill = str(getattr(config, "hole_fill", "edge_aware")).strip().lower()
+        hole_fill_mode = str(getattr(config, "hole_fill_mode", "balanced")).strip().lower()
+        vulkan_mode = resolve_vulkan_hole_fill_mode(hole_fill, hole_fill_mode)
+        fill_radius, fill_strength = resolve_vulkan_hole_fill_parameters(
+            vulkan_mode,
+            fill_radius=getattr(config, "hole_fill_radius", 3),
+            fill_strength=getattr(config, "hole_fill_strength", 1.0),
+        )
+        values = {
+            "depth_strength": max(0.0, float(getattr(config, "depth_strength", 1.0))),
+            "max_disparity_px": float(budget.max_disparity_px),
+            "convergence": float(getattr(config, "convergence", 0.0)),
+            "edge_threshold": float(getattr(config, "edge_threshold", 0.04)),
+            "fill_strength": float(fill_strength),
+            "fill_radius": int(fill_radius),
+            "mask_feather_radius": max(
+                0, min(3, int(getattr(config, "mask_feather_radius", 3)))
+            ),
+            "symmetric": int(bool(getattr(config, "symmetric", True))),
+            "layers": max(1, min(4, int(getattr(config, "layers", 2)))),
+            "softness": 0.08,
+            "foreground_scale": max(
+                0.0, float(getattr(config, "foreground_shift_scale", 1.0))
+            ),
+            "midground_scale": max(
+                0.0, float(getattr(config, "midground_shift_scale", 1.0))
+            ),
+            "background_scale": max(
+                0.0, float(getattr(config, "background_shift_scale", 1.0))
+            ),
+            "edge_dilation": max(0, min(3, int(getattr(config, "edge_dilation", 2)))),
+            "screen_edge_suppression": max(
+                0, int(getattr(config, "screen_edge_mask_suppression", 0))
+            ),
+            "hole_fill_mode": int(vulkan_mode),
+            "occlusion_enabled": int(bool(getattr(config, "occlusion", True))),
+            "depth_pop": float(getattr(config, "depth_pop", 0.0)),
+            "antialias_strength": float(
+                getattr(config, "depth_antialias_strength", 0.0)
+            ),
+        }
+        configure(**values)
+        return {
+            "native_coreml_stereo_postprocess": "vulkan_layered_equivalent",
+            "native_coreml_layers": values["layers"],
+            "native_coreml_occlusion_enabled": values["occlusion_enabled"],
+            "native_coreml_hole_fill_mode": values["hole_fill_mode"],
+            "native_coreml_max_disparity_px": values["max_disparity_px"],
+        }
+    except Exception as exc:
+        LOGGER.warning("Native CoreML stereo configuration failed: %s", exc)
+        return {
+            "native_coreml_stereo_postprocess": "legacy_native_warp",
+            "native_coreml_stereo_postprocess_error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _provider_report(depth_provider: Any) -> dict[str, Any]:

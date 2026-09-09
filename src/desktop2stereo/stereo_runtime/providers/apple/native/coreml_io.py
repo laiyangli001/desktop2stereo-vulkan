@@ -47,6 +47,30 @@ class _NativeResult(ctypes.Structure):
     ]
 
 
+class _NativeWarpConfig(ctypes.Structure):
+    _fields_ = [
+        ("depth_strength", ctypes.c_float),
+        ("max_disparity_px", ctypes.c_float),
+        ("convergence", ctypes.c_float),
+        ("edge_threshold", ctypes.c_float),
+        ("fill_strength", ctypes.c_float),
+        ("fill_radius", ctypes.c_int32),
+        ("mask_feather_radius", ctypes.c_int32),
+        ("symmetric", ctypes.c_int32),
+        ("layers", ctypes.c_int32),
+        ("softness", ctypes.c_float),
+        ("foreground_scale", ctypes.c_float),
+        ("midground_scale", ctypes.c_float),
+        ("background_scale", ctypes.c_float),
+        ("edge_dilation", ctypes.c_int32),
+        ("screen_edge_suppression", ctypes.c_int32),
+        ("hole_fill_mode", ctypes.c_int32),
+        ("occlusion_enabled", ctypes.c_int32),
+        ("depth_pop", ctypes.c_float),
+        ("antialias_strength", ctypes.c_float),
+    ]
+
+
 class NativeCoreMLBusy(RuntimeError):
     """The bounded native resource ring has no reusable slot yet."""
 
@@ -169,6 +193,7 @@ class NativeCoreMLFrame:
     output_zero_copy: bool
     normalize_lo: float = 0.0
     normalize_hi: float = 1.0
+    warp_config: dict[str, float | int] | None = None
     released: bool = False
 
     @property
@@ -192,6 +217,10 @@ class NativeCoreMLFrame:
             height,
             output_format,
         )
+
+    def configure_warp(self, **values: float | int) -> None:
+        """Attach the shared stereo parameters before presenter-side packing."""
+        self.warp_config = dict(values)
 
     def release(self) -> None:
         if self.released:
@@ -241,6 +270,7 @@ class NativeCoreMLIOBridge:
             ctypes.c_int32,
             ctypes.c_int32,
             ctypes.c_int32,
+            ctypes.POINTER(_NativeWarpConfig),
             ctypes.c_float,
             ctypes.c_float,
             ctypes.c_float,
@@ -393,6 +423,28 @@ class NativeCoreMLIOBridge:
             convergence = float(os.environ.get("D2S_METAL_WARP_CONVERGENCE", "0.0"))
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid native warp configuration: {exc}") from exc
+        values = dict(getattr(frame, "warp_config", None) or {})
+        config = _NativeWarpConfig(
+            float(values.get("depth_strength", depth_strength)),
+            float(values.get("max_disparity_px", 48.0)),
+            float(values.get("convergence", convergence)),
+            float(values.get("edge_threshold", 0.04)),
+            float(values.get("fill_strength", 0.0)),
+            int(values.get("fill_radius", 0)),
+            int(values.get("mask_feather_radius", 0)),
+            int(values.get("symmetric", 1)),
+            int(values.get("layers", 2)),
+            float(values.get("softness", 0.08)),
+            float(values.get("foreground_scale", 1.0)),
+            float(values.get("midground_scale", 1.0)),
+            float(values.get("background_scale", 1.0)),
+            int(values.get("edge_dilation", 2)),
+            int(values.get("screen_edge_suppression", 0)),
+            int(values.get("hole_fill_mode", 2)),
+            int(values.get("occlusion_enabled", 1)),
+            float(values.get("depth_pop", 0.0)),
+            float(values.get("antialias_strength", 0.0)),
+        )
         handle = self._begin_call(allow_closing=True)
         try:
             code = self._library.d2s_coreml_io_pack(
@@ -403,6 +455,7 @@ class NativeCoreMLIOBridge:
                 int(output_width),
                 int(output_height),
                 1 if str(output_format) == "full_sbs" else 0,
+                ctypes.byref(config),
                 eye_offset,
                 depth_strength,
                 convergence,

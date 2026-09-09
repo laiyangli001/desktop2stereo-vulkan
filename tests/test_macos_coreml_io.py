@@ -13,6 +13,7 @@ from stereo_runtime.providers.apple.native.coreml_io import (
     NativeCoreMLFrame,
     NativeCoreMLIOBridge,
     _NativeResult,
+    _NativeWarpConfig,
 )
 from utils.queue_utils import put_latest
 
@@ -45,6 +46,7 @@ def _native_frame(bridge) -> NativeCoreMLFrame:
 def test_native_result_abi_has_stable_layout() -> None:
     assert ctypes.sizeof(_NativeResult) == 80
     assert _NativeResult.source_width.offset > _NativeResult.slot.offset
+    assert ctypes.sizeof(_NativeWarpConfig) == 76
 
 
 def test_native_scalar_kernels_use_one_dimensional_threadgroups() -> None:
@@ -96,8 +98,10 @@ def test_native_warp_uses_depth_dimensions_for_depth_sampling() -> None:
     assert "uint32_t depth_height;" in source
     assert "(uint32_t)ctx->depth_width" in pack
     assert "(uint32_t)ctx->depth_height" in pack
-    assert "depth, p.depth_width, p.depth_height, p" in source
+    assert "depth_sample(depth, p.depth_width, p.depth_height" in source
     assert "depth, p.source_width, p.source_height, p" not in source
+    assert "layered_warp_at" in warp
+    assert "occlusion_at" in warp
 
 
 def test_native_frame_pack_uses_destination_without_host_conversion() -> None:
@@ -125,6 +129,69 @@ def test_native_frame_pack_uses_destination_without_host_conversion() -> None:
     assert len(bridge.pack_calls) == 1
     assert bridge.pack_calls[0][2] == len(destination)
     assert bridge.release_calls == [1]
+
+
+def test_native_frame_accepts_shared_layered_warp_configuration() -> None:
+    bridge = object()
+    frame = _native_frame(bridge)
+
+    frame.configure_warp(
+        depth_strength=0.25,
+        max_disparity_px=48.0,
+        layers=2,
+        edge_dilation=1,
+        hole_fill_mode=2,
+        occlusion_enabled=1,
+    )
+
+    assert frame.warp_config == {
+        "depth_strength": 0.25,
+        "max_disparity_px": 48.0,
+        "layers": 2,
+        "edge_dilation": 1,
+        "hole_fill_mode": 2,
+        "occlusion_enabled": 1,
+    }
+
+
+def test_runtime_native_warp_configuration_uses_vulkan_controls() -> None:
+    from stereo_runtime.runtime import _configure_native_coreml_warp
+
+    calls = []
+
+    class Native:
+        def configure_warp(self, **values):
+            calls.append(values)
+
+    config = SimpleNamespace(
+        depth_strength=0.25,
+        max_disparity_px=None,
+        convergence=0.0,
+        parallax_preset="standard",
+        edge_threshold=0.04,
+        hole_fill="none",
+        hole_fill_mode="none",
+        hole_fill_radius=3,
+        hole_fill_strength=1.0,
+        mask_feather_radius=3,
+        symmetric=True,
+        layers=2,
+        foreground_shift_scale=1.0,
+        midground_shift_scale=1.0,
+        background_shift_scale=1.0,
+        edge_dilation=1,
+        screen_edge_mask_suppression=0,
+        occlusion=True,
+        depth_pop=0.0,
+        depth_antialias_strength=0.0,
+    )
+    debug = _configure_native_coreml_warp(Native(), config, width=1920, height=1080)
+
+    assert debug["native_coreml_stereo_postprocess"] == "vulkan_layered_equivalent"
+    assert calls[0]["layers"] == 2
+    assert calls[0]["hole_fill_mode"] == 2
+    assert calls[0]["occlusion_enabled"] == 1
+    assert calls[0]["max_disparity_px"] == 48.0
 
 
 def test_native_busy_code_is_explicit_not_a_cpu_fallback(monkeypatch) -> None:

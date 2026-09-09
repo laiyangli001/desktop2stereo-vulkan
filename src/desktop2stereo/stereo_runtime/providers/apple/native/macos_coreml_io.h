@@ -28,6 +28,28 @@ typedef struct {
     double postprocess_ms;
 } D2SCoreMLIOResult;
 
+typedef struct {
+    float depth_strength;
+    float max_disparity_px;
+    float convergence;
+    float edge_threshold;
+    float fill_strength;
+    int32_t fill_radius;
+    int32_t mask_feather_radius;
+    int32_t symmetric;
+    int32_t layers;
+    float softness;
+    float foreground_scale;
+    float midground_scale;
+    float background_scale;
+    int32_t edge_dilation;
+    int32_t screen_edge_suppression;
+    int32_t hole_fill_mode;
+    int32_t occlusion_enabled;
+    float depth_pop;
+    float antialias_strength;
+} D2SCoreMLIOWarpConfig;
+
 void *d2s_coreml_io_create(const char *model_path, int32_t input_width,
                            int32_t input_height, int32_t compute_units,
                            char *error_buffer, size_t error_capacity);
@@ -38,6 +60,7 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
 int32_t d2s_coreml_io_pack(void *handle, int32_t slot, void *destination,
                            size_t destination_size, int32_t output_width,
                            int32_t output_height, int32_t output_format,
+                           const D2SCoreMLIOWarpConfig *warp_config,
                            float eye_offset, float depth_strength,
                            float convergence, float smooth_texels);
 
