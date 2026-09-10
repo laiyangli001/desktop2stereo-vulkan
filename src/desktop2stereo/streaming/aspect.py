@@ -366,6 +366,15 @@ def apply_aspect_on_cpu(
         return frame
 
     tw, th = target_size
+    # Contain placement for an already-canonical packed frame can be an
+    # identity operation (for example 1920x1080 Half-TAB). Avoid allocating a
+    # second full RGB canvas and copying both eyes on every stream frame.
+    if (
+        tuple(frame.shape[:2]) == (th, tw)
+        and len(regions) in (1, 2)
+        and all(tuple(src) == tuple(dst) for src, dst in regions)
+    ):
+        return frame
     is_packed = str(display_mode or "").strip().casefold().replace("_", "-") in {
         "half-sbs", "full-sbs", "half-tab", "full-tab"
     }

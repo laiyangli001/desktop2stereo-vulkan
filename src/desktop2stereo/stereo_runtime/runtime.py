@@ -269,6 +269,10 @@ class StereoRuntimeResult:
     # texture and normalized model-resolution depth until it is packed or
     # released by the presenter queue.
     viewer_native: Any | None = None
+    # Native CoreML/Metal stream result. The direct stream consumer packs it
+    # on its own thread so the next CoreML prediction can overlap the warp.
+    native_stream_frame: Any | None = None
+    native_stream_fallback: Any | None = None
     # Opaque native resource handle and its measured ownership mode. These
     # fields keep the native handoff explicit for callers and telemetry.
     native_resource_handle: Any | None = None
@@ -1345,13 +1349,104 @@ class StereoRuntime:
         native_depth = getattr(profile, "native_depth", None)
         if native_depth is not None:
             # The bridge retained the CVPixelBuffer while moving it into its
-            # native slot. Release the capture lease now; the native slot is
-            # released only after the Vulkan transfer has completed.
+            # native slot. Its slot now owns the capture resource until the
+            # presenter or stream consumer releases the native frame.
             if pixel_buffer is not None:
                 try:
                     pixel_buffer.release()
                 except Exception:
                     pass
+            if _macos_stream_native_io_enabled():
+                source_size = getattr(native_depth, "source_size", None)
+                if source_size is None:
+                    source_size = _runtime_frame_size(rgb_frame)
+                if source_size is None:
+                    native_depth.release()
+                    raise RuntimeError("native CoreML stream result has no source size")
+                width, height = (int(source_size[0]), int(source_size[1]))
+                output_format = str(self.stereo_config.output_format)
+                output_width, output_height = _native_output_size(
+                    width, height, output_format
+                )
+                native_warp_debug = _configure_native_coreml_warp(
+                    native_depth,
+                    self.stereo_config,
+                    width=width,
+                    height=height,
+                )
+                total_ms = (time.perf_counter() - total_start) * 1000.0
+                provider_info = self.provider_report()
+                debug = {
+                    "backend": self.stereo_config.backend,
+                    "sbs_backend": "native_coreml_metal_stream_warp_deferred",
+                    "runtime_output_pack_backend": "native_coreml_metal_stream_pack",
+                    "runtime_output_dtype": "native_deferred_rgb24",
+                    "native_coreml_io": True,
+                    "native_coreml_stream_pack": 0,
+                    "native_coreml_stream_pack_deferred": 1,
+                    "native_coreml_input_shared": int(bool(native_depth.input_shared)),
+                    "native_coreml_output_backing": int(
+                        bool(native_depth.output_backing_used)
+                    ),
+                    "native_coreml_output_zero_copy": int(
+                        bool(native_depth.output_zero_copy)
+                    ),
+                    "native_coreml_metal_vulkan_alias": 0,
+                    "native_coreml_host_handoff_copy_count": 1,
+                    "native_coreml_gpu_copy_count": 1,
+                    "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
+                    "depth_finite": int(bool(native_depth.finite_depth)),
+                    "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
+                    "runtime_depth_backend": "coreml",
+                    "runtime_output_format": output_format,
+                    "runtime_output_eye_size": f"{width}x{height}",
+                    "runtime_output_display_size": f"{output_width}x{output_height}",
+                    "native_coreml_stream_host_rgb_handoff": 1,
+                    **native_warp_debug,
+                }
+                native_error = getattr(self, "_native_io_last_error", None)
+                if native_error:
+                    debug["native_coreml_previous_error"] = str(native_error)
+                timing = {
+                    "depth_preprocess_ms": float(profile.preprocess_ms),
+                    "depth_model_ms": float(profile.model_ms),
+                    "depth_postprocess_ms": float(profile.postprocess_ms),
+                    "depth_total_ms": float(profile.total_ms),
+                    "synthesis_ms": 0.0,
+                    "pack_ms": 0.0,
+                    "total_ms": float(total_ms),
+                    "depth_nonfinite_count": int(profile.nonfinite_count),
+                    "native_coreml_stream_pack_ms": 0.0,
+                }
+                self.last_timing = timing
+                self.last_memory = {}
+                self.stats.update(timing, {})
+                return StereoRuntimeResult(
+                    depth=native_depth,
+                    left_eye=rgb_frame,
+                    right_eye=rgb_frame,
+                    sbs=rgb_frame,
+                    output_eye_size=(width, height),
+                    output_display_size=(output_width, output_height),
+                    output_format=output_format,
+                    output_dtype="uint8",
+                    output_pack_backend="native_coreml_metal_stream_pack",
+                    native_stream_frame=native_depth,
+                    native_stream_fallback=lambda: self.process_rgb_frame(
+                        rgb_frame,
+                        pixel_buffer=None,
+                        capture_frame_id=capture_frame_id,
+                    ),
+                    native_resource_handle=None,
+                    native_zero_copy=False,
+                    depth_finite=bool(profile.finite_depth),
+                    capture_frame_id=capture_frame_id,
+                    depth_frame_id=capture_frame_id,
+                    depth_complete=bool(profile.finite_depth),
+                    debug_info=debug,
+                    timing=timing,
+                    provider_info=provider_info,
+                )
             width, height = _runtime_frame_size(rgb_frame) or (0, 0)
             native_warp_debug = _configure_native_coreml_warp(
                 native_depth,
@@ -1400,6 +1495,11 @@ class StereoRuntime:
                 "total_ms": float(profile.total_ms),
                 "depth_nonfinite_count": int(profile.nonfinite_count),
             }
+            if pixel_buffer is not None:
+                try:
+                    pixel_buffer.release()
+                except Exception:
+                    pass
             return StereoRuntimeResult(
                 depth=native_depth,
                 left_eye=rgb_frame,
@@ -1452,6 +1552,20 @@ class StereoRuntime:
             not skip_sbs_output
             and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
         )
+        # Advanced macOS streaming has no native Metal-to-encoder texture
+        # bridge in this output path. Use the same synthesis contract as
+        # CUDA/ROCm rather than the Vulkan layered pass, which currently
+        # performs a GPU -> host -> GPU roundtrip before the host encoder.
+        # This is deliberately limited to Darwin network streaming; the
+        # local Vulkan viewer and vendor paths keep their existing routing.
+        macos_stream_canonical_synthesis = (
+            sys.platform == "darwin"
+            and os.environ.get("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and not _intel_vulkan_network_path_enabled()
+        )
+        vulkan_skip = "not_attempted"
+        fused_skip = "not_attempted"
         if deferred_warp:
             stereo = StereoResult(
                 left_eye=output_rgb,
@@ -1488,6 +1602,11 @@ class StereoRuntime:
                         "vulkan_zero_copy_reason": deferred_vulkan_reason,
                     },
                 )
+            elif macos_stream_canonical_synthesis:
+                vulkan_stereo = None
+                vulkan_skip = "macos_stream_canonical_synthesis"
+                fused_sbs = None
+                fused_skip = "macos_stream_canonical_synthesis"
             else:
                 vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
                     output_rgb,
@@ -1559,6 +1678,9 @@ class StereoRuntime:
         self.stats.update(timing, memory)
 
         debug = dict(stereo.debug_info)
+        if macos_stream_canonical_synthesis:
+            debug["macos_stream_canonical_synthesis"] = 1
+            debug["macos_stream_vulkan_skip"] = vulkan_skip
         debug["runtime_depth_backend"] = self.depth_config.backend
         debug["runtime_output_format"] = self.stereo_config.output_format
         debug["packing_format"] = self.stereo_config.output_format
@@ -2957,6 +3079,22 @@ def _runtime_eye_size(eye) -> str:
     return "unknown"
 def _runtime_output_uint8_enabled() -> bool:
     return _env_flag("D2S_RUNTIME_OUTPUT_UINT8", "0")
+
+
+def _macos_stream_native_io_enabled() -> bool:
+    return sys.platform == "darwin" and _env_flag(
+        "D2S_MAC_STREAM_NATIVE_IO", "0"
+    )
+
+
+def _native_output_size(width: int, height: int, output_format: str) -> tuple[int, int]:
+    output_format = str(output_format).strip().lower()
+    if output_format == "full_sbs":
+        return int(width) * 2, int(height)
+    if output_format == "full_tab":
+        return int(width), int(height) * 2
+    return int(width), int(height)
+
 
 def _half_res_synth_enabled() -> bool:
     """Viewer fast path: warp at half eye resolution, upscale the SBS.

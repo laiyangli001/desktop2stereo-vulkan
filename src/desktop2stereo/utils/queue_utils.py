@@ -37,6 +37,13 @@ def _release_item(item: Any) -> None:
             release_native()
         except Exception:
             pass
+    stream_native = getattr(item, "native_stream_frame", None)
+    release_stream_native = getattr(stream_native, "release", None)
+    if callable(release_stream_native) and id(stream_native) not in released_ids:
+        try:
+            release_stream_native()
+        except Exception:
+            pass
 
 
 def put_latest(q: queue.Queue, item: Any) -> None:

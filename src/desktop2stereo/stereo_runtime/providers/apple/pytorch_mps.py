@@ -360,6 +360,31 @@ class _CoreMLMixin:
     def _coreml_enabled(self) -> bool:
         return bool(getattr(self, "use_coreml", False)) and sys.platform == "darwin"
 
+    def load(self):
+        """Keep cached CoreML startup independent from the Transformers stack.
+
+        ``AutoDepthProvider`` calls ``load`` while selecting a provider.  The
+        CoreML engine is fixed-shape and is created lazily from the first frame,
+        so loading the PyTorch model here is both unnecessary and makes a
+        cached CoreML run depend on the optional Transformers import path.
+        """
+        if self._coreml_enabled():
+            return None
+        return super().load()
+
+    def _load_torch_model_for_coreml(self):
+        """Load the torch model only for CoreML conversion or fallback."""
+        return super().load()
+
+    def _run_torch_model_for_coreml(self, tensor: torch.Tensor):
+        """Run the normal MPS model after an optional CoreML fallback."""
+        model = self._load_torch_model_for_coreml()
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type, enabled=use_autocast
+        ):
+            return model(pixel_values=tensor)
+
     def _set_coreml_info(self, *, fallback_reason: str | None = None) -> None:
         self.info = replace(
             self.info,
@@ -443,7 +468,7 @@ class _CoreMLMixin:
 
         engine = self._coreml_engine_for_frame(rgb)
         if engine is None:
-            raise RuntimeError("CoreML engine became unavailable")
+            return super().predict_profile(rgb)
         start = time.perf_counter()
         with torch.inference_mode():
             predicted = engine(pixel_values=tensor).predicted_depth
@@ -598,7 +623,7 @@ class _CoreMLMixin:
                 flush=True,
             )
             install_coremltools_workarounds()
-            torch_model = self.load()
+            torch_model = self._load_torch_model_for_coreml()
             wrapped = ModelForCoreML(torch_model).float().eval()
             # Trace on the same device as the model weights (MPS); the
             # converted mlpackage is device-independent.
@@ -665,7 +690,7 @@ class _CoreMLMixin:
             return super()._run_depth_model(tensor)
         engine = self._coreml_engine_for_frame(tensor)
         if engine is None:
-            return super()._run_depth_model(tensor)
+            return self._run_torch_model_for_coreml(tensor)
         with torch.inference_mode():
             return engine(pixel_values=tensor)
 

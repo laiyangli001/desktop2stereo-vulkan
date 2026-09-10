@@ -1202,6 +1202,43 @@ def test_warp_horizontal_clamps_out_of_range_edges_instead_of_mirroring():
     assert torch.equal(actual[..., -2:], torch.tensor([[[[7.0, 7.0]]]]))
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_mps_warp_horizontal_supports_border_clamping():
+    rgb = torch.arange(8, dtype=torch.float32, device="mps").reshape(1, 1, 1, 8)
+    shift = torch.full((1, 1, 1, 8), 3.0, device="mps")
+
+    actual = warp_horizontal(rgb, shift, eye_sign=1.0)
+
+    assert actual.device.type == "mps"
+    assert torch.allclose(
+        actual[..., -2:].cpu(),
+        torch.tensor([[[[7.0, 7.0]]]]),
+    )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_macos_stream_mps_fused_warp_uses_common_layer_math(monkeypatch):
+    monkeypatch.setenv("D2S_MAC_STREAM_MPS_FUSED", "1")
+    rgb = torch.rand(1, 3, 16, 32, device="mps")
+    depth = torch.linspace(0.0, 1.0, 16 * 32, device="mps").reshape(1, 1, 16, 32)
+    config = StereoConfig(
+        backend="quality_4k",
+        output_format="full_sbs",
+        layers=2,
+        symmetric=True,
+        hole_fill="none",
+        temporal=False,
+        fused=True,
+        depth_strength=0.25,
+    )
+
+    result = synthesize_stereo(rgb, depth, config)
+
+    assert result.debug_info["warp_composite_backend"] == "metal_mps_warp_composite2"
+    assert torch.isfinite(result.left_eye).all().item()
+    assert torch.isfinite(result.right_eye).all().item()
+
+
 def test_openxr_stereo_warp_defaults_to_edge_clamping():
     assert OpenXRRenderConfig().padding_mode == "border"
 

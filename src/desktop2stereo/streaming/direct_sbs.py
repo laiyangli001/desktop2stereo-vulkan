@@ -525,6 +525,7 @@ class DirectSbsOutputConsumer:
         self._fps_submitted_frames = 0
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
+        self._fps_native_pack_seconds = 0.0
         # Pass aspect config to converter for CPU fallback path
         self._frame_converter = RuntimeSbsRgbConverter(
             copy_output=not bool(getattr(output, "synchronous_submit", False)),
@@ -652,6 +653,11 @@ class DirectSbsOutputConsumer:
             if self._fps_submitted_frames
             else 0.0
         )
+        native_pack_ms = (
+            self._fps_native_pack_seconds * 1000.0 / self._fps_sbs_frames
+            if self._fps_sbs_frames
+            else 0.0
+        )
         if self.on_sbs_fps is not None:
             self.on_sbs_fps(sbs_fps, frame_count=self._fps_sbs_frames)
         observe_calibration = getattr(self.output, "observe_calibration_window", None)
@@ -675,13 +681,15 @@ class DirectSbsOutputConsumer:
                 f"[DirectSbsStream] SBS FPS: {sbs_fps:.1f} "
                 f"network_bitrate={network_bitrate:.1f} Mbps "
                 f"submitted={submitted_fps:.1f} "
-                f"convert_ms={convert_ms:.1f} submit_ms={submit_ms:.1f}",
+                f"convert_ms={convert_ms:.1f} submit_ms={submit_ms:.1f} "
+                f"native_pack_ms={native_pack_ms:.1f}",
                 flush=True,
             )
         self._fps_sbs_frames = 0
         self._fps_submitted_frames = 0
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
+        self._fps_native_pack_seconds = 0.0
         self._fps_started = now
 
     def run(self) -> None:
@@ -689,13 +697,17 @@ class DirectSbsOutputConsumer:
             item = self._take_latest()
             if item is None:
                 continue
+            native_stream_frame = None
             try:
                 runtime_result, _capture_timestamp = item
                 self._fps_sbs_frames += 1
+                native_stream_frame = getattr(runtime_result, "native_stream_frame", None)
                 prepare_calibration = getattr(
                     self.output, "prepare_calibration_source", None
                 )
                 if callable(prepare_calibration) and prepare_calibration(runtime_result):
+                    if native_stream_frame is not None:
+                        native_stream_frame.release()
                     self._fps_submitted_frames += 1
                     self.source_stat_inc("runtime_output_frames")
                     self.source_stat_inc("network_stream_frames")
@@ -703,8 +715,64 @@ class DirectSbsOutputConsumer:
                     continue
                 should_submit = getattr(self.output, "should_submit_frame", None)
                 if callable(should_submit) and not should_submit(self._clock()):
+                    if native_stream_frame is not None:
+                        native_stream_frame.release()
                     self._report_fps_if_due()
                     continue
+                if native_stream_frame is not None:
+                    # Native CoreML prediction runs on the pipeline thread;
+                    # keep the expensive Metal warp on this independent output
+                    # thread so the next depth prediction can use another
+                    # native ring slot concurrently.
+                    import numpy as np
+
+                    target_size = getattr(runtime_result, "output_display_size", None)
+                    if not isinstance(target_size, (tuple, list)) or len(target_size) != 2:
+                        raise RuntimeError("native stream result has no output size")
+                    target_width, target_height = (
+                        int(target_size[0]),
+                        int(target_size[1]),
+                    )
+                    if target_width <= 0 or target_height <= 0:
+                        raise RuntimeError("native stream result has an invalid output size")
+                    output_format = str(
+                        getattr(runtime_result, "output_format", "half_sbs")
+                        or "half_sbs"
+                    )
+                    output = bytearray(target_width * target_height * 3)
+                    pack_started = self._clock()
+                    try:
+                        native_stream_frame.pack(
+                            output,
+                            (target_width, target_height),
+                            output_format,
+                            rgb=True,
+                        )
+                        packed = np.frombuffer(output, dtype=np.uint8).reshape(
+                            target_height, target_width, 3
+                        )
+                    except Exception:
+                        native_stream_frame.release()
+                        native_stream_frame = None
+                        self.source_stat_inc("native_stream_pack_error")
+                        fallback = getattr(runtime_result, "native_stream_fallback", None)
+                        if not callable(fallback):
+                            raise
+                        self.source_stat_inc("native_stream_fallback")
+                        runtime_result = fallback()
+                    else:
+                        self._fps_native_pack_seconds += self._clock() - pack_started
+                        native_stream_frame.release()
+                        native_stream_frame = None
+                        object.__setattr__(runtime_result, "native_stream_frame", None)
+                        object.__setattr__(runtime_result, "sbs", packed)
+                        object.__setattr__(runtime_result, "output_dtype", "uint8")
+                        timing = getattr(runtime_result, "timing", None)
+                        if isinstance(timing, dict):
+                            timing["native_coreml_stream_pack_ms"] = (
+                                self._clock() - pack_started
+                            ) * 1000.0
+                            timing["pack_ms"] = timing["native_coreml_stream_pack_ms"]
                 # Native GPU surface paths (Intel D3D11/oneVPL final-SBS and the
                 # deferred Vulkan compose) present the packed SBS at its native
                 # aspect and cannot letterbox into the 16:9 transport canvas.
@@ -813,6 +881,11 @@ class DirectSbsOutputConsumer:
                 self.source_stat_inc("network_stream_frames")
                 self._report_fps_if_due()
             except Exception as exc:
+                if native_stream_frame is not None:
+                    try:
+                        native_stream_frame.release()
+                    except Exception:
+                        pass
                 self.source_stat_inc(
                     "network_stream_errors",
                     last_error=f"{type(exc).__name__}: {exc}",

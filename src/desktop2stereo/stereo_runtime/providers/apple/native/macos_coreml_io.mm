@@ -47,6 +47,7 @@ typedef struct {
     uint32_t output_width;
     uint32_t output_height;
     uint32_t output_format;
+    uint32_t output_channels;
     D2SCoreMLIOWarpConfig stereo;
 } D2SWarpParams;
 
@@ -81,6 +82,7 @@ struct WarpParams {
     uint output_width;
     uint output_height;
     uint output_format;
+    uint output_channels;
     float depth_strength;
     float max_disparity_px;
     float convergence;
@@ -542,11 +544,11 @@ kernel void d2s_warp_pack(
             screen_edge, p);
     }
     pixel = finite_color(pixel);
-    uint offset = gid * 4u;
+    uint offset = gid * p.output_channels;
     output[offset + 0u] = uchar(clamp(pixel.r * 255.0f + 0.5f, 0.0f, 255.0f));
     output[offset + 1u] = uchar(clamp(pixel.g * 255.0f + 0.5f, 0.0f, 255.0f));
     output[offset + 2u] = uchar(clamp(pixel.b * 255.0f + 0.5f, 0.0f, 255.0f));
-    output[offset + 3u] = 255u;
+    if (p.output_channels == 4u) output[offset + 3u] = 255u;
 }
 )D2S";
 
@@ -1146,17 +1148,18 @@ int32_t d2s_coreml_io_predict(void *handle, void *pixel_buffer,
     }
 }
 
-int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
-                           size_t destination_size, int32_t output_width,
-                           int32_t output_height, int32_t output_format,
-                           const D2SCoreMLIOWarpConfig *warp_config,
-                           float eye_offset, float depth_strength,
-                           float convergence, float smooth_texels) {
+static int32_t d2s_coreml_io_pack_internal(
+    void *handle, int32_t slot_index, void *destination, size_t destination_size,
+    int32_t output_width, int32_t output_height, int32_t output_format,
+    const D2SCoreMLIOWarpConfig *warp_config, float eye_offset,
+    float depth_strength, float convergence, float smooth_texels,
+    uint32_t output_channels) {
     @autoreleasepool {
         D2SCoreMLIO *ctx = (D2SCoreMLIO *)handle;
         if (ctx == NULL || destination == NULL || slot_index < 0 || slot_index >= 3 ||
             output_width <= 0 || output_height <= 0 || output_format < D2S_OUTPUT_HALF_SBS ||
-            output_format > D2S_OUTPUT_LEIA) {
+            output_format > D2S_OUTPUT_LEIA ||
+            (output_channels != 3u && output_channels != 4u)) {
             return D2S_COREML_ERROR;
         }
         D2SSlot *slot = &ctx->slots[slot_index];
@@ -1186,7 +1189,7 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
                     break;
             }
             if (
-                destination_size < (size_t)output_width * output_height * 4u ||
+                destination_size < (size_t)output_width * output_height * output_channels ||
                 !expected_size ||
                 ((output_format == D2S_OUTPUT_HALF_SBS ||
                   output_format == D2S_OUTPUT_FULL_SBS) && output_width % 2 != 0)) {
@@ -1194,7 +1197,7 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
                 return D2S_COREML_ERROR;
             }
         }
-        size_t output_bytes = (size_t)output_width * (size_t)output_height * 4u;
+        size_t output_bytes = (size_t)output_width * (size_t)output_height * output_channels;
         if (slot->packed_buffer == nil || slot->packed_buffer.length < output_bytes) {
             slot->packed_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
                                                                options:MTLResourceStorageModeShared];
@@ -1217,6 +1220,7 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
             (uint32_t)output_width,
             (uint32_t)output_height,
             (uint32_t)output_format,
+            output_channels,
             warp_config != NULL ? *warp_config : default_stereo,
         };
         id<MTLCommandBuffer> command = [ctx->pack_queue commandBuffer];
@@ -1244,6 +1248,30 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
         memcpy(destination, destination_buffer.contents, output_bytes);
         return D2S_COREML_OK;
     }
+}
+
+int32_t d2s_coreml_io_pack(void *handle, int32_t slot_index, void *destination,
+                           size_t destination_size, int32_t output_width,
+                           int32_t output_height, int32_t output_format,
+                           const D2SCoreMLIOWarpConfig *warp_config,
+                           float eye_offset, float depth_strength,
+                           float convergence, float smooth_texels) {
+    return d2s_coreml_io_pack_internal(
+        handle, slot_index, destination, destination_size, output_width,
+        output_height, output_format, warp_config, eye_offset, depth_strength,
+        convergence, smooth_texels, 4u);
+}
+
+int32_t d2s_coreml_io_pack_rgb(void *handle, int32_t slot_index, void *destination,
+                               size_t destination_size, int32_t output_width,
+                               int32_t output_height, int32_t output_format,
+                               const D2SCoreMLIOWarpConfig *warp_config,
+                               float eye_offset, float depth_strength,
+                               float convergence, float smooth_texels) {
+    return d2s_coreml_io_pack_internal(
+        handle, slot_index, destination, destination_size, output_width,
+        output_height, output_format, warp_config, eye_offset, depth_strength,
+        convergence, smooth_texels, 3u);
 }
 
 int32_t d2s_coreml_io_release(void *handle, int32_t slot_index) {

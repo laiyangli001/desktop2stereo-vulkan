@@ -237,19 +237,23 @@ class NativeCoreMLFrame:
     def source_size(self) -> tuple[int, int]:
         return (int(self.source_width), int(self.source_height))
 
-    def pack(self, destination: Any, output_size: tuple[int, int], output_format: str) -> None:
+    def pack(
+        self,
+        destination: Any,
+        output_size: tuple[int, int],
+        output_format: str,
+        *,
+        rgb: bool = False,
+    ) -> None:
         if self.released:
             raise RuntimeError("native CoreML frame was already released")
         pointer, view = _buffer_pointer(destination)
         width, height = (int(output_size[0]), int(output_size[1]))
-        self.bridge.pack(
-            self,
-            pointer,
-            len(view),
-            width,
-            height,
-            output_format,
-        )
+        arguments = (self, pointer, len(view), width, height, output_format)
+        if rgb:
+            self.bridge.pack(*arguments, rgb=True)
+        else:
+            self.bridge.pack(*arguments)
 
     def configure_warp(self, **values: float | int | str) -> None:
         """Attach the shared stereo parameters before presenter-side packing."""
@@ -295,7 +299,7 @@ class NativeCoreMLIOBridge:
             ctypes.POINTER(_NativeResult),
         ]
         self._library.d2s_coreml_io_predict.restype = ctypes.c_int32
-        self._library.d2s_coreml_io_pack.argtypes = [
+        pack_argtypes = [
             ctypes.c_void_p,
             ctypes.c_int32,
             ctypes.c_void_p,
@@ -309,7 +313,10 @@ class NativeCoreMLIOBridge:
             ctypes.c_float,
             ctypes.c_float,
         ]
+        self._library.d2s_coreml_io_pack.argtypes = pack_argtypes
         self._library.d2s_coreml_io_pack.restype = ctypes.c_int32
+        self._library.d2s_coreml_io_pack_rgb.argtypes = pack_argtypes
+        self._library.d2s_coreml_io_pack_rgb.restype = ctypes.c_int32
         self._library.d2s_coreml_io_release.argtypes = [ctypes.c_void_p, ctypes.c_int32]
         self._library.d2s_coreml_io_release.restype = ctypes.c_int32
         self._library.d2s_coreml_io_last_error.argtypes = [ctypes.c_void_p]
@@ -447,6 +454,8 @@ class NativeCoreMLIOBridge:
         output_width: int,
         output_height: int,
         output_format: str,
+        *,
+        rgb: bool = False,
     ) -> None:
         try:
             eye_offset = float(os.environ.get("D2S_METAL_WARP_IPD", "0.064")) / 2.0
@@ -481,7 +490,12 @@ class NativeCoreMLIOBridge:
         )
         handle = self._begin_call(allow_closing=True)
         try:
-            code = self._library.d2s_coreml_io_pack(
+            pack_function = (
+                self._library.d2s_coreml_io_pack_rgb
+                if rgb
+                else self._library.d2s_coreml_io_pack
+            )
+            code = pack_function(
                 handle,
                 int(frame.slot),
                 destination,

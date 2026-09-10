@@ -82,3 +82,18 @@ def test_contain_16_10_output_keeps_per_eye_ratio() -> None:
     assert len(green) == 960  # right eye content width
     assert red.min() == 53 and red.max() == 1012  # pillarboxed, not stretched
     assert green.min() == 1119 and green.max() == 2078
+
+
+def test_identity_packed_contain_returns_original_frame() -> None:
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+    out = apply_aspect_on_cpu(
+        frame,
+        source_size=(1920, 1080),
+        target_size=(1920, 1080),
+        fit_mode="contain",
+        display_mode="Half-TAB",
+        input_size=(1920, 1080),
+    )
+
+    assert out is frame

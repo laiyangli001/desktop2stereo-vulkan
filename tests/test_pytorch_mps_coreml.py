@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from stereo_runtime.depth_provider import (
     DepthProviderConfig,
     DepthProviderInfo,
+    GenericAutoDepthProvider,
     create_depth_provider,
 )
 from stereo_runtime.providers.apple.pytorch_mps import (
@@ -47,6 +48,30 @@ def test_create_pytorch_mps_provider_forwards_coreml_flags() -> None:
     assert isinstance(provider, GenericAutoDepthMpsProvider)
     assert provider.use_coreml is True
     assert provider.recompile_coreml is True
+
+
+def test_coreml_load_does_not_preload_transformers(monkeypatch) -> None:
+    """A cached CoreML model must not load the PyTorch model at startup."""
+    import stereo_runtime.providers.apple.pytorch_mps as mps_module
+
+    monkeypatch.setattr(mps_module.sys, "platform", "darwin")
+
+    def fail_transformers_load(_provider):
+        raise AssertionError("CoreML startup must not load Transformers")
+
+    monkeypatch.setattr(
+        GenericAutoDepthProvider, "load", fail_transformers_load
+    )
+    provider = create_pytorch_mps_provider(
+        model_id="xingyang1/Distill-Any-Depth-Small-hf",
+        device="cpu",
+        cache_dir="/tmp/d2s-models",
+        local_files_only=True,
+        use_coreml=True,
+    )
+
+    assert isinstance(provider, GenericAutoDepthMpsProvider)
+    assert provider.load() is None
 
 
 def test_depth_provider_config_carries_coreml_fields() -> None:

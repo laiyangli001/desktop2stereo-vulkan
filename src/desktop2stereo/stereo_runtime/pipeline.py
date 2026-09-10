@@ -105,6 +105,18 @@ def _env_flag(name: str) -> bool:
     }
 
 
+def _native_coreml_capture_enabled(ctx) -> bool:
+    """Allow native SCK only for Darwin viewers and opted-in stream sinks."""
+    if platform.system() != "Darwin":
+        return False
+    if ctx.run_mode in {"Local Viewer", "Viewer"}:
+        return True
+    return bool(
+        getattr(ctx, "application_runtime_target", None) == "network_stream"
+        and _env_flag("D2S_MAC_STREAM_NATIVE_IO")
+    )
+
+
 def _runtime_diag_stage() -> str:
     if _env_flag("D2S_RUNTIME_DROP_ONLY"):
         return "raw"
@@ -1345,8 +1357,7 @@ class RuntimePipelineLoop:
         render_config = getattr(ctx, "render_size_config", None)
         native_ready = getattr(ctx.stereo_runtime, "native_coreml_io_ready", None)
         if (
-            platform.system() == "Darwin"
-            and ctx.run_mode in {"Local Viewer", "Viewer"}
+            _native_coreml_capture_enabled(ctx)
             and callable(native_ready)
             and render_config is not None
         ):
@@ -1542,7 +1553,7 @@ class RuntimePipelineLoop:
                     captured_frame is not None
                     and frame_raw is None
                     and getattr(captured_frame, "sck_zero_copy", None) is not None
-                    and ctx.run_mode in {"Local Viewer", "Viewer"}
+                    and _native_coreml_capture_enabled(ctx)
                 )
                 native_ready = False
                 if native_sck and callable(

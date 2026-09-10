@@ -30,6 +30,7 @@ from stereo_runtime.pipeline import (
     _runtime_parallel_adaptive_backoff_enabled,
     _cuda_event_ready,
     _attach_capture_debug,
+    _native_coreml_capture_enabled,
 )
 
 
@@ -68,6 +69,21 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
     assert result.depth_complete is True
     assert result.debug_info["depth_finite"] == 1
     assert result.debug_info["depth_nonfinite_count"] == 0
+
+
+def test_native_coreml_capture_is_enabled_for_macos_network_stream(monkeypatch):
+    monkeypatch.setattr("stereo_runtime.pipeline.platform.system", lambda: "Darwin")
+    monkeypatch.setenv("D2S_MAC_STREAM_NATIVE_IO", "1")
+
+    assert _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="network_stream")
+    )
+    assert not _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="local_viewer")
+    )
+    assert _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="Local Viewer", application_runtime_target="local_viewer")
+    )
 
 
 @pytest.mark.parametrize(

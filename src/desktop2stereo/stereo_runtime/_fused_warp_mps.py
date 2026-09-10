@@ -90,6 +90,251 @@ kernel void warp_pack(
                  * 255.0f + 0.5f;  // planar CHW channel base
     out[idx] = (uchar)clamp(cval, 0.0f, 255.0f);
 }
+
+static inline float sample_common(
+    device const float* image,
+    uint batch,
+    uint channel,
+    uint W,
+    uint H,
+    uint C,
+    float x,
+    float y
+) {
+    // Match grid_sample(..., align_corners=True, padding_mode=border).
+    x = clamp(x, 0.0f, (float)W - 1.0f);
+    y = clamp(y, 0.0f, (float)H - 1.0f);
+    uint x0 = (uint)floor(x), y0 = (uint)floor(y);
+    uint x1 = min(x0 + 1u, W - 1u), y1 = min(y0 + 1u, H - 1u);
+    float fx = x - (float)x0, fy = y - (float)y0;
+    uint plane = H * W;
+    uint base = (batch * C + channel) * plane;
+    float a = image[base + y0 * W + x0];
+    float b = image[base + y0 * W + x1];
+    float c = image[base + y1 * W + x0];
+    float d = image[base + y1 * W + x1];
+    return mix(mix(a, b, fx), mix(c, d, fx), fy);
+}
+
+static inline float blend_common(
+    device const float* col,
+    device const float* dep,
+    device const float* shift,
+    uint batch,
+    uint channel,
+    uint W,
+    uint H,
+    uint C,
+    uint x,
+    uint y,
+    float eye_sign
+) {
+    uint plane = H * W;
+    uint depth_idx = batch * plane + y * W + x;
+    float d = clamp(dep[depth_idx], 0.0f, 1.0f);
+    float w0 = exp(-(d * d) / 0.08f);
+    float w1 = exp(-((d - 1.0f) * (d - 1.0f)) / 0.08f);
+    float weight_sum = max(w0 + w1, 1.0e-6f);
+    float base = shift[depth_idx];
+    float shift0 = base * 0.875f;
+    float shift1 = base;
+    float sample0 = sample_common(
+        col, batch, channel, W, H, C,
+        (float)x + shift0 * eye_sign, (float)y
+    );
+    float sample1 = sample_common(
+        col, batch, channel, W, H, C,
+        (float)x + shift1 * eye_sign, (float)y
+    );
+    return (w0 * sample0 + w1 * sample1) / weight_sum;
+}
+
+static inline float downsample_common(
+    device const float* col,
+    device const float* dep,
+    device const float* shift,
+    uint batch,
+    uint channel,
+    uint W,
+    uint H,
+    uint C,
+    uint x,
+    uint y,
+    bool horizontal,
+    float eye_sign
+) {
+    uint center = 2u * (horizontal ? x : y);
+    float values[4];
+    values[0] = -1.0f;
+    values[1] = 9.0f;
+    values[2] = 9.0f;
+    values[3] = -1.0f;
+    float total = 0.0f;
+    for (uint tap = 0u; tap < 4u; ++tap) {
+        int source = (int)center + (int)tap - 1;
+        uint limit = (horizontal ? W : H) - 1u;
+        uint coordinate = (uint)clamp(source, 0, (int)limit);
+        uint sx = horizontal ? coordinate : x;
+        uint sy = horizontal ? y : coordinate;
+        total += values[tap] * blend_common(
+            col, dep, shift, batch, channel, W, H, C, sx, sy, eye_sign
+        );
+    }
+    return total * (1.0f / 16.0f);
+}
+
+kernel void warp_composite2_u8(
+    device uchar* out        [[buffer(0)]],
+    device const float* col  [[buffer(1)]],
+    device const float* dep  [[buffer(2)]],
+    device const float* shift [[buffer(3)]],
+    constant uint& B         [[buffer(4)]],
+    constant uint& C         [[buffer(5)]],
+    constant uint& W         [[buffer(6)]],
+    constant uint& H         [[buffer(7)]],
+    constant uint& outW      [[buffer(8)]],
+    constant uint& outH      [[buffer(9)]],
+    constant uint& format    [[buffer(10)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = B * C * outH * outW;
+    if (idx >= total) return;
+    uint out_plane = outH * outW;
+    uint out_pixels = C * out_plane;
+    uint batch = idx / out_pixels;
+    uint rem = idx % out_pixels;
+    uint channel = rem / out_plane;
+    uint pixel = rem % out_plane;
+    uint ox = pixel % outW;
+    uint oy = pixel / outW;
+    bool horizontal = (format == 0u || format == 1u);
+    bool half_res = (format == 0u || format == 2u);
+    uint eyeW = horizontal ? (half_res ? W / 2u : W) : W;
+    uint eyeH = horizontal ? H : (half_res ? H / 2u : H);
+    bool right_eye = horizontal ? ox >= eyeW : oy >= eyeH;
+    uint x = horizontal ? (right_eye ? ox - eyeW : ox) : ox;
+    uint y = horizontal ? oy : (right_eye ? oy - eyeH : oy);
+    float eye_sign = right_eye ? -1.0f : 1.0f;
+    float value;
+    if (half_res) {
+        value = downsample_common(
+            col, dep, shift, batch, channel, W, H, C, x, y,
+            horizontal, eye_sign
+        );
+    } else {
+        value = blend_common(
+            col, dep, shift, batch, channel, W, H, C, x, y, eye_sign
+        );
+    }
+    out[idx] = (uchar)clamp(value * 255.0f + 0.5f, 0.0f, 255.0f);
+}
+
+kernel void warp_composite2(
+    device float* left       [[buffer(0)]],
+    device float* right      [[buffer(1)]],
+    device const float* col  [[buffer(2)]],
+    device const float* dep  [[buffer(3)]],
+    device const float* shift [[buffer(4)]],
+    constant uint& B         [[buffer(5)]],
+    constant uint& C         [[buffer(6)]],
+    constant uint& W         [[buffer(7)]],
+    constant uint& H         [[buffer(8)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = B * C * H * W;
+    if (idx >= total) return;
+    uint plane = H * W;
+    uint pixels = C * plane;
+    uint batch = idx / pixels;
+    uint rem = idx % pixels;
+    uint channel = rem / plane;
+    uint pixel = rem % plane;
+    uint y = pixel / W;
+    uint x = pixel % W;
+    uint depth_idx = batch * plane + pixel;
+    float d = clamp(dep[depth_idx], 0.0f, 1.0f);
+    float w0 = exp(-(d * d) / 0.08f);
+    float w1 = exp(-((d - 1.0f) * (d - 1.0f)) / 0.08f);
+    float weight_sum = max(w0 + w1, 1.0e-6f);
+    w0 /= weight_sum;
+    w1 /= weight_sum;
+    float base = shift[depth_idx];
+    // layers.py/synthesis.py use factors 0.875 and 1.0 for two layers.
+    float shift0 = base * 0.875f;
+    float shift1 = base;
+    float left0 = sample_common(col, batch, channel, W, H, C, (float)x + shift0, (float)y);
+    float left1 = sample_common(col, batch, channel, W, H, C, (float)x + shift1, (float)y);
+    float right0 = sample_common(col, batch, channel, W, H, C, (float)x - shift0, (float)y);
+    float right1 = sample_common(col, batch, channel, W, H, C, (float)x - shift1, (float)y);
+    left[idx] = w0 * left0 + w1 * left1;
+    right[idx] = w0 * right0 + w1 * right1;
+}
+
+static inline float read_eye(
+    device const float* eye,
+    uint batch,
+    uint channel,
+    uint W,
+    uint H,
+    uint C,
+    uint x,
+    uint y
+) {
+    return eye[(batch * C + channel) * H * W + y * W + x];
+}
+
+kernel void pack_eyes_u8(
+    device uchar* out       [[buffer(0)]],
+    device const float* left [[buffer(1)]],
+    device const float* right [[buffer(2)]],
+    constant uint& B        [[buffer(3)]],
+    constant uint& C        [[buffer(4)]],
+    constant uint& W        [[buffer(5)]],
+    constant uint& H        [[buffer(6)]],
+    constant uint& outW     [[buffer(7)]],
+    constant uint& outH     [[buffer(8)]],
+    constant uint& format   [[buffer(9)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = B * C * outH * outW;
+    if (idx >= total) return;
+    uint out_plane = outH * outW;
+    uint out_pixels = C * out_plane;
+    uint batch = idx / out_pixels;
+    uint rem = idx % out_pixels;
+    uint channel = rem / out_plane;
+    uint pixel = rem % out_plane;
+    uint ox = pixel % outW;
+    uint oy = pixel / outW;
+    bool horizontal = (format == 0u || format == 1u);
+    bool half_res = (format == 0u || format == 2u);
+    uint eyeW = horizontal ? (half_res ? W / 2u : W) : W;
+    uint eyeH = horizontal ? H : (half_res ? H / 2u : H);
+    bool right_eye = horizontal ? ox >= eyeW : oy >= eyeH;
+    uint x = horizontal ? (right_eye ? ox - eyeW : ox) : ox;
+    uint y = horizontal ? oy : (right_eye ? oy - eyeH : oy);
+    device const float* eye = right_eye ? right : left;
+    float value;
+    if (half_res) {
+        uint center = 2u * (horizontal ? x : y);
+        float taps[4] = {-1.0f, 9.0f, 9.0f, -1.0f};
+        value = 0.0f;
+        for (uint tap = 0u; tap < 4u; ++tap) {
+            int source = (int)center + (int)tap - 1;
+            uint limit = (horizontal ? W : H) - 1u;
+            uint coordinate = (uint)clamp(source, 0, (int)limit);
+            uint sx = horizontal ? coordinate : x;
+            uint sy = horizontal ? y : coordinate;
+            value += taps[tap] * read_eye(
+                eye, batch, channel, W, H, C, sx, sy
+            );
+        }
+        value *= 1.0f / 16.0f;
+    } else {
+        value = read_eye(eye, batch, channel, W, H, C, x, y);
+    }
+    out[idx] = (uchar)clamp(value * 255.0f + 0.5f, 0.0f, 255.0f);
+}
 """
 
 
@@ -219,4 +464,108 @@ def fused_sbs_pack(rgb_f32_chw, depth_f32, host_out=None, out_size=None,
     except Exception as exc:
         if os.environ.get("D2S_FUSED_DEBUG"):
             print(f"[fused] pack failed: {exc!r}", flush=True)
+        return None
+
+
+def mps_warp_composite2(rgb_f32, depth_f32, base_shift):
+    """Run the canonical two-layer warp without MPS grid_sample launches.
+
+    The kernel mirrors the common synthesis path for the streaming profile:
+    two depth layers, symmetric eyes, bilinear border sampling, and the
+    already-resolved pixel shift. It intentionally returns ``None`` for any
+    unsupported shape so the caller can use the existing torch path.
+    """
+    try:
+        import torch
+
+        if sys.platform != "darwin" or rgb_f32.device.type != "mps":
+            return None
+        if rgb_f32.ndim == 3:
+            rgb_f32 = rgb_f32.unsqueeze(0)
+        if rgb_f32.ndim != 4 or rgb_f32.dtype != torch.float32:
+            return None
+        if depth_f32.ndim == 3:
+            depth_f32 = depth_f32.unsqueeze(1)
+        if base_shift.ndim == 3:
+            base_shift = base_shift.unsqueeze(1)
+        if depth_f32.ndim != 4 or base_shift.ndim != 4:
+            return None
+        batch, channels, height, width = map(int, rgb_f32.shape)
+        if channels != 3 or tuple(depth_f32.shape) != (batch, 1, height, width):
+            return None
+        if tuple(base_shift.shape) != (batch, 1, height, width):
+            return None
+        left = torch.empty_like(rgb_f32)
+        right = torch.empty_like(rgb_f32)
+        _lib().warp_composite2(
+            left,
+            right,
+            rgb_f32.contiguous(),
+            depth_f32.contiguous(),
+            base_shift.contiguous(),
+            int(batch),
+            int(channels),
+            int(width),
+            int(height),
+        )
+        return left, right
+    except Exception as exc:
+        if os.environ.get("D2S_FUSED_DEBUG"):
+            print(f"[mps-warp] canonical kernel failed: {exc!r}", flush=True)
+        return None
+
+
+def mps_warp_composite2_u8(rgb_f32, depth_f32, base_shift, output_format: str):
+    """Pack the canonical two-layer output directly into an MPS uint8 tensor."""
+    try:
+        import torch
+
+        if sys.platform != "darwin" or rgb_f32.device.type != "mps":
+            return None
+        if rgb_f32.ndim == 3:
+            rgb_f32 = rgb_f32.unsqueeze(0)
+        if rgb_f32.ndim != 4 or rgb_f32.dtype != torch.float32:
+            return None
+        if depth_f32.ndim == 3:
+            depth_f32 = depth_f32.unsqueeze(1)
+        if base_shift.ndim == 3:
+            base_shift = base_shift.unsqueeze(1)
+        batch, channels, height, width = map(int, rgb_f32.shape)
+        if channels != 3 or height % 2 or width % 2:
+            return None
+        if tuple(depth_f32.shape) != (batch, 1, height, width):
+            return None
+        if tuple(base_shift.shape) != (batch, 1, height, width):
+            return None
+        formats = {"half_sbs": 0, "full_sbs": 1, "half_tab": 2, "full_tab": 3}
+        format_id = formats.get(str(output_format))
+        if format_id is None:
+            return None
+        out_width = width * 2 if format_id == 1 else width
+        out_height = height * 2 if format_id == 3 else height
+        warped = mps_warp_composite2(rgb_f32, depth_f32, base_shift)
+        if warped is None:
+            return None
+        left, right = warped
+        out = torch.empty(
+            (batch, channels, out_height, out_width),
+            dtype=torch.uint8,
+            device="mps",
+        )
+        _lib().pack_eyes_u8(
+            out,
+            left,
+            right,
+            int(batch),
+            int(channels),
+            int(width),
+            int(height),
+            int(out_width),
+            int(out_height),
+            int(format_id),
+        )
+        return out
+    except Exception as exc:
+        if os.environ.get("D2S_FUSED_DEBUG"):
+            print(f"[mps-warp] packed canonical kernel failed: {exc!r}", flush=True)
         return None

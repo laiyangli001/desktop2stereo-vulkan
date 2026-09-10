@@ -77,6 +77,13 @@ int32_t d2s_coreml_io_pack(void *handle, int32_t slot, void *destination,
                            float eye_offset, float depth_strength,
                            float convergence, float smooth_texels);
 
+int32_t d2s_coreml_io_pack_rgb(void *handle, int32_t slot, void *destination,
+                               size_t destination_size, int32_t output_width,
+                               int32_t output_height, int32_t output_format,
+                               const D2SCoreMLIOWarpConfig *warp_config,
+                               float eye_offset, float depth_strength,
+                               float convergence, float smooth_texels);
+
 int32_t d2s_coreml_io_release(void *handle, int32_t slot);
 const char *d2s_coreml_io_last_error(void *handle);
 void d2s_coreml_io_destroy(void *handle);

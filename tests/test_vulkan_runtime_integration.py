@@ -607,3 +607,56 @@ def test_runtime_routes_quality_4k_to_vulkan_layered_backend(monkeypatch):
     assert result.debug_info["vulkan_fused_backend"] == "vulkan_stereo_layered"
     assert result.debug_info["sbs_backend"] == "vulkan_layered_stereo"
     runtime.close()
+
+
+def test_macos_advanced_stream_uses_canonical_stereo_synthesis(monkeypatch):
+    monkeypatch.setattr(runtime_module.sys, "platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "1")
+    monkeypatch.delenv("D2S_INTEL_VULKAN_SBS", raising=False)
+    monkeypatch.delenv("D2S_RUNTIME_OUTPUT_UINT8", raising=False)
+
+    config = StereoRuntimeConfig(
+        model_id="lc700x/Distill-Any-Depth-Base-hf",
+        stereo_quality="quality_4k",
+        stereo_compute_backend="auto",
+        output_format="half_sbs",
+        temporal=False,
+    )
+    runtime = StereoRuntime(config, depth_provider=_Provider(), collect_memory_stats=False)
+    vulkan_calls = []
+    synthesis_calls = []
+
+    def fake_vulkan(*args, **kwargs):
+        del kwargs
+        vulkan_calls.append(args)
+        rgb = args[0]
+        return (
+            StereoResult(
+                left_eye=rgb,
+                right_eye=rgb,
+                sbs=rgb,
+                debug_info={"sbs_backend": "vulkan_layered_stereo"},
+            ),
+            "used",
+        )
+
+    def fake_synthesize(rgb, depth, synthesis_config, temporal_state=None, sbs_only=False):
+        del depth, temporal_state, sbs_only
+        synthesis_calls.append(synthesis_config)
+        return StereoResult(
+            left_eye=rgb,
+            right_eye=rgb,
+            sbs=rgb,
+            debug_info={"sbs_backend": "canonical_synthesis"},
+        )
+
+    monkeypatch.setattr(runtime, "_try_vulkan_fused_stereo", fake_vulkan)
+    monkeypatch.setattr(runtime_module, "synthesize_stereo", fake_synthesize)
+
+    result = runtime.process_rgb_frame(torch.rand(1, 3, 8, 12))
+
+    assert not vulkan_calls
+    assert len(synthesis_calls) == 1
+    assert result.debug_info["sbs_backend"] == "canonical_synthesis"
+    assert result.debug_info["macos_stream_canonical_synthesis"] == 1
+    runtime.close()

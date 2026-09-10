@@ -43,6 +43,122 @@ def test_runtime_sbs_to_rgb_converts_chw_float_to_hwc_uint8():
     assert rgb[0, 1].tolist() == [255, 0, 128]
 
 
+def test_native_stream_frame_is_packed_on_output_thread():
+    shutdown = threading.Event()
+    submitted = []
+
+    class NativeFrame:
+        def __init__(self):
+            self.released = False
+
+        def pack(self, destination, output_size, output_format, *, rgb=False):
+            assert output_size == (4, 2)
+            assert output_format == "half_tab"
+            assert rgb is True
+            for offset in range(0, len(destination), 3):
+                destination[offset : offset + 3] = bytes((10, 20, 30))
+
+        def release(self):
+            self.released = True
+
+    class Output:
+        display_mode = "Half-TAB"
+        fit_mode = "stretch"
+        input_size = (4, 2)
+        synchronous_submit = True
+
+        def submit_frame(self, frame):
+            submitted.append(frame)
+            shutdown.set()
+
+    native = NativeFrame()
+    result = SimpleNamespace(
+        native_stream_frame=native,
+        native_stream_fallback=None,
+        output_display_size=(4, 2),
+        output_format="half_tab",
+        sbs=None,
+        left_eye=None,
+        right_eye=None,
+    )
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(),
+        shutdown_event=shutdown,
+        output=Output(),
+        source_stat_inc=lambda *args, **kwargs: None,
+    )
+    consumer.runtime_q.put((result, 0.0))
+    thread = threading.Thread(target=consumer.run)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert native.released is True
+    assert len(submitted) == 1
+    assert submitted[0].shape == (2, 4, 3)
+    assert submitted[0].dtype == np.uint8
+    assert submitted[0][0, 0].tolist() == [10, 20, 30]
+
+
+def test_native_stream_pack_failure_uses_runtime_fallback():
+    shutdown = threading.Event()
+    stats = []
+    submitted = []
+
+    class NativeFrame:
+        def __init__(self):
+            self.released = False
+
+        def pack(self, *args, **kwargs):
+            raise RuntimeError("injected native pack failure")
+
+        def release(self):
+            self.released = True
+
+    class Output:
+        display_mode = "Half-TAB"
+        fit_mode = "stretch"
+        input_size = (4, 2)
+        synchronous_submit = True
+
+        def submit_frame(self, frame):
+            submitted.append(frame)
+            shutdown.set()
+
+    native = NativeFrame()
+    fallback = SimpleNamespace(
+        sbs=np.full((2, 4, 3), 77, dtype=np.uint8),
+        left_eye=None,
+        right_eye=None,
+        native_stream_frame=None,
+    )
+    result = SimpleNamespace(
+        native_stream_frame=native,
+        native_stream_fallback=lambda: fallback,
+        output_display_size=(4, 2),
+        output_format="half_tab",
+        sbs=None,
+        left_eye=None,
+        right_eye=None,
+    )
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(),
+        shutdown_event=shutdown,
+        output=Output(),
+        source_stat_inc=lambda name, **kwargs: stats.append(name),
+    )
+    consumer.runtime_q.put((result, 0.0))
+    thread = threading.Thread(target=consumer.run)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert native.released is True
+    assert submitted[0][0, 0].tolist() == [77, 77, 77]
+    assert "native_stream_pack_error" in stats
+    assert "native_stream_fallback" in stats
+
+
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
 def test_runtime_sbs_to_rgb_converts_mps_tensor_to_host():
     # MJPEG on macOS feeds MPS SBS tensors; numpy() without .cpu() raises

@@ -629,6 +629,20 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
     direct_stream_mode = is_network_stream_mode(configured_run_mode) or configured_run_mode == "MJPEG Streamer"
     if direct_stream_mode:
         os.environ["D2S_RUNTIME_OUTPUT_UINT8"] = "1"
+        if platform.system() == "Darwin":
+            # The macOS network sink currently consumes host RGB frames. Keep
+            # stereo generation on the canonical path so its geometry and
+            # postprocessing match CUDA/ROCm instead of paying the Vulkan
+            # layered pass's host readback and using different edge rules.
+            os.environ.setdefault("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "1")
+            # Prefer the existing IOSurface -> CoreML -> Metal pack bridge for
+            # network streams. It is attempted only after native capability
+            # preflight; the pipeline retains the Python CoreML fallback.
+            os.environ.setdefault("D2S_MAC_STREAM_NATIVE_IO", "1")
+            # Replace MPS grid_sample's two full-frame synchronization points
+            # with the canonical two-layer Metal kernel for the eligible
+            # realtime profile. Unsupported profiles still use torch.
+            os.environ.setdefault("D2S_MAC_STREAM_MPS_FUSED", "1")
     configured_target_fps = target_fps_for_run_mode(settings)
     nvfruc_requested = bool(
         settings.get(

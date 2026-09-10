@@ -151,6 +151,13 @@ def warp_horizontal(
     grid = torch.stack((grid_x, grid_y), dim=-1)
     if padding_mode not in {"zeros", "border", "reflection"}:
         raise ValueError(f"unsupported stereo warp padding mode: {padding_mode!r}")
+    if rgb.device.type == "mps" and padding_mode == "border":
+        # MPS does not implement grid_sample's border mode. Clamping the
+        # normalized coordinates first is equivalent to border sampling and
+        # lets the operation use MPS's supported zeros mode. Other devices
+        # retain the native path and its original padding semantics.
+        grid = grid.clamp(-1.0, 1.0)
+        padding_mode = "zeros"
     return F.grid_sample(rgb, grid, mode="bilinear", padding_mode=padding_mode, align_corners=True)
 
 

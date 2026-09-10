@@ -196,6 +196,24 @@ def test_native_frame_pack_uses_destination_without_host_conversion() -> None:
     assert bridge.release_calls == [1]
 
 
+def test_native_frame_can_request_gpu_rgb24_pack() -> None:
+    class RecordingBridge:
+        def __init__(self):
+            self.rgb = None
+
+        def pack(self, frame, destination, destination_size, width, height, output_format, *, rgb=False):
+            self.rgb = rgb
+
+        def release(self, slot):
+            pass
+
+    bridge = RecordingBridge()
+    frame = _native_frame(bridge)
+    frame.pack(bytearray(2 * 1 * 3), (2, 1), "half_sbs", rgb=True)
+
+    assert bridge.rgb is True
+
+
 def test_native_frame_accepts_shared_layered_warp_configuration() -> None:
     bridge = object()
     frame = _native_frame(bridge)
