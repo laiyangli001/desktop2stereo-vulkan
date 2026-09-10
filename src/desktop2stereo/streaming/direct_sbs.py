@@ -1362,6 +1362,18 @@ class FfmpegDirectSbsOutput:
         self._darwin_audio_device: str | None = None
         self._darwin_audio_probe_started = False
         self._audio_startup_retried = False
+        # AVFoundation audio and the RTSP muxer can briefly apply backpressure
+        # to the rawvideo pipe. Keep that stall off the runtime consumer on
+        # macOS; the one-slot queue deliberately drops stale video frames.
+        self._darwin_async_submit = self.os_name == "Darwin"
+        self._async_frame_queue: queue.Queue[np.ndarray | None] | None = (
+            queue.Queue(maxsize=1) if self._darwin_async_submit else None
+        )
+        self._async_frame_stop = threading.Event()
+        self._async_frame_thread: threading.Thread | None = None
+        self._async_frame_error: Exception | None = None
+        self._async_frame_lock = threading.Lock()
+        self._async_frame_drops = 0
         if self.auto_calibration:
             logs_dir = self.base_dir / "logs"
             self._calibration_controller = StreamCalibrationController(
@@ -1911,15 +1923,20 @@ class FfmpegDirectSbsOutput:
         ``-itsoffset`` audio delay is folded into the RTCTIME offset
         because asetpts overwrites the demuxer PTS that the offset shifted.
 
-        macOS uses the same re-anchoring: the AVFoundation device timestamps
-        are already real-time, so the demuxer wall-clock option is redundant
-        and re-times audio to the (jittery under CPU load) packet read time,
-        which the async resampler then has to correct audibly. Anchoring in
-        the filter graph keeps the audio on the wall-clock base with smooth,
-        device-derived pacing.
+        macOS AVFoundation exposes an absolute microsecond timestamp. Normalize
+        it to the input start and the audio time base before applying the
+        configured delay. Passing RTCTIME directly as PTS makes FFmpeg treat
+        the microsecond value as stream ticks; the muxer then duplicates video
+        for minutes to catch up, eventually blocking the rawvideo pipe.
         """
         graph = "aresample=async=1"
-        if self._soundcard_audio is not None or self.os_name == "Darwin":
+        if self.os_name == "Darwin":
+            delay_us = int(round(float(self.audio_delay) * 1e6))
+            graph = (
+                "asetpts=(RTCTIME-STARTT"
+                f"{delay_us:+d})/(1000000*TB),{graph}"
+            )
+        elif self._soundcard_audio is not None:
             delay_us = int(round(float(self.audio_delay) * 1e6))
             graph = f"asetpts=RTCTIME{delay_us:+d},{graph}"
         return graph
@@ -2171,11 +2188,10 @@ class FfmpegDirectSbsOutput:
                 # -use_wallclock_as_timestamps (measured: that demuxer
                 # option silences the whole audio chain on this FFmpeg
                 # build); its wall-clock re-anchoring happens in the audio
-                # filter graph instead (asetpts=RTCTIME, see
+                # filter graph instead (normalized asetpts, see
                 # _audio_filter_graph). macOS drops it too: AVFoundation
-                # timestamps are already real-time and re-timing them to the
-                # packet read time (jittery under CPU load) makes the async
-                # resampler compensate audibly.
+                # timestamps are absolute microseconds and are normalized in
+                # the filter graph before the async resampler.
                 "-thread_queue_size",
                 "512",
                 *(
@@ -2454,8 +2470,9 @@ class FfmpegDirectSbsOutput:
             # inserting/dropping samples without letting the filter make
             # large, audible adjustments. The WASAPI soundcard path
             # additionally re-anchors the raw s16le/UDP timeline to the wall
-            # clock (asetpts=RTCTIME) because -use_wallclock_as_timestamps
-            # on the audio demuxer would silence the stream entirely.
+            # clock (normalized asetpts on macOS) because
+            # -use_wallclock_as_timestamps on the audio demuxer would silence
+            # the stream entirely.
             command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC" or self.os_name == "Darwin":
                 command.extend(
@@ -2701,7 +2718,7 @@ class FfmpegDirectSbsOutput:
                 if self._soundcard_audio is not None:
                     self._soundcard_audio.close()
                     self._soundcard_audio = None
-                self._stop_process(self.ffmpeg_process)
+                self._stop_ffmpeg_publisher()
                 self.ffmpeg_process = None
                 self._frame_size = None
                 self._start_ffmpeg(width, height)
@@ -2710,6 +2727,8 @@ class FfmpegDirectSbsOutput:
                 f"FFmpeg exited during startup with code {self.ffmpeg_process.returncode}: {detail}"
             )
         self._frame_size = (width, height)
+        if self._darwin_async_submit and self._calibration_controller is None:
+            self._start_async_frame_writer()
         if (
             self.os_name == "Darwin"
             and not getattr(self, "_darwin_audio_probe_started", False)
@@ -2753,6 +2772,118 @@ class FfmpegDirectSbsOutput:
                 f"gpu_copy_count={1 if self._qsv_surface_mode == 'd3d11_upload' else 0}",
                 flush=True,
             )
+
+    def _start_async_frame_writer(self) -> None:
+        if not self._darwin_async_submit:
+            return
+        frame_queue = self._async_frame_queue
+        process = self.ffmpeg_process
+        if (
+            frame_queue is None
+            or process is None
+            or process.stdin is None
+            or (
+                self._async_frame_thread is not None
+                and self._async_frame_thread.is_alive()
+            )
+        ):
+            return
+        self._async_frame_stop.clear()
+        with self._async_frame_lock:
+            self._async_frame_error = None
+        self._async_frame_thread = threading.Thread(
+            target=self._run_async_frame_writer,
+            name="DarwinDirectSbsFrameWriter",
+            daemon=True,
+        )
+        self._async_frame_thread.start()
+
+    def _run_async_frame_writer(self) -> None:
+        frame_queue = self._async_frame_queue
+        if frame_queue is None:
+            return
+        while not self._async_frame_stop.is_set():
+            try:
+                frame = frame_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if frame is None:
+                return
+            if self._async_frame_stop.is_set():
+                return
+            try:
+                self._write_frame(frame)
+            except Exception as exc:
+                with self._async_frame_lock:
+                    self._async_frame_error = exc
+                self._async_frame_stop.set()
+                return
+
+    def _raise_async_frame_error(self) -> None:
+        with self._async_frame_lock:
+            error = self._async_frame_error
+        if error is not None:
+            raise RuntimeError(f"macOS FFmpeg frame writer failed: {error}") from error
+
+    def _enqueue_async_frame(self, frame: np.ndarray) -> None:
+        frame_queue = self._async_frame_queue
+        if frame_queue is None:
+            raise RuntimeError("macOS frame queue is unavailable")
+        # The converter may reuse its backing array after submit_frame returns.
+        # Own exactly one contiguous copy for the writer thread.
+        owned_frame = np.array(frame, dtype=np.uint8, copy=True, order="C")
+        try:
+            frame_queue.put_nowait(owned_frame)
+            return
+        except queue.Full:
+            pass
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            with self._async_frame_lock:
+                self._async_frame_drops += 1
+        try:
+            frame_queue.put_nowait(owned_frame)
+        except queue.Full:
+            with self._async_frame_lock:
+                self._async_frame_drops += 1
+
+    def _stop_async_frame_writer(self) -> None:
+        thread = self._async_frame_thread
+        if thread is None:
+            return
+        self._async_frame_stop.set()
+        frame_queue = self._async_frame_queue
+        if frame_queue is not None:
+            try:
+                frame_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    frame_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        # Closing stdin first releases a writer blocked in the kernel pipe.
+        self._stop_process(self.ffmpeg_process)
+        if thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        self._async_frame_thread = None
+        self._async_frame_stop.clear()
+        if frame_queue is not None:
+            while True:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _stop_ffmpeg_publisher(self) -> None:
+        self._stop_async_frame_writer()
+        self._stop_process(self.ffmpeg_process)
 
     def _write_frame(self, frame: np.ndarray) -> None:
         process = self.ffmpeg_process
@@ -2831,7 +2962,7 @@ class FfmpegDirectSbsOutput:
             f"{delay:.3f}s; restarting FFmpeg publisher",
             flush=True,
         )
-        self._stop_process(self.ffmpeg_process)
+        self._stop_ffmpeg_publisher()
         self.ffmpeg_process = None
         self._frame_size = None
 
@@ -2851,7 +2982,11 @@ class FfmpegDirectSbsOutput:
             # speed cannot throttle the bandwidth probe.
             return
         try:
-            self._write_frame(frame)
+            if self._darwin_async_submit:
+                self._raise_async_frame_error()
+                self._enqueue_async_frame(frame)
+            else:
+                self._write_frame(frame)
         except (BrokenPipeError, OSError, RuntimeError) as exc:
             # A dead FFmpeg whose last diagnostics point at the audio input
             # (dshow/wasapi open failure) is restarted once without audio so
@@ -2879,11 +3014,15 @@ class FfmpegDirectSbsOutput:
                 if self._soundcard_audio is not None:
                     self._soundcard_audio.close()
                     self._soundcard_audio = None
-                self._stop_process(self.ffmpeg_process)
+                self._stop_ffmpeg_publisher()
                 self.ffmpeg_process = None
                 self._frame_size = None
                 self._start_ffmpeg(*size)
-                self._write_frame(frame)
+                if self._darwin_async_submit:
+                    self._raise_async_frame_error()
+                    self._enqueue_async_frame(frame)
+                else:
+                    self._write_frame(frame)
                 return
             if self.video_encoder not in {"h264_nvenc", "hevc_nvenc"}:
                 raise
@@ -2893,12 +3032,16 @@ class FfmpegDirectSbsOutput:
                 f"{software_encoder}",
                 flush=True,
             )
-            self._stop_process(self.ffmpeg_process)
+            self._stop_ffmpeg_publisher()
             self.ffmpeg_process = None
             self._frame_size = None
             self.video_encoder = software_encoder
             self._start_ffmpeg(*size)
-            self._write_frame(frame)
+            if self._darwin_async_submit:
+                self._raise_async_frame_error()
+                self._enqueue_async_frame(frame)
+            else:
+                self._write_frame(frame)
 
     @staticmethod
     def _stop_process(process: subprocess.Popen | None) -> None:
@@ -2928,7 +3071,7 @@ class FfmpegDirectSbsOutput:
         if self._soundcard_audio is not None:
             self._soundcard_audio.close()
             self._soundcard_audio = None
-        self._stop_process(self.ffmpeg_process)
+        self._stop_ffmpeg_publisher()
         self._stop_process(self.server_process)
         if self._server_log_thread is not None:
             self._server_log_thread.join(timeout=0.5)
@@ -3124,8 +3267,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
                 # be starved by a stalled video pipe producer. The WASAPI
                 # soundcard input skips the demuxer wall-clock option (it
                 # silences the chain on this FFmpeg build) and is re-anchored
-                # in the filter graph via asetpts=RTCTIME instead. macOS
-                # skips it too (see _audio_filter_graph).
+                # in the filter graph instead. macOS skips it too (see
+                # _audio_filter_graph).
                 "-thread_queue_size",
                 "512",
                 *(
@@ -3173,8 +3316,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             command.extend(["-map", "1:a:0"])
             # Same normalized audio timeline as the FFmpeg path (async=1,
             # the v2.5.0 magnitude) for every client protocol; the WASAPI
-            # soundcard path adds the asetpts=RTCTIME wall-clock re-anchor
-            # (see _audio_filter_graph).
+            # soundcard path adds the asetpts wall-clock re-anchor (see
+            # _audio_filter_graph).
             command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC":
                 command.extend(

@@ -233,6 +233,50 @@ def test_darwin_unconfigured_audio_stays_video_only(monkeypatch) -> None:
     assert target._audio_input_args() == []
 
 
+def test_darwin_frame_submit_replaces_stale_frame_without_blocking() -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target._darwin_async_submit = True
+    target._async_frame_queue = queue.Queue(maxsize=1)
+    target._async_frame_lock = threading.Lock()
+    target._async_frame_drops = 0
+
+    first = np.zeros((2, 4, 3), dtype=np.uint8)
+    second = np.full_like(first, 17)
+    third = np.full_like(first, 33)
+    target._async_frame_queue.put_nowait(first)
+
+    target._enqueue_async_frame(second)
+    target._enqueue_async_frame(third)
+
+    queued = target._async_frame_queue.get_nowait()
+    assert queued[0, 0].tolist() == [33, 33, 33]
+    assert target._async_frame_drops == 2
+    # The queued frame owns its storage, so a converter buffer can be reused.
+    third.fill(99)
+    assert queued[0, 0].tolist() == [33, 33, 33]
+
+
+def test_darwin_submit_frame_does_not_write_on_runtime_thread() -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target._darwin_async_submit = True
+    target._async_frame_queue = queue.Queue(maxsize=1)
+    target._async_frame_lock = threading.Lock()
+    target._async_frame_drops = 0
+    target._async_frame_error = None
+    target._apply_pending_audio_delay = lambda: None
+    target._calibration_controller = None
+    target.ffmpeg_process = SimpleNamespace()
+    target._frame_size = (4, 2)
+
+    writes = []
+    target._write_frame = lambda frame: writes.append(frame)
+    frame = np.zeros((2, 4, 3), dtype=np.uint8)
+    target.submit_frame(frame)
+
+    assert writes == []
+    assert target._async_frame_queue.qsize() == 1
+
+
 def test_darwin_safe_mediamtx_config_zeroes_udp_read_buffer(tmp_path: Path) -> None:    # MediaMTX aborts on macOS when udpReadBufferSize > 0 ("read buffer size
     # is unimplemented"); the darwin launcher must rewrite it to 0 while
     # keeping every other setting intact.
@@ -884,10 +928,11 @@ def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    # macOS re-anchors audio to the video wall-clock base in the filter graph
-    # (asetpts=RTCTIME, delay folded in: -0.1s -> -100000us) instead of the
-    # audio demuxer wall-clock option, so audio keeps smooth device pacing.
-    assert command[command.index("-af") + 1] == "asetpts=RTCTIME-100000,aresample=async=1"
+    # macOS normalizes AVFoundation's absolute microsecond timestamp to the
+    # stream time base and folds in the -0.1s audio delay.
+    assert command[command.index("-af") + 1] == (
+        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+    )
     assert command[command.index("-ar") + 1] == "48000"
     assert command[command.index("-ac") + 1] == "2"
     assert command[command.index("-b:a") + 1] == "96k"
@@ -929,8 +974,10 @@ def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    # Default audio_delay (-0.1s) folds into the RTCTIME anchor on macOS.
-    assert command[command.index("-af") + 1] == "asetpts=RTCTIME-100000,aresample=async=1"
+    # Default audio_delay (-0.1s) folds into the normalized macOS timestamp.
+    assert command[command.index("-af") + 1] == (
+        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+    )
     assert "aac" not in command
 
 
