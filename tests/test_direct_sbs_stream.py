@@ -206,14 +206,31 @@ def test_darwin_audio_input_args_strip_backend_prefix(monkeypatch) -> None:
     target.stereo_mix_device = "soundcard:Gone Device"
     assert target._audio_input_args()[-2:] == ["-i", ":1"]
 
-    # Empty / bare-prefix / lone-colon / "no device" values must not reach
-    # FFmpeg as "-i :" (it aborts with "Error opening input file :."); on
-    # macOS they auto-select a loopback device so the stream carries sound.
+    # Empty / bare-prefix / lone-colon / "no device" values must not start a
+    # live AVFoundation input: that input can block the video muxer. Explicit
+    # device names still use the configured audio path above.
     for bad in ("", "soundcard:", "wasapi:", ":", "No Stereo Mix device found"):
         target.stereo_mix_device = bad
         args = target._audio_input_args()
-        assert args, f"device {bad!r} must auto-select audio"
-        assert args[-1].startswith(":")
+        assert args == [], f"device {bad!r} must remain video-only"
+
+
+def test_darwin_unconfigured_audio_stays_video_only(monkeypatch) -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target.os_name = "Darwin"
+    target.audio_delay = 0.0
+    target.ffmpeg_path = Path("/usr/bin/ffmpeg")
+    target.stereo_mix_device = ""
+
+    monkeypatch.setattr(
+        direct_sbs,
+        "_auto_select_darwin_audio",
+        lambda _ffmpeg: (_ for _ in ()).throw(
+            AssertionError("unconfigured audio must not start a device probe")
+        ),
+    )
+
+    assert target._audio_input_args() == []
 
 
 def test_darwin_safe_mediamtx_config_zeroes_udp_read_buffer(tmp_path: Path) -> None:    # MediaMTX aborts on macOS when udpReadBufferSize > 0 ("read buffer size

@@ -1043,7 +1043,7 @@ def run_processing_runtime(*, max_seconds: float | None = None) -> int:
                     settings.get("Audio Capture Backend", "auto") or "auto"
                 ).strip().casefold()
                 selected_audio = str(settings.get("Stereo Mix", "") or "").strip()
-                if audio_backend in {"auto", "soundcard"} and not selected_audio.casefold().startswith(
+                if selected_audio and audio_backend in {"auto", "soundcard"} and not selected_audio.casefold().startswith(
                     ("soundcard:", "wasapi:")
                 ):
                     selected_audio = f"soundcard:{selected_audio}"

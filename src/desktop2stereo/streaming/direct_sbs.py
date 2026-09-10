@@ -1927,11 +1927,17 @@ class FfmpegDirectSbsOutput:
     def _audio_input_args(self) -> list[str]:
         device = self.stereo_mix_device
         if self.os_name == "Darwin":
-            # No configured device (or a "no device found" placeholder):
-            # auto-pick a loopback capture device so the stream always
-            # carries sound on macOS.
-            if not device or device.lower().startswith(("no ", "none", "null")):
-                device = _auto_select_darwin_audio(self.ffmpeg_path)
+            # An unconfigured audio source must not open a live AVFoundation
+            # input: its clock can block the video muxer for hundreds of ms.
+            # Audio remains available when the user explicitly selects a
+            # device (for example ``soundcard:BlackHole 2ch``).
+            normalized = device.casefold().strip()
+            if (
+                not normalized
+                or normalized in {"soundcard:", "wasapi:", ":"}
+                or normalized.startswith(("no ", "none", "null"))
+            ):
+                return []
         if not device or device.lower().startswith(("no ", "none", "null")):
             return []
         if self.os_name == "Windows":
