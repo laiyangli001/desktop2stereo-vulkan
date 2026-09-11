@@ -1061,7 +1061,7 @@ def test_device_authorization_and_pending_poll(monkeypatch):
     )
     monkeypatch.setattr("desktop2stereo.auth.client.httpx.post", lambda *args, **kwargs: calls.append(kwargs) or next(responses))
     client = AuthClient()
-    authorization = client.authorize_device()
+    authorization = client.authorize_device(platform_name="windows")
     assert authorization.user_code == "ABCD1234"
     assert authorization.verification_uri_complete.endswith("user_code=ABCD1234")
     assert calls[0]["json"] == {

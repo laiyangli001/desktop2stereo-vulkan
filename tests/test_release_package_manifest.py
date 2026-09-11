@@ -122,7 +122,7 @@ def test_release_package_allows_public_pem_certificates(tmp_path: Path):
 
 @pytest.mark.parametrize("platform", ["linux", "macos"])
 def test_release_package_verifies_posix_launcher_layout(tmp_path: Path, platform: str):
-    if platform == "linux" and sys.platform == "win32":
+    if platform == "linux" and sys.platform in {"win32", "darwin"}:
         pytest.skip("Linux release layout uses case-distinct paths on case-sensitive filesystems")
     package = tmp_path / "Desktop2Stereo"
     _make_posix_package(package, platform)
