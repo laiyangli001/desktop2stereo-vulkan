@@ -70,6 +70,10 @@ jobs:
       - name: Install authorization test dependencies
         run: python -m pip install --disable-pip-version-check pytest httpx flet pyyaml cryptography truststore numpy glfw soundcard
 
+      - name: Install Windows authorization test dependencies
+        if: runner.os == 'Windows'
+        run: python -m pip install --disable-pip-version-check pywin32
+
       - name: Test authorization and native launcher contracts
         env:
           PYTHONPATH: src
