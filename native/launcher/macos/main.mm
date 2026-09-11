@@ -69,7 +69,7 @@
     self.task.arguments = @[script];
     self.task.currentDirectoryPath = app;
     NSMutableDictionary* environment = [NSMutableDictionary dictionaryWithDictionary:NSProcessInfo.processInfo.environment];
-    environment[@"PYTHONPATH"] = app;
+    environment[@"PYTHONPATH"] = [root stringByAppendingPathComponent:@"src"];
     self.task.environment = environment;
     [self.task launch];
     self.deadline = [NSDate dateWithTimeIntervalSinceNow:60.0];

@@ -9,6 +9,14 @@ from path_config import APP_ROOT, PROJECT_ROOT
 ROOT = PROJECT_ROOT
 RUNTIME_ENTRY = APP_ROOT / "app_runtime/runtime_entry.py"
 
+# Runtime-entry import tests must not depend on a machine-specific output display.
+import utils
+
+_test_settings = utils._get_settings()
+_test_settings["Stereo Output"] = None
+_test_settings["Stereo Output Identity"] = None
+utils._runtime_exports = None
+
 
 def _load_environment_resolver():
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
@@ -59,6 +67,29 @@ def test_stop_request_watcher_sets_runtime_event(tmp_path: Path) -> None:
     assert stopped.is_set()
     assert not watcher.is_alive()
     assert not request.exists()
+
+
+def test_lease_loss_watcher_sets_runtime_shutdown_event() -> None:
+    import threading
+
+    from app_runtime.runtime_entry import _watch_lease_loss
+
+    lease_lost = threading.Event()
+    shutdown = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_lease_loss,
+        kwargs={
+            "lease_lost": lease_lost,
+            "stop_event": shutdown,
+            "poll_interval": 0.01,
+        },
+    )
+    watcher.start()
+    lease_lost.set()
+    watcher.join(timeout=1.0)
+
+    assert shutdown.is_set()
+    assert not watcher.is_alive()
 
 
 def test_legacy_streamer_normalizes_to_mjpeg() -> None:

@@ -14,33 +14,18 @@ from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
 from stereo_runtime.pipeline import RuntimePipelineLoop
+import utils
 from utils import (
-    CAPTURE_MODE,
-    CAPTURE_TOOL,
-    CONVERGENCE,
-    DEPTH_STRENGTH,
-    DEVICE,
-    DEVICE_INFO,
-    DISPLAY_MODE,
-    FPS,
-    LOCAL_VSYNC,
-    MONITOR_INDEX,
-    OPENXR_SCREEN_DISTANCE,
-    OPENXR_SCREEN_WIDTH,
     OS_NAME,
-    OUTPUT_RESOLUTION,
-    RENDER_SIZE_CONFIG,
-    RUN_MODE,
-    SHOW_FPS,
-    STEREO_DISPLAY_INDEX,
-    STEREO_DISPLAY_SELECTION,
-    WINDOW_TITLE,
     _get_settings,
     shutdown_event,
 )
 from utils.display_info import resolve_windows_fullscreen_policy
 from utils.run_mode import normalize_run_mode, target_fps_for_run_mode
-from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL
+from utils.xr_headset_presets import (
+    DEFAULT_XR_HEADSET_MODEL,
+    resolve_xr_headset_preset,
+)
 from streaming.stream_session import (
     CALIBRATABLE_STREAM_MODES,
     NetworkStreamSessionConfig,
@@ -50,21 +35,6 @@ from streaming.stream_session import (
 )
 
 from .runtime_callbacks import RuntimeCallbacks
-from .runtime_context import (
-    build_capture_callbacks,
-    build_runtime_pipeline_context,
-    create_runtime_context,
-)
-from .runtime_output import VulkanRuntimeOutputConsumer
-from stereo_runtime.nvfruc import probe_nvfruc
-from stereo_runtime.nvfruc_calibration import (
-    NvFrucCalibrationCache,
-    NvFrucCalibrationController,
-    calibration_fingerprint,
-    limit_nvfruc_output_fps,
-    output_base_fps,
-)
-from stereo_runtime.nvfruc_stage import NvFrucStage
 
 
 def _resolve_filament_environment_paths(
@@ -143,6 +113,30 @@ def _load_common_filament_defaults(src_root: Path) -> dict[str, object]:
         return {}
     filament = common.get("filament", {})
     return filament if isinstance(filament, dict) else {}
+
+
+def _load_runtime_exports_for_execution() -> None:
+    """Load hardware-dependent exports only when the runtime is launched."""
+    for name in (
+        "CAPTURE_MODE",
+        "CAPTURE_TOOL",
+        "CONVERGENCE",
+        "DEPTH_STRENGTH",
+        "DEVICE",
+        "DEVICE_INFO",
+        "DISPLAY_MODE",
+        "FPS",
+        "LOCAL_VSYNC",
+        "MONITOR_INDEX",
+        "OUTPUT_RESOLUTION",
+        "RENDER_SIZE_CONFIG",
+        "RUN_MODE",
+        "SHOW_FPS",
+        "STEREO_DISPLAY_INDEX",
+        "STEREO_DISPLAY_SELECTION",
+        "WINDOW_TITLE",
+    ):
+        globals()[name] = getattr(utils, name)
 
 
 def _resolve_openxr_render_scale(
@@ -332,10 +326,16 @@ def _openxr_filament_config(
         "filament_glow_smoothing_seconds": float(
             common_filament.get("glow_smoothing_seconds", 0.10)
         ),
-        # These values are resolved by the legacy viewer-settings path and
-        # exported through utils; keep the Vulkan entrypoint as a consumer.
-        "filament_screen_width": float(OPENXR_SCREEN_WIDTH),
-        "filament_screen_distance": float(OPENXR_SCREEN_DISTANCE),
+        "filament_screen_width": float(
+            resolve_xr_headset_preset(
+                settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
+            ).width_m
+        ),
+        "filament_screen_distance": float(
+            resolve_xr_headset_preset(
+                settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
+            ).distance_m
+        ),
     }
 
 
@@ -394,6 +394,23 @@ def _watch_stop_request(
             return
 
 
+def _watch_lease_loss(
+    lease_lost: threading.Event,
+    *,
+    stop_event: threading.Event,
+    poll_interval: float = 0.05,
+) -> None:
+    """Bridge online lease loss into the runtime-wide shutdown event."""
+    while not stop_event.wait(poll_interval):
+        if lease_lost.is_set():
+            print(
+                "[AUTH] Online authorization lease expired; stopping runtime.",
+                flush=True,
+            )
+            stop_event.set()
+            return
+
+
 def _wait_for_runtime_ready(
     ready_event: threading.Event,
     pipeline_thread: threading.Thread,
@@ -418,11 +435,17 @@ def _wait_for_runtime_ready(
     return False
 
 
-def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: threading.Event | None = None) -> int:
+def run_processing_runtime(
+    *,
+    max_seconds: float | None = None,
+    lease_lost: threading.Event | None = None,
+    lease_recheck=None,
+) -> int:
     """Run capture, inference, and pipeline threads until shutdown is requested."""
 
     shutdown_event.clear()
     stop_request_thread = None
+    lease_monitor_thread = None
     stop_request_path = os.environ.get("D2S_STOP_REQUEST_FILE", "").strip()
     if stop_request_path:
         stop_request_thread = threading.Thread(
@@ -436,7 +459,34 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
             daemon=True,
         )
         stop_request_thread.start()
+    if lease_lost is not None:
+        lease_monitor_thread = threading.Thread(
+            target=_watch_lease_loss,
+            kwargs={
+                "lease_lost": lease_lost,
+                "stop_event": shutdown_event,
+            },
+            name="D2SLeaseMonitor",
+            daemon=True,
+        )
+        lease_monitor_thread.start()
     settings = _get_settings()
+    _load_runtime_exports_for_execution()
+    from .runtime_context import (
+        build_capture_callbacks,
+        build_runtime_pipeline_context,
+        create_runtime_context,
+    )
+    from .runtime_output import VulkanRuntimeOutputConsumer
+    from stereo_runtime.nvfruc import probe_nvfruc
+    from stereo_runtime.nvfruc_calibration import (
+        NvFrucCalibrationCache,
+        NvFrucCalibrationController,
+        calibration_fingerprint,
+        limit_nvfruc_output_fps,
+        output_base_fps,
+    )
+    from stereo_runtime.nvfruc_stage import NvFrucStage
     configured_run_mode = normalize_run_mode(
         settings.get("Run Mode", "Local Viewer")
     )
@@ -546,6 +596,7 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
         context,
         show_fps=bool(SHOW_FPS),
         display_fit_mode=settings.get("Display Fit Mode", "contain"),
+        on_authorization_recheck=lease_recheck,
     )
 
     low_sbs_report_count = 0
@@ -734,6 +785,9 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
     capture_thread.start()
     pipeline_thread.start()
     try:
+        if lease_lost is not None and lease_lost.is_set():
+            shutdown_event.set()
+            return 1
         if str(RUN_MODE).strip().lower() == "openxr":
             if not _wait_for_runtime_ready(runtime_ready_event, pipeline_thread):
                 return 0
@@ -1072,6 +1126,8 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
         shutdown_event.set()
         if stop_request_thread is not None:
             stop_request_thread.join(timeout=0.2)
+        if lease_monitor_thread is not None:
+            lease_monitor_thread.join(timeout=0.2)
         callbacks.stop_active_capture_session()
         _queue_clear(context.raw_q)
         _queue_clear(context.runtime_q)

@@ -48,12 +48,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         except AuthError as exc:
             print(f"[AUTH] {exc} ({exc.code})", file=sys.stderr, flush=True)
             return 1
-        lease = RuntimeLease(session) if session.access_token else None
-        if lease is not None:
-            lease.start()
-        from .runtime_entry import run_processing_runtime
+        lease = RuntimeLease(session) if _uses_online_lease(session) else None
         try:
-            return run_processing_runtime(max_seconds=args.runtime_seconds, lease_lost=lease.lost if lease else None)
+            if lease is not None:
+                lease.start()
+            from .runtime_entry import run_processing_runtime
+            return run_processing_runtime(
+                max_seconds=args.runtime_seconds,
+                lease_lost=lease.lost if lease else None,
+                lease_recheck=lease.request_recheck if lease else None,
+            )
+        except AuthError as exc:
+            print(f"[AUTH] {exc} ({exc.code})", file=sys.stderr, flush=True)
+            return 1
         finally:
             if lease is not None:
                 lease.close()
@@ -88,3 +95,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     gui_main()
     return 0
+
+
+def _uses_online_lease(session) -> bool:
+    """Only online licenses need a server-backed runtime lease."""
+
+    if not session.access_token:
+        return False
+    selected_id = session.selected_license_id
+    if not isinstance(selected_id, str) or not selected_id.strip():
+        return True
+    for item in session.licenses:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        if item["id"] == selected_id:
+            mode = item.get("mode", "online")
+            return not isinstance(mode, str) or mode.casefold() == "online"
+    # Keep legacy sessions fail-safe until their next status refresh.
+    return True

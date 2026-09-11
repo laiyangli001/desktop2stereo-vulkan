@@ -10,6 +10,7 @@ safetensors==0.8.0
 numpy==2.5.0
 pillow==12.2.0
 flet==0.86.5
+qrcode==8.2
 httpx==0.28.1
 cryptography==46.0.3
 onnx==1.22.0
@@ -18,7 +19,7 @@ mss==10.2.0
 pynput==1.8.2
 wincam==1.0.14; sys_platform == "win32"
 windows-capture==2.0.0; sys_platform == "win32"
-python_xlib; sys_platform == "linux"
+python_xlib==0.33; sys_platform == "linux"
 # for video depth anything
 imageio==2.37.3
 easydict==1.13
@@ -26,7 +27,7 @@ einops==0.8.2
 
 # for rtmp and new streaming
 sounddevice==0.5.5
-pygltflib>=1.16.5
+pygltflib==1.16.5
 
 # Vulkan/OpenXR primary path
 pyopenxr==1.1.5301
