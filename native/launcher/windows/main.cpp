@@ -125,6 +125,22 @@ void ShowFailure(const wchar_t* message) {
     MessageBoxW(nullptr, message, L"Desktop2Stereo", MB_OK | MB_ICONERROR);
 }
 
+void StopChildProcess() {
+    if (!g_process) return;
+    if (WaitForSingleObject(g_process, 0) == WAIT_TIMEOUT) {
+        TerminateProcess(g_process, 1);
+        WaitForSingleObject(g_process, 2000);
+    }
+    CloseHandle(g_process);
+    g_process = nullptr;
+}
+
+void DetachChildProcess() {
+    if (!g_process) return;
+    CloseHandle(g_process);
+    g_process = nullptr;
+}
+
 bool StartPython() {
     const auto python = g_root / L"src" / L"python3" / L"python.exe";
     const auto script = g_root / L"src" / L"desktop2stereo" / L"main.py";
@@ -137,6 +153,8 @@ bool StartPython() {
     std::filesystem::create_directories(logDir, ec);
     std::filesystem::remove(logDir / L"auth_ready.flag", ec);
     std::filesystem::remove(logDir / L"gui_ready.flag", ec);
+    const auto pythonPath = g_root / L"src";
+    SetEnvironmentVariableW(L"PYTHONPATH", pythonPath.c_str());
     std::wstring command = L"\"" + python.wstring() + L"\" \"" + script.wstring() + L"\"";
     std::vector<wchar_t> mutableCommand(command.begin(), command.end());
     mutableCommand.push_back(L'\0');
@@ -159,18 +177,21 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     if (message == WM_TIMER && wParam == kTimerId) {
         if (ReadyFileExists()) {
             KillTimer(window, kTimerId);
+            DetachChildProcess();
             DestroyWindow(window);
             return 0;
         }
         if (g_process && WaitForSingleObject(g_process, 0) == WAIT_OBJECT_0) {
             KillTimer(window, kTimerId);
             ShowFailure(L"Desktop2Stereo exited before the GUI became ready.\nSee logs/launcher_stderr.log for details.");
+            StopChildProcess();
             PostQuitMessage(1);
             return 0;
         }
         if (GetTickCount() - g_startedAt > kTimeoutMs) {
             KillTimer(window, kTimerId);
             ShowFailure(L"Desktop2Stereo did not become ready within 60 seconds.");
+            StopChildProcess();
             PostQuitMessage(2);
             return 0;
         }
@@ -247,7 +268,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    if (g_process) CloseHandle(g_process);
+    StopChildProcess();
     CoUninitialize();
     return static_cast<int>(message.wParam);
 }

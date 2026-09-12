@@ -101,6 +101,21 @@ static bool ready(const fs::path& auth_path, const fs::path& gui_path) {
     return fs::is_regular_file(auth_path) || fs::is_regular_file(gui_path);
 }
 
+static void stop_child(pid_t child) {
+    if (child <= 0) return;
+    if (kill(child, SIGTERM) == 0) {
+        int status = 0;
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            if (waitpid(child, &status, WNOHANG) == child) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    if (kill(child, SIGKILL) == 0) {
+        int status = 0;
+        waitpid(child, &status, 0);
+    }
+}
+
 int main() {
     const auto root = project_root(executable_dir());
     const auto app = root / "src/desktop2stereo";
@@ -167,7 +182,8 @@ int main() {
 
     const pid_t child = fork();
     if (child == 0) {
-        setenv("PYTHONPATH", app.c_str(), 1);
+        const auto python_path = root / "src";
+        setenv("PYTHONPATH", python_path.c_str(), 1);
         chdir(app.c_str());
         execl(python.c_str(), python.c_str(), main_script.c_str(), static_cast<char*>(nullptr));
         _exit(127);
@@ -183,6 +199,7 @@ int main() {
         if (ready(auth_ready_file, ready_file)) break;
         if (waitpid(child, &status, WNOHANG) == child) {
             std::cerr << "Desktop2Stereo launcher: GUI exited before ready\n";
+            stop_child(child);
             XDestroyWindow(display, window);
             XCloseDisplay(display);
             return WIFEXITED(status) ? WEXITSTATUS(status) : 6;
@@ -190,9 +207,13 @@ int main() {
         while (XPending(display)) { XEvent event{}; XNextEvent(display, &event); }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (!ready(auth_ready_file, ready_file)) std::cerr << "Desktop2Stereo launcher: GUI ready timeout\n";
+    const bool is_ready = ready(auth_ready_file, ready_file);
+    if (!is_ready) {
+        std::cerr << "Desktop2Stereo launcher: GUI ready timeout\n";
+        stop_child(child);
+    }
     XDestroyWindow(display, window);
     XFreeColormap(display, colormap);
     XCloseDisplay(display);
-    return ready(auth_ready_file, ready_file) ? 0 : 7;
+    return is_ready ? 0 : 7;
 }

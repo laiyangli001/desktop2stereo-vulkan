@@ -68,6 +68,15 @@ export PYTHONPATH="${SCRIPT_DIR}"
 # Start the GUI process, redirect stdout/stderr to log files, run in background
 "${PYTHON_EXE}" -m desktop2stereo.main > "${LAUNCH_STDOUT}" 2> "${LAUNCH_STDERR}" &
 GUI_PID=$!
+HANDOFF=0
+
+cleanup_child() {
+    if [ "${HANDOFF}" -eq 0 ] && kill -0 "${GUI_PID}" 2>/dev/null; then
+        kill "${GUI_PID}" 2>/dev/null || true
+        wait "${GUI_PID}" 2>/dev/null || true
+    fi
+}
+trap cleanup_child EXIT
 
 # ----------------------------------------------------------------------
 # Wait for the ready flag (timeout after 60 seconds)
@@ -77,6 +86,7 @@ deadline=$((SECONDS + timeout_seconds))
 while [ $SECONDS -lt $deadline ]; do
     if [ -f "${GUI_READY_FILE}" ]; then
         # GUI is ready – exit cleanly
+        HANDOFF=1
         exit 0
     fi
     # Check if the GUI process is still running

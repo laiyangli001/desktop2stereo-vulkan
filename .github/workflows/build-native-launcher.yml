@@ -8,8 +8,18 @@ on:
       - "src/desktop2stereo/auth/**"
       - "src/desktop2stereo/app_runtime/**"
       - "src/desktop2stereo/main.py"
+      - "src/env_install/requirements*.txt"
       - "scripts/install-public-key.mjs"
       - "scripts/write-release-manifest.mjs"
+      - "scripts/verify-release-package.mjs"
+      - "scripts/scan-release-secrets.mjs"
+      - "scripts/write-release-sbom.mjs"
+      - "scripts/write-build-info.mjs"
+      - "scripts/stage-python-runtime.py"
+      - "tests/test_release_package_manifest.py"
+      - "tests/test_release_sbom.py"
+      - "tests/test_release_secrets.py"
+      - "tests/test_python_runtime_staging.py"
       - ".github/workflows/build-native-launcher.yml"
 
 jobs:
@@ -25,6 +35,11 @@ jobs:
       - name: Build
         run: cmake --build build/native-launcher --config Release --parallel
 
+      - name: Set up packaging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+
       - name: Package launcher
         shell: pwsh
         env:
@@ -38,7 +53,18 @@ jobs:
           Copy-Item src/desktop2stereo/app_runtime,src/desktop2stereo/auth,src/desktop2stereo/gui,src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/ -Recurse
           Copy-Item src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
           Copy-Item native/launcher/windows/README.md dist/Desktop2Stereo/
+          node scripts/write-build-info.mjs dist/Desktop2Stereo
+          $runtimeUrl = "https://www.nuget.org/api/v2/package/python/3.12.10"
+          $runtimeArchive = Join-Path $env:RUNNER_TEMP "python-3.12.10-nuget.zip"
+          Invoke-WebRequest -Uri $runtimeUrl -OutFile $runtimeArchive
+          python scripts/stage-python-runtime.py windows $runtimeArchive dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url $runtimeUrl --sha256 0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8 --expected-version 3.12.10
+          $runtimePython = (Resolve-Path dist/Desktop2Stereo/src/python3/python.exe).Path
+          & $runtimePython -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install locked release dependencies." }
+          node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
+          node scripts/verify-release-package.mjs dist/Desktop2Stereo windows
+          node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload Windows launcher
         uses: actions/upload-artifact@v4
@@ -61,6 +87,11 @@ jobs:
       - name: Build
         run: cmake --build build/native-launcher-linux --parallel
 
+      - name: Set up packaging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+
       - name: Package launcher
         env:
           D2S_LICENSE_PUBLIC_KEY_JSON: ${{ vars.D2S_LICENSE_PUBLIC_KEY_JSON }}
@@ -73,7 +104,16 @@ jobs:
           cp -R src/desktop2stereo/app_runtime src/desktop2stereo/auth src/desktop2stereo/gui src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/
           cp src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
           cp native/launcher/linux/README.md dist/Desktop2Stereo/
+          node scripts/write-build-info.mjs dist/Desktop2Stereo
+          runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+          runtime_archive="$RUNNER_TEMP/python-3.12.14-linux.tar.gz"
+          curl --fail --location --retry 3 "$runtime_url" --output "$runtime_archive"
+          python scripts/stage-python-runtime.py linux "$runtime_archive" dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url "$runtime_url" --sha256 72748da13197c1fb161e3afeef20a6a385ff24f2165e6e2758e47008e7faba4c --expected-version 3.12.14
+          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
+          node scripts/verify-release-package.mjs dist/Desktop2Stereo linux
+          node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload Linux launcher
         uses: actions/upload-artifact@v4
@@ -93,6 +133,11 @@ jobs:
       - name: Build
         run: cmake --build build/native-launcher-macos --config Release --parallel
 
+      - name: Set up packaging Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12.10"
+
       - name: Package launcher
         env:
           D2S_LICENSE_PUBLIC_KEY_JSON: ${{ vars.D2S_LICENSE_PUBLIC_KEY_JSON }}
@@ -105,10 +150,42 @@ jobs:
           cp -R src/desktop2stereo/app_runtime src/desktop2stereo/auth src/desktop2stereo/gui src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/
           cp src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
           cp native/launcher/macos/README.md dist/Desktop2Stereo/
+          node scripts/write-build-info.mjs dist/Desktop2Stereo
+          runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-apple-darwin-install_only_stripped.tar.gz"
+          runtime_archive="$RUNNER_TEMP/python-3.12.14-macos-arm64.tar.gz"
+          curl --fail --location --retry 3 "$runtime_url" --output "$runtime_archive"
+          python scripts/stage-python-runtime.py macos "$runtime_archive" dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url "$runtime_url" --sha256 81a359f1cfadd4da11766534c5913791cea55f26e1bb902cacd2a531bb1e4b2b --expected-version 3.12.14
+          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
+          node scripts/verify-release-package.mjs dist/Desktop2Stereo macos
+          node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload macOS launcher
         uses: actions/upload-artifact@v4
         with:
           name: Desktop2Stereo-macos-launcher-${{ github.sha }}
           path: dist/Desktop2Stereo
+
+  malware-scan:
+    name: Scan packaged launchers for malware
+    needs: [windows-launcher, linux-launcher, macos-launcher]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Desktop2Stereo-*-launcher-${{ github.sha }}
+          path: dist
+
+      - name: Install ClamAV
+        run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
+
+      - name: Update ClamAV signatures
+        run: sudo freshclam --stdout --verbose
+
+      - name: Scan final release artifacts
+        run: |
+          find dist -type f -print0 | xargs -0 -r sudo clamscan --infected --no-summary

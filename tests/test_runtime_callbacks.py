@@ -21,6 +21,9 @@ class FakeOpenXrState:
             depth_strength=depth_strength
         )
         self.updates: list[dict[str, float | None]] = []
+        self.render_active = threading.Event()
+        self.source_active = threading.Event()
+        self.wait_idle_active = threading.Event()
 
     def update_runtime_config(self, **values) -> None:
         self.updates.append(values)
@@ -30,10 +33,11 @@ class FakeOpenXrState:
             ]
 
 
-def _callbacks(depth_strength: float = 0.75) -> RuntimeCallbacks:
+def _callbacks(depth_strength: float = 0.75, on_authorization_recheck=None) -> RuntimeCallbacks:
     context = SimpleNamespace(
         stereo_runtime=SimpleNamespace(
-            stereo_config=SimpleNamespace(depth_strength=depth_strength)
+            stereo_config=SimpleNamespace(depth_strength=depth_strength),
+            set_inference_active=lambda _active: None,
         ),
         openxr_state=FakeOpenXrState(depth_strength),
         fps_breakdown=SimpleNamespace(
@@ -41,7 +45,7 @@ def _callbacks(depth_strength: float = 0.75) -> RuntimeCallbacks:
             add_runtime_timing=lambda *_args, **_kwargs: None,
         ),
     )
-    return RuntimeCallbacks(context)
+    return RuntimeCallbacks(context, on_authorization_recheck=on_authorization_recheck)
 
 
 def test_local_breakdown_is_not_gated_by_openxr_render_state() -> None:
@@ -74,6 +78,19 @@ def test_capture_fps_reports_accepted_capture_rate_and_expires(monkeypatch) -> N
         "app_runtime.runtime_callbacks.time.perf_counter", lambda: 12.0
     )
     assert callbacks.capture_fps() == 0.0
+
+
+def test_openxr_resume_requests_authorization_recheck() -> None:
+    rechecks = []
+    callbacks = _callbacks(on_authorization_recheck=lambda: rechecks.append(True))
+    callbacks.queue_clear_nonblocking = lambda _queue: None
+    callbacks.context.raw_q = object()
+    callbacks.context.runtime_q = object()
+    callbacks.context.openxr_state.wait_idle_active.set()
+
+    callbacks.on_openxr_headset_state("active")
+
+    assert rechecks == [True]
 
 
 def test_show_fps_hot_reload_updates_viewer_provider() -> None:

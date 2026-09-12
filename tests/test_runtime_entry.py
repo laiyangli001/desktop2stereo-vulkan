@@ -11,6 +11,14 @@ from path_config import APP_ROOT, PROJECT_ROOT
 ROOT = PROJECT_ROOT
 RUNTIME_ENTRY = APP_ROOT / "app_runtime/runtime_entry.py"
 
+# Runtime-entry import tests must not depend on a machine-specific output display.
+import utils
+
+_test_settings = utils._get_settings()
+_test_settings["Stereo Output"] = None
+_test_settings["Stereo Output Identity"] = None
+utils._runtime_exports = None
+
 
 def _load_environment_resolver():
     source = RUNTIME_ENTRY.read_text(encoding="utf-8")
@@ -61,6 +69,29 @@ def test_stop_request_watcher_sets_runtime_event(tmp_path: Path) -> None:
     assert stopped.is_set()
     assert not watcher.is_alive()
     assert not request.exists()
+
+
+def test_lease_loss_watcher_sets_runtime_shutdown_event() -> None:
+    import threading
+
+    from app_runtime.runtime_entry import _watch_lease_loss
+
+    lease_lost = threading.Event()
+    shutdown = threading.Event()
+    watcher = threading.Thread(
+        target=_watch_lease_loss,
+        kwargs={
+            "lease_lost": lease_lost,
+            "stop_event": shutdown,
+            "poll_interval": 0.01,
+        },
+    )
+    watcher.start()
+    lease_lost.set()
+    watcher.join(timeout=1.0)
+
+    assert shutdown.is_set()
+    assert not watcher.is_alive()
 
 
 def test_legacy_streamer_normalizes_to_mjpeg() -> None:
@@ -191,9 +222,11 @@ def test_direct_stream_output_uses_uint8_nvenc_and_fps_provider() -> None:
 
 def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -> None:
     import app_runtime.runtime_entry as runtime_entry
+    from stereo_runtime.render_size import RenderSizeConfig
 
     monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(runtime_entry, "OUTPUT_RESOLUTION", (3840, 2160))
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", RenderSizeConfig(), raising=False)
+    monkeypatch.setattr(runtime_entry, "OUTPUT_RESOLUTION", (3840, 2160), raising=False)
     config = runtime_entry._resolve_local_viewer_render_size_config(
         {
             "Processing Resolution": "Auto",
@@ -210,9 +243,11 @@ def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -
 
 def test_local_viewer_native_4k_escape_hatch_and_macos_are_unchanged(monkeypatch) -> None:
     import app_runtime.runtime_entry as runtime_entry
+    from stereo_runtime.render_size import RenderSizeConfig
 
     settings = {"Processing Resolution": "Auto", "Display Mode": "Half-SBS"}
     device = type("CudaDevice", (), {"type": "cuda"})()
+    monkeypatch.setattr(runtime_entry, "RENDER_SIZE_CONFIG", RenderSizeConfig(), raising=False)
     monkeypatch.setenv("D2S_LOCAL_VIEWER_NATIVE_4K", "1")
     assert runtime_entry._resolve_local_viewer_render_size_config(
         settings, "Viewer", device

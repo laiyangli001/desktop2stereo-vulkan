@@ -9,6 +9,31 @@ from utils.queue_utils import clear_nonblocking, drain_latest, put_latest
 from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 
 
+def _read_settings_yaml(path: str) -> dict:
+    import yaml
+
+    with open(path, "r", encoding="utf-8") as file:
+        value = yaml.safe_load(file)
+    return value if isinstance(value, dict) else {}
+
+
+def _save_settings_yaml(path: str, settings: dict) -> tuple[bool, str]:
+    import yaml
+
+    temporary_path = path + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            yaml.safe_dump(settings, file, allow_unicode=True, sort_keys=False)
+        os.replace(temporary_path, path)
+        return True, ""
+    except OSError as exc:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            pass
+        return False, str(exc)
+
+
 class RuntimeCallbacks:
     def __init__(
         self,
@@ -16,6 +41,7 @@ class RuntimeCallbacks:
         *,
         show_fps: bool = False,
         display_fit_mode: str = "contain",
+        on_authorization_recheck=None,
     ):
         self.context = context
         self.capture_control = None
@@ -32,9 +58,17 @@ class RuntimeCallbacks:
         self._display_fit_mode = str(display_fit_mode or "contain")
         self.stream_output = None
         self._screen_state_save_error_logged = False
+        self._on_authorization_recheck = on_authorization_recheck
 
     def set_stream_output(self, output) -> None:
         self.stream_output = output
+
+    def request_authorization_recheck(self) -> None:
+        """Request an immediate online lease check after a runtime environment change."""
+
+        callback = self._on_authorization_recheck
+        if callable(callback):
+            callback()
 
     def show_fps(self) -> bool:
         return self._show_fps
@@ -163,20 +197,18 @@ class RuntimeCallbacks:
             if was_idle:
                 self.queue_clear_nonblocking(self.context.raw_q)
                 self.queue_clear_nonblocking(self.context.runtime_q)
+                self.request_authorization_recheck()
                 print("[Main] OpenXR headset resumed; inference restarted", flush=True)
 
     def on_openxr_controller_shortcut(self, action: str, **values) -> bool:
         """Apply renderer-independent depth shortcuts to runtime state."""
         if action == "select_environment_model":
             try:
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
-
                 model = str(values.get("model", "Default") or "Default")
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 settings["Environment Model"] = model
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 return True
@@ -189,17 +221,14 @@ class RuntimeCallbacks:
                     OPENXR_RENDER_SCALE_MIN,
                     min(OPENXR_RENDER_SCALE_MAX, float(values.get("value", 1.0))),
                 )
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
-
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 # Canonical name is percentage-oriented and is also read by
                 # the main Flet GUI. Keep the legacy key synchronized.
                 settings["XR Render"] = numeric
                 settings["XR Render Mode"] = "manual"
                 settings["OpenXR Render Scale"] = numeric
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 return True

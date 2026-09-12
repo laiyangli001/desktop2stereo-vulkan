@@ -34,7 +34,15 @@ class TokenStore:
         return value if isinstance(value, dict) else None
 
     def save(self, session: dict) -> bool:
-        raw = json.dumps(session, ensure_ascii=False, separators=(",", ":"))
+        if not isinstance(session, dict):
+            return False
+        # Access tokens are process-memory credentials and must never be
+        # persisted, even when a caller accidentally includes one.
+        persisted = {key: value for key, value in session.items() if key != "access_token"}
+        try:
+            raw = json.dumps(persisted, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return False
         return self._write_secure(raw)
 
     def clear(self) -> None:
