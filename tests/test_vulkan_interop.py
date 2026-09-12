@@ -192,3 +192,40 @@ def test_submit_frame_forwards_external_timeline_values() -> None:
     submit = submissions[0][2][0]
     assert submit.pNext.pWaitSemaphoreValues == [7]
     assert submit.pNext.pSignalSemaphoreValues == [8]
+
+
+def test_buffer_to_image_pair_uses_one_graphics_submission() -> None:
+    submissions = []
+    recordings = []
+    updates = []
+    context = object.__new__(VulkanContext)
+    context._image_states = SimpleNamespace(
+        update=lambda key, state: updates.append((key, state))
+    )
+
+    def prepare(source, destination):
+        return (
+            destination,
+            f"state-{destination}",
+            lambda command_buffer: recordings.append((command_buffer, source, destination)),
+        )
+
+    context._prepare_buffer_to_image_copy = prepare
+
+    def submit_on(role, record, **kwargs):
+        submissions.append((role, kwargs))
+        record("command-buffer")
+        return 12
+
+    context.submit_on = submit_on
+
+    assert context.copy_buffer_to_image_pair(
+        (("left-buffer", "left-image"), ("right-buffer", "right-image")),
+        wait_for_timeline=7,
+    ) == 12
+    assert submissions == [("graphics", {"wait_for_timeline": 7})]
+    assert recordings == [
+        ("command-buffer", "left-buffer", "left-image"),
+        ("command-buffer", "right-buffer", "right-image"),
+    ]
+    assert updates == [("left-image", "state-left-image"), ("right-image", "state-right-image")]

@@ -98,16 +98,15 @@ class Desktop2StereoGUI2(Desktop2StereoGUI):
         # established layout, where the surrounding row already constrains
         # the log panel height.
         self.log_viewport.tight = False
-        legacy_root = self._root_row
+        legacy_root = getattr(self, "_content_with_buttons", self._root_row)
         try:
             self.page.remove(legacy_root)
         except (ValueError, RuntimeError):
             if legacy_root in self.page.controls:
                 self.page.controls.remove(legacy_root)
 
-        for control in (self.lang_group, self._footer):
-            if control in self._scroll_area.controls:
-                self._scroll_area.controls.remove(control)
+        if self.lang_group in self._scroll_area.controls:
+            self._scroll_area.controls.remove(self.lang_group)
         self.log_panel.visible = True
 
         depth_rows = list(self.depth_group.content.controls)

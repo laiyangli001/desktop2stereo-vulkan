@@ -41,8 +41,9 @@ class VulkanMsdfQuadRenderer:
     _WORKGROUP_SIZE = 8
     # The full Chinese operation guide can contain more than 800 glyphs.
     # Keep one dispatch for the complete panel instead of splitting text
-    # across multiple Quad images.
-    _MAX_GLYPHS = 2048
+    # across multiple Quad images. 8192 covers the largest bilingual guide
+    # panels on the GPU path (399 KB glyph buffer, dispatch-bounded only).
+    _MAX_GLYPHS = 8192
     _GLYPH_STRIDE = 48
     _PUSH_CONSTANT_SIZE = 64
 
@@ -111,6 +112,24 @@ class VulkanMsdfQuadRenderer:
         except Exception:
             self.close()
             raise
+
+    def has_output_for(self, width: int, height: int) -> bool:
+        """Whether a render-target image already exists for this canvas size."""
+        return (int(width), int(height)) in self.outputs
+
+    def prewarm_outputs(self, sizes) -> None:
+        """Allocate the render-target images before the XR frame loop starts.
+
+        The first mid-frame allocation+layout-transition submission stalled on
+        VDXR/AMD (vkWaitSemaphores VkTimeout); the identical code completes
+        instantly at session start, so callers pass the overlay canvas sizes
+        up front and mid-frame renders are then pure cache hits.
+        """
+        for width, height in sizes:
+            try:
+                self._ensure_output(int(width), int(height))
+            except Exception:
+                pass
 
     def _create_atlas_image(self, vk: Any) -> None:
         pages = [self.atlas.page_rgba(page) for page in range(len(self.atlas.pages))]

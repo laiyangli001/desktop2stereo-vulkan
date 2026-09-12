@@ -52,10 +52,8 @@ def test_cuda_external_buffer_desc_matches_runtime_abi() -> None:
     assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 24
 
 
-def test_cuda_external_semaphore_enabled_by_default_and_can_be_disabled(monkeypatch) -> None:
+def test_cuda_external_semaphore_is_default_and_can_be_disabled(monkeypatch) -> None:
     monkeypatch.delenv("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", raising=False)
-    assert CudaVulkanOutputAdapter._external_semaphore_requested()
-    monkeypatch.setenv("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", "1")
     assert CudaVulkanOutputAdapter._external_semaphore_requested()
     monkeypatch.setenv("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", "0")
     assert not CudaVulkanOutputAdapter._external_semaphore_requested()
@@ -108,11 +106,49 @@ def test_cuda_timeline_semaphore_handle_types_match_runtime_enum() -> None:
         CudaVulkanImageImporter._semaphore_value(binary, 1)
 
 
-def test_rocm_external_semaphore_is_capability_gated_by_default(monkeypatch) -> None:
+def test_rocm_external_semaphore_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("D2S_ENABLE_ROCM_EXTERNAL_SEMAPHORE", raising=False)
-    assert RocmVulkanOutputAdapter._external_semaphore_requested()
+    assert not RocmVulkanOutputAdapter._external_semaphore_requested()
     monkeypatch.setenv("D2S_ENABLE_ROCM_EXTERNAL_SEMAPHORE", "0")
     assert not RocmVulkanOutputAdapter._external_semaphore_requested()
+
+
+def test_rocm_source_prepare_waits_for_hip_ready_semaphore() -> None:
+    adapter = RocmVulkanOutputAdapter.__new__(RocmVulkanOutputAdapter)
+    adapter._prepared_source_eyes = set()
+    adapter._rocm_ready_pending = {(7, 0)}
+    adapter._source_frames = {
+        7: (
+            SimpleNamespace(resource=object()),
+            SimpleNamespace(resource=object()),
+            0,
+        )
+    }
+    adapter._buffer_frames = {
+        7: (SimpleNamespace(), SimpleNamespace())
+    }
+    adapter._host_staging_enabled = False
+    adapter.external_semaphore_enabled = True
+    adapter.left_ready_semaphores = [SimpleNamespace(semaphore="left-ready")]
+    adapter.right_ready_semaphores = [SimpleNamespace(semaphore="right-ready")]
+    adapter.left_ready_values = [3]
+    adapter.right_ready_values = [4]
+    adapter.left_visible_semaphores = [SimpleNamespace(semaphore="left-visible")]
+    adapter.right_visible_semaphores = [SimpleNamespace(semaphore="right-visible")]
+    calls = []
+    adapter.presenter = SimpleNamespace(
+        vulkan=SimpleNamespace(
+            copy_buffer_to_image=lambda *args, **kwargs: calls.append((args, kwargs))
+        )
+    )
+
+    assert adapter.prepare_source_for_sampling(7, 0) == "left-visible"
+    assert calls[0][1] == {
+        "wait_semaphore": "left-ready",
+        "wait_semaphore_value": 3,
+        "signal_semaphore": "left-visible",
+    }
+    assert (7, 0) not in adapter._rocm_ready_pending
 
 
 def test_cuda_output_adapter_implements_backend_neutral_gpu_contract() -> None:
@@ -191,7 +227,9 @@ def test_output_contract_publishes_actual_source_layout_and_queue_family() -> No
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA GPU is unavailable")
-def test_cuda_tensor_reaches_vulkan_output_slot_without_cpu_roundtrip() -> None:
+def test_cuda_tensor_reaches_vulkan_output_slot_without_cpu_roundtrip(monkeypatch) -> None:
+    # This test exercises the production CUDA timeline-semaphore path.
+    monkeypatch.setenv("D2S_ENABLE_CUDA_EXTERNAL_SEMAPHORE", "1")
     required_extensions = tuple(
         dict.fromkeys(
             VulkanExportableImage.required_device_extensions()

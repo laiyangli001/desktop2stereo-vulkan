@@ -67,6 +67,27 @@ def test_graceful_stop_timeout_allows_runtime_cleanup():
     assert gui_process._GRACEFUL_PROCESS_STOP_TIMEOUT_S >= 8.0
 
 
+def test_run_completion_flags_preserve_runtime_glow_selection(tmp_path):
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "OpenXR Glow Modes:\n"
+        "  Default: off\n"
+        "OpenXR Glow Transparency:\n"
+        "  Default: 0.35\n"
+        "Recompile TensorRT: true\n",
+        encoding="utf-8",
+    )
+
+    assert gui_process._save_run_completion_flags(str(settings_path)) == (True, "")
+
+    settings = gui_process.read_yaml(str(settings_path))
+    # PyYAML emits the YAML 1.1 spelling ``false`` for the string ``off``;
+    # the runtime normalizes that value back to the explicit OFF mode.
+    assert settings["OpenXR Glow Modes"] == {"Default": False}
+    assert settings["OpenXR Glow Transparency"] == {"Default": 0.35}
+    assert settings["Recompile TensorRT"] is False
+
+
 def test_firewall_probe_parses_single_and_multiple_rules():
     single = gui_process._parse_firewall_block_output(json.dumps({"Protocol": "TCP"}))
     multiple = gui_process._parse_firewall_block_output(
@@ -553,6 +574,7 @@ def test_backend_status_payload_is_rendered_as_read_only_telemetry():
     class Harness(gui_process.GUIProcessMixin):
         backend_status_text = control
         _backend_status_bar = bar
+        locale = "CN"
 
         def _safe_update(self, *controls):
             updates.extend(controls)

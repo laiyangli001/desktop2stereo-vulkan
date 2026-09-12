@@ -49,6 +49,8 @@ class StereoRuntimeConfig:
     trt_workspace_gb: int = 4
     use_cuda_graph: bool = False
     profile_sync: bool = False
+    use_coreml: bool = False
+    recompile_coreml: bool = False
     parallel_inference: bool = False
     parallel_inference_workers: int = 1
     # Optional program-controlled OpenXR visual regression output directory.
@@ -199,14 +201,23 @@ def runtime_config_from_d2s_settings(
         raise ValueError("D2S settings must include 'Depth Model' or 'model_id'")
 
     depth_backend: DepthBackend
+    import torch
+
+    # TensorRT is NVIDIA-only.  On AMD ROCm the stale "TensorRT" setting
+    # (defaulted on by the GUI for CUDA machines) must not select the
+    # tensorrt_native backend, otherwise the frame loop fails importing
+    # tensorrt.  ROCm defaults to the AMD-native MIGraphX path instead.
+    is_rocm = bool(getattr(torch.version, "hip", None))
     if settings.get("MIGraphX", False):
         depth_backend = "migraphx_rocm"
-    elif settings.get("TensorRT", False):
+    elif settings.get("TensorRT", False) and not is_rocm:
         depth_backend = "tensorrt_native"
     elif settings.get("ONNX", False):
         depth_backend = "onnx_cuda"
     elif settings.get("Depth Backend"):
         depth_backend = _normalize_depth_backend(settings["Depth Backend"])
+    elif is_rocm:
+        depth_backend = "migraphx_rocm"
     else:
         depth_backend = "auto"
 
@@ -294,12 +305,20 @@ def runtime_config_from_d2s_settings(
         color_tint=float(settings.get("Color Tint", 0.0)),
         debug_output=_to_bool(settings.get("Debug Stereo Output", False)),
         profile_sync=_to_bool(settings.get("Depth Profile Sync", settings.get("Profile Sync", False))),
+        use_coreml=_to_bool(settings.get("CoreML", False)),
+        recompile_coreml=_to_bool(settings.get("Recompile CoreML", False)),
         parallel_inference=parallel_workers > 1,
         parallel_inference_workers=parallel_workers,
         stereo_compute_backend=_normalize_stereo_compute_backend(
             settings.get("Stereo Compute Backend", "auto")
         ),
-        output_quality_enabled=True,
+        # OpenXR's projection composer already samples the source eye image
+        # directly into the runtime-owned swapchain. Pre-downsampling a 4K
+        # source to the selected headset tier makes text permanently softer
+        # and prevents the OpenXR resolution multiplier from recovering detail.
+        # Keep the source native for OpenXR; the runtime's recommended/max view
+        # extents remain the final display-resolution authority.
+        output_quality_enabled=not _output_quality_disabled(settings),
         output_headset_tier_k=headset_tier,
         output_min_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Min LOD", 0.0)))),
         output_max_lod=max(0.0, min(16.0, float(settings.get("Vulkan Projection Max LOD", 0.35)))),
@@ -324,6 +343,39 @@ def _output_headset_tier_from_settings(settings: dict[str, Any]) -> int:
 
     preset = resolve_xr_headset_preset(settings.get("XR Headset Model"))
     return int(preset.resolution_tier_k)
+
+
+def _streamer_mode_output_quality_disabled(settings: dict[str, Any]) -> bool:
+    """Return whether stream output-quality resampling should be skipped.
+
+    Streamers publish to browsers/network players, not a headset, so upscaling
+    the packed SBS to the headset 4K tier only adds hundreds of ms of EASU
+    work per frame (the torch fallback is ~300 ms at 1920x1200). Local Viewer,
+    3D Monitor and OpenXR keep the upscale.
+    """
+    try:
+        from utils.run_mode import normalize_run_mode
+    except Exception:
+        return False
+    run_mode = normalize_run_mode(str(settings.get("Run Mode", "") or ""))
+    return run_mode in {
+        "MJPEG Streamer",
+        "RTMP Streamer",
+        "Streamer",
+        "MJPEG",
+        "RTMP",
+    }
+
+
+def _output_quality_disabled(settings: dict[str, Any]) -> bool:
+    """Skip producer-side resampling when the consumer is OpenXR or a stream."""
+    if _streamer_mode_output_quality_disabled(settings):
+        return True
+    try:
+        from utils.run_mode import normalize_run_mode
+    except Exception:
+        return False
+    return normalize_run_mode(str(settings.get("Run Mode", "") or "")) == "OpenXR Link"
 
 
 def _optional_int_setting(settings: dict[str, Any], *keys: str) -> int | None:
@@ -551,6 +603,8 @@ def depth_provider_config_from_runtime(config: StereoRuntimeConfig) -> "DepthPro
         force_rebuild=force_rebuild,
         use_cuda_graph=config.use_cuda_graph,
         profile_sync=config.profile_sync,
+        use_coreml=bool(getattr(config, "use_coreml", False)),
+        recompile_coreml=bool(getattr(config, "recompile_coreml", False)),
         execution_slot_count=config.parallel_inference_workers,
         depth_upsample=config.depth_upsample,
         depth_upsample_edge_strength=config.depth_upsample_edge_strength,
@@ -563,7 +617,10 @@ def openxr_render_config_from_snapshot(
     render_size: tuple[int, int] | None = None,
     preset: str = "standard",
     screen_roll: float = 0.0,
-    padding_mode: str = "reflection",
+    # Disparity can move the outermost destination pixels outside the source.
+    # Border extension avoids reflecting those pixels into a second visible
+    # edge in the final stereo image.
+    padding_mode: str = "border",
 ):
     """Convert normalized runtime settings into OpenXR render-core uniforms."""
     from .openxr_render import OpenXRRenderConfig

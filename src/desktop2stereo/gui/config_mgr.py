@@ -49,11 +49,45 @@ class GUIConfigMixin:
             cfg["Stereo Output"] = resolved_stereo_index
         self._config = cfg.copy()
         self._config.pop("Debug Mode", None)
-        label = next(
-            (lbl for lbl, i in self.monitor_label_to_index.items() if i == mon_idx),
-            None,
-        )
+
+        # Try to find the saved monitor by index, fallback to primary or first available
+        label = None
+        if mon_idx is not None:
+            label = next(
+                (lbl for lbl, i in self.monitor_label_to_index.items() if i == mon_idx),
+                None,
+            )
+        if label is None and self.monitor_label_to_index:
+            # Fallback: try primary monitor, then first available
+            primary_index = get_primary_monitor_index()
+            label = next((lbl for lbl, i in self.monitor_label_to_index.items() if i == primary_index), None)
+            if label is None:
+                label = list(self.monitor_label_to_index.keys())[0]
+            # Update config with fallback monitor's identity
+            fallback_idx = self.monitor_label_to_index.get(label)
+            if fallback_idx is not None:
+                self._config["Monitor Index"] = fallback_idx
+                self._config["Monitor Identity"] = self._display_identity_for_capture_index(fallback_idx)
+                # Clear missing flag since we have a valid fallback
+                self._missing_monitor_identity = False
         self.monitor_dd.value = label or ""
+
+        # Also apply fallback for stereo output if missing
+        stereo_label = None
+        stereo_idx = self._config.get("Stereo Output")
+        if stereo_idx is not None:
+            stereo_label = next((lbl for lbl, i in self.monitor_label_to_index.items() if i == stereo_idx), None)
+        if stereo_label is None and self.monitor_label_to_index:
+            # Use same fallback as main monitor
+            stereo_label = label
+            if stereo_label:
+                stereo_fallback_idx = self.monitor_label_to_index.get(stereo_label)
+                if stereo_fallback_idx is not None:
+                    self._config["Stereo Output"] = stereo_fallback_idx
+                    self._config["Stereo Output Identity"] = self._display_identity_for_capture_index(stereo_fallback_idx)
+                    # Clear missing flag since we have a valid fallback
+                    self._missing_stereo_output_identity = False
+        self.stereo_monitor_dd.value = stereo_label or ""
         self.selected_window_name = cfg.get("Window Title", "")
         self.selected_window_handle = None
         self.selected_window_rect = None
@@ -107,6 +141,15 @@ class GUIConfigMixin:
             cfg.get("Render Size Policy", DEFAULTS["Render Size Policy"]))
         self.render_scale_dd.value = self._render_scale_to_display(
             cfg.get("Render Scale", DEFAULTS["Render Scale"]))
+        openxr_render_value = cfg.get(
+            "XR Render",
+            cfg.get("OpenXR Render Scale", DEFAULTS["XR Render"]),
+        )
+        if str(cfg.get("XR Render Mode", "")).strip().lower() == "auto":
+            openxr_render_value = "Auto (Headset)"
+        self.openxr_render_resolution_dd.value = self._openxr_render_resolution_to_display(
+            openxr_render_value
+        )
         fixed_width = self._parse_int(cfg.get("Render Fixed Width", DEFAULTS["Render Fixed Width"]), DEFAULTS["Render Fixed Width"])
         fixed_height = self._parse_int(cfg.get("Render Fixed Height", DEFAULTS["Render Fixed Height"]), DEFAULTS["Render Fixed Height"])
         self.render_fixed_dd.value = self._fixed_size_to_display(fixed_width, fixed_height)
@@ -157,10 +200,15 @@ class GUIConfigMixin:
         self.display_fit_dd.options = self._display_fit_options()
         self.display_fit_dd.value = self._display_fit_to_display(
             cfg.get("Display Fit Mode", DEFAULTS["Display Fit Mode"]))
+        if hasattr(self, "stream_display_fit_dd"):
+            self.stream_display_fit_dd.options = self._display_fit_options()
+            self.stream_display_fit_dd.value = self._display_fit_to_display(
+                cfg.get("Stream Display Fit Mode", cfg.get("Display Fit Mode", DEFAULTS["Stream Display Fit Mode"])))
         self.lossless_cb.value = cfg.get(
             "NVIDIA Frame Generation",
             cfg.get("Lossless Scaling Support", DEFAULTS["NVIDIA Frame Generation"]),
         )
+        self.lsfg_cb.value = bool(cfg.get("LSFG Support", DEFAULTS["LSFG Support"]))
         if keep_optional:
             self.locale = cfg.get("Language", DEFAULTS["Language"])
             self.lang_dd.value = "English" if self.locale == "EN" else "简体中文"
@@ -363,6 +411,16 @@ class GUIConfigMixin:
             "Processing Resolution": self._config.get("Processing Resolution", DEFAULTS["Processing Resolution"]),
             "Render Size Policy": "scaled",
             "Render Scale": self._display_to_render_scale(self.render_scale_dd.value),
+            "XR Render": self._display_to_openxr_render_resolution(
+                self.openxr_render_resolution_dd.value
+            ),
+            "XR Render Mode": (
+                "auto"
+                if self._openxr_render_resolution_is_auto(
+                    self.openxr_render_resolution_dd.value
+                )
+                else "manual"
+            ),
             "Render Fixed Width": render_fixed_width,
             "Render Fixed Height": render_fixed_height,
             "Render Max Pixels": self._parse_int(self.render_max_pixels_dd.value, DEFAULTS["Render Max Pixels"]),
@@ -391,10 +449,14 @@ class GUIConfigMixin:
             **recompile_values,
             "Capture Tool": self.capture_tool_dd.value,
             "Display Fit Mode": self._display_to_display_fit(self.display_fit_dd.value),
+            "Stream Display Fit Mode": self._display_to_display_fit(
+                getattr(self, "stream_display_fit_dd", self.display_fit_dd).value
+            ),
             # Retain the legacy keys for older runtime packages reading the same YAML.
             "Fill 16:9": self._display_to_display_fit(self.display_fit_dd.value) == "contain",
             "Fix Viewer Aspect": self._display_to_display_fit(self.display_fit_dd.value) != "stretch",
             "NVIDIA Frame Generation": bool(self.lossless_cb.value),
+            "LSFG Support": bool(self.lsfg_cb.value),
             "Stream Key": self.stream_key_tf.value,
             "Video Encoder Backend": {
                 "Auto": "auto",
@@ -411,9 +473,13 @@ class GUIConfigMixin:
             "Controller Model": self.ctrl_model_dd.value,
             "Environment Model": self.env_key,
         })
-        # Remove legacy persisted audio selections. The runtime resolves the
-        # current default output through SoundCard/WASAPI on every start.
-        self._config.pop("Stereo Mix", None)
+        # Remove legacy persisted audio selections on Windows/Linux: the
+        # runtime resolves the current default output through SoundCard/WASAPI
+        # on every start. On macOS the selected Stereo Mix device is kept
+        # (v2.5.0 parity) so the runtime captures the user's chosen device by
+        # name instead of auto-selecting a possibly silent loopback.
+        if OS_NAME != "Darwin":
+            self._config.pop("Stereo Mix", None)
         self.recompile_trt_cb.value = False
         self.recompile_migraphx_cb.value = False
         self.recompile_coreml_cb.value = False
@@ -504,11 +570,15 @@ class GUIConfigMixin:
         parallax_budget = self._display_to_parallax_budget(self.parallax_budget_dd.value)
 
         display_fit_mode = self._display_to_display_fit(self.display_fit_dd.value)
+        stream_fit_mode = self._display_to_display_fit(
+            getattr(self, "stream_display_fit_dd", self.display_fit_dd).value
+        )
         cfg.update({
             "Show FPS": bool(self.showfps_cb.value),
             "XR Preview Window": bool(self.xr_preview_cb.value),
             "Window Preview": bool(self.window_preview_cb.value),
             "Display Fit Mode": display_fit_mode,
+            "Stream Display Fit Mode": stream_fit_mode,
             "Fill 16:9": display_fit_mode == "contain",
             "Fix Viewer Aspect": display_fit_mode != "stretch",
             "Stereo Preset": stereo_preset,
@@ -548,6 +618,16 @@ class GUIConfigMixin:
             "Vulkan Projection Max LOD": self._parse_float(self.projection_max_lod_dd.value, DEFAULTS["Vulkan Projection Max LOD"]),
             "Vulkan Projection MIP LOD Bias": self._parse_float(self.projection_mip_lod_bias_dd.value, DEFAULTS["Vulkan Projection MIP LOD Bias"]),
             "Vulkan Projection RCAS Sharpness": self._parse_float(self.projection_rcas_sharpness_dd.value, DEFAULTS["Vulkan Projection RCAS Sharpness"]),
+            "XR Render": self._display_to_openxr_render_resolution(
+                self.openxr_render_resolution_dd.value
+            ),
+            "XR Render Mode": (
+                "auto"
+                if self._openxr_render_resolution_is_auto(
+                    self.openxr_render_resolution_dd.value
+                )
+                else "manual"
+            ),
             "Cross Eyed": bool(self.cross_eyed_cb.value),
             "Audio Delay": self._parse_float(
                 self.audio_delay_tf.value, DEFAULTS["Audio Delay"]

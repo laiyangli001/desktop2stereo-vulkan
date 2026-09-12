@@ -1,4 +1,6 @@
 import queue
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -7,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 import streaming.direct_sbs as direct_sbs
 import streaming.nvidia_encoder as nvidia_encoder
@@ -38,6 +41,261 @@ def test_runtime_sbs_to_rgb_converts_chw_float_to_hwc_uint8():
     assert rgb.dtype == np.uint8
     assert rgb.flags.c_contiguous
     assert rgb[0, 1].tolist() == [255, 0, 128]
+
+
+def test_native_stream_frame_is_packed_on_output_thread():
+    shutdown = threading.Event()
+    submitted = []
+
+    class NativeFrame:
+        def __init__(self):
+            self.released = False
+
+        def pack(self, destination, output_size, output_format, *, rgb=False):
+            assert output_size == (4, 2)
+            assert output_format == "half_tab"
+            assert rgb is True
+            for offset in range(0, len(destination), 3):
+                destination[offset : offset + 3] = bytes((10, 20, 30))
+
+        def release(self):
+            self.released = True
+
+    class Output:
+        display_mode = "Half-TAB"
+        fit_mode = "stretch"
+        input_size = (4, 2)
+        synchronous_submit = True
+
+        def submit_frame(self, frame):
+            submitted.append(frame)
+            shutdown.set()
+
+    native = NativeFrame()
+    result = SimpleNamespace(
+        native_stream_frame=native,
+        native_stream_fallback=None,
+        output_display_size=(4, 2),
+        output_format="half_tab",
+        sbs=None,
+        left_eye=None,
+        right_eye=None,
+    )
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(),
+        shutdown_event=shutdown,
+        output=Output(),
+        source_stat_inc=lambda *args, **kwargs: None,
+    )
+    consumer.runtime_q.put((result, 0.0))
+    thread = threading.Thread(target=consumer.run)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert native.released is True
+    assert len(submitted) == 1
+    assert submitted[0].shape == (2, 4, 3)
+    assert submitted[0].dtype == np.uint8
+    assert submitted[0][0, 0].tolist() == [10, 20, 30]
+
+
+def test_native_stream_pack_failure_uses_runtime_fallback():
+    shutdown = threading.Event()
+    stats = []
+    submitted = []
+
+    class NativeFrame:
+        def __init__(self):
+            self.released = False
+
+        def pack(self, *args, **kwargs):
+            raise RuntimeError("injected native pack failure")
+
+        def release(self):
+            self.released = True
+
+    class Output:
+        display_mode = "Half-TAB"
+        fit_mode = "stretch"
+        input_size = (4, 2)
+        synchronous_submit = True
+
+        def submit_frame(self, frame):
+            submitted.append(frame)
+            shutdown.set()
+
+    native = NativeFrame()
+    fallback = SimpleNamespace(
+        sbs=np.full((2, 4, 3), 77, dtype=np.uint8),
+        left_eye=None,
+        right_eye=None,
+        native_stream_frame=None,
+    )
+    result = SimpleNamespace(
+        native_stream_frame=native,
+        native_stream_fallback=lambda: fallback,
+        output_display_size=(4, 2),
+        output_format="half_tab",
+        sbs=None,
+        left_eye=None,
+        right_eye=None,
+    )
+    consumer = DirectSbsOutputConsumer(
+        runtime_q=queue.Queue(),
+        shutdown_event=shutdown,
+        output=Output(),
+        source_stat_inc=lambda name, **kwargs: stats.append(name),
+    )
+    consumer.runtime_q.put((result, 0.0))
+    thread = threading.Thread(target=consumer.run)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert native.released is True
+    assert submitted[0][0, 0].tolist() == [77, 77, 77]
+    assert "native_stream_pack_error" in stats
+    assert "native_stream_fallback" in stats
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="requires MPS")
+def test_runtime_sbs_to_rgb_converts_mps_tensor_to_host():
+    # MJPEG on macOS feeds MPS SBS tensors; numpy() without .cpu() raises
+    # "can't convert mps:0 device type tensor to numpy".
+    import torch
+
+    frame = torch.rand(1, 3, 64, 96, device="mps")
+
+    rgb = runtime_sbs_to_rgb(SimpleNamespace(sbs=frame))
+
+    assert rgb.shape == (64, 96, 3)
+    assert rgb.dtype == np.uint8
+
+    packed = (torch.rand(1, 3, 64, 96, device="mps") * 255).to(torch.uint8)
+    rgb8 = runtime_sbs_to_rgb(SimpleNamespace(sbs=packed))
+    assert rgb8.shape == (64, 96, 3)
+    assert rgb8.dtype == np.uint8
+
+
+def test_darwin_audio_input_args_strip_backend_prefix(monkeypatch) -> None:
+    # macOS RTMP maps "soundcard:BlackHole 2ch" to an avfoundation input; the
+    # prefix must be stripped or ffmpeg fails ("Error opening input file
+    # :soundcard:BlackHole 2ch"). A configured NAME is resolved to its
+    # AVFoundation index (v2.5.0 get_device_index parity).
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target.os_name = "Darwin"
+    target.audio_delay = 0.0
+    target.ffmpeg_path = Path("/usr/bin/ffmpeg")
+    monkeypatch.setattr(direct_sbs, "_auto_select_darwin_audio", lambda ff: "1")
+    monkeypatch.setattr(
+        direct_sbs,
+        "_list_darwin_audio_devices",
+        lambda ff: [(0, "BlackHole 2ch"), (2, "Stereo Mix"), (8, "Virtual Desktop Speakers")],
+    )
+
+    target.stereo_mix_device = "soundcard:BlackHole 2ch"
+    args = target._audio_input_args()
+    assert args[-2:] == ["-i", ":0"]
+
+    target.stereo_mix_device = "wasapi:Stereo Mix"
+    assert target._audio_input_args()[-2:] == ["-i", ":2"]
+
+    # A stale/unplugged configured name falls back to auto-selection instead
+    # of handing FFmpeg a device that no longer exists.
+    target.stereo_mix_device = "soundcard:Gone Device"
+    assert target._audio_input_args()[-2:] == ["-i", ":1"]
+
+    # Empty / bare-prefix / lone-colon / "no device" values must not start a
+    # live AVFoundation input: that input can block the video muxer. Explicit
+    # device names still use the configured audio path above.
+    for bad in ("", "soundcard:", "wasapi:", ":", "No Stereo Mix device found"):
+        target.stereo_mix_device = bad
+        args = target._audio_input_args()
+        assert args == [], f"device {bad!r} must remain video-only"
+
+
+def test_darwin_unconfigured_audio_stays_video_only(monkeypatch) -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target.os_name = "Darwin"
+    target.audio_delay = 0.0
+    target.ffmpeg_path = Path("/usr/bin/ffmpeg")
+    target.stereo_mix_device = ""
+
+    monkeypatch.setattr(
+        direct_sbs,
+        "_auto_select_darwin_audio",
+        lambda _ffmpeg: (_ for _ in ()).throw(
+            AssertionError("unconfigured audio must not start a device probe")
+        ),
+    )
+
+    assert target._audio_input_args() == []
+
+
+def test_darwin_frame_submit_replaces_stale_frame_without_blocking() -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target._darwin_async_submit = True
+    target._async_frame_queue = queue.Queue(maxsize=1)
+    target._async_frame_lock = threading.Lock()
+    target._async_frame_drops = 0
+
+    first = np.zeros((2, 4, 3), dtype=np.uint8)
+    second = np.full_like(first, 17)
+    third = np.full_like(first, 33)
+    target._async_frame_queue.put_nowait(first)
+
+    target._enqueue_async_frame(second)
+    target._enqueue_async_frame(third)
+
+    queued = target._async_frame_queue.get_nowait()
+    assert queued[0, 0].tolist() == [33, 33, 33]
+    assert target._async_frame_drops == 2
+    # The queued frame owns its storage, so a converter buffer can be reused.
+    third.fill(99)
+    assert queued[0, 0].tolist() == [33, 33, 33]
+
+
+def test_darwin_submit_frame_does_not_write_on_runtime_thread() -> None:
+    target = object.__new__(FfmpegDirectSbsOutput)
+    target._darwin_async_submit = True
+    target._async_frame_queue = queue.Queue(maxsize=1)
+    target._async_frame_lock = threading.Lock()
+    target._async_frame_drops = 0
+    target._async_frame_error = None
+    target._apply_pending_audio_delay = lambda: None
+    target._calibration_controller = None
+    target.ffmpeg_process = SimpleNamespace()
+    target._frame_size = (4, 2)
+
+    writes = []
+    target._write_frame = lambda frame: writes.append(frame)
+    frame = np.zeros((2, 4, 3), dtype=np.uint8)
+    target.submit_frame(frame)
+
+    assert writes == []
+    assert target._async_frame_queue.qsize() == 1
+
+
+def test_darwin_safe_mediamtx_config_zeroes_udp_read_buffer(tmp_path: Path) -> None:    # MediaMTX aborts on macOS when udpReadBufferSize > 0 ("read buffer size
+    # is unimplemented"); the darwin launcher must rewrite it to 0 while
+    # keeping every other setting intact.
+    cfg = tmp_path / "mediamtx.yml"
+    cfg.write_text(
+        "udpReadBufferSize: 4194304\nwriteQueueSize: 2048\npaths:\n  all_others:\n",
+        encoding="utf-8",
+    )
+
+    patched = direct_sbs._darwin_safe_mediamtx_config(cfg)
+
+    assert patched != cfg
+    text = patched.read_text(encoding="utf-8")
+    assert "udpReadBufferSize: 0" in text
+    assert "writeQueueSize: 2048" in text
+    # Already-default configs are returned unchanged (no copy created).
+    cfg2 = tmp_path / "mediamtx_default.yml"
+    cfg2.write_text("udpReadBufferSize: 0\n", encoding="utf-8")
+    assert direct_sbs._darwin_safe_mediamtx_config(cfg2) is cfg2
 
 
 def test_pynv_backend_uses_shared_ffmpeg_probe_for_calibration(monkeypatch):
@@ -89,7 +347,12 @@ def test_direct_consumer_submits_latest_sbs_frame():
     consumer.run()
 
     assert len(submitted) == 1
-    assert np.all(submitted[0] == 255)
+    # The NEWEST (ones) frame is the one submitted. The 2x2 source is not
+    # 16:9, so the contain-fit transport canvas letterboxes it into black
+    # bars; only the content pixels are 255, and the stale zeros frame must
+    # not have been submitted.
+    assert np.any(submitted[0] == 255)
+    assert not np.all(submitted[0] == 0)
     assert "runtime_output_overwrite" in stats
     assert "network_stream_frames" in stats
 
@@ -282,6 +545,45 @@ def test_vulkan_output_disables_native_bridge_under_validation(monkeypatch, caps
     assert "disabled under VK_LAYER_KHRONOS_validation" in capsys.readouterr().out
 
 
+def test_vulkan_native_mux_uses_wallclock_sync_and_async1(monkeypatch):
+    captured = {}
+
+    class RunningProcess:
+        stdin = object()
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return RunningProcess()
+
+    output = object.__new__(VulkanDirectSbsOutput)
+    output.os_name = "Windows"
+    output.protocol = "WEBRTC"
+    output.fps = 30
+    output.stream_key = "live"
+    output.ffmpeg_path = Path("ffmpeg")
+    output.stereo_mix_device = "soundcard:Stereo Mix"
+    output.audio_delay = 0.0
+    output._soundcard_audio = None
+    monkeypatch.setattr(VulkanDirectSbsOutput, "_native_output_url", lambda self: "rtsp://127.0.0.1:8554/live")
+    monkeypatch.setattr(VulkanDirectSbsOutput, "_audio_input_args", lambda self: ["-itsoffset", "0.0", "-f", "dshow", "-i", "audio=Stereo Mix"])
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    output._start_native_mux()
+
+    command = captured["command"]
+    # The native mux carries the same professional A/V sync as the FFmpeg
+    # path: wall-clock timestamps on both inputs, threaded demux, async=1.
+    assert command.count("-use_wallclock_as_timestamps") == 2
+    assert command.count("-thread_queue_size") == 2
+    assert command[command.index("-af") + 1] == "aresample=async=1"
+    assert command[command.index("-c:a") + 1] == "libopus"
+
+
 def test_packet_loss_detector_matches_transport_loss_messages():
     assert FfmpegDirectSbsOutput._looks_like_packet_loss(
         "[WebRTC] packet missed: sequence gap"
@@ -328,7 +630,13 @@ def test_ffmpeg_output_finds_bundled_encoder_and_config():
 
     assert output.ffmpeg_path.name == "ffmpeg.exe"
     assert output.mediamtx_path.name == "mediamtx.exe"
-    assert output.mediamtx_config.name == "mediamtx.yml"
+    if sys.platform == "darwin":
+        # The darwin launcher substitutes a runtime-generated config with the
+        # OS-default UDP read buffer (udpReadBufferSize is unimplemented on
+        # macOS) even when a Windows os_name is simulated for the test.
+        assert output.mediamtx_config.name == "mediamtx.macos.yml"
+    else:
+        assert output.mediamtx_config.name == "mediamtx.yml"
     assert output.publish_rtsp_port == 8554
     server_env = output._server_environment()
     assert server_env["MTX_RTMPADDRESS"] == ":1935"
@@ -535,15 +843,146 @@ def test_hardware_encoder_failure_falls_back_to_software(monkeypatch):
     assert output._encoder_selection_reason == "software fallback"
 
 
+def test_windows_soundcard_audio_uses_wasapi_loopback_sender(monkeypatch) -> None:
+    # NVIDIA/ROCm run on Windows with the "soundcard:" speaker label; it is
+    # captured through the python soundcard WASAPI loopback (UDP s16le), not
+    # dshow. The macOS avfoundation parity work must not alter this path.
+    output = object.__new__(FfmpegDirectSbsOutput)
+    output.os_name = "Windows"
+    output.stereo_mix_device = "soundcard:Stereo Mix (Realtek(R) Audio)"
+    output.audio_delay = -0.15
+    output._soundcard_audio = None
+    sender = SimpleNamespace(
+        ffmpeg_url="udp://127.0.0.1:54321", start=lambda: None
+    )
+    monkeypatch.setattr(direct_sbs, "SoundcardLoopbackSender", lambda name: sender)
+
+    args = output._audio_input_args()
+
+    assert args == [
+        "-itsoffset", "-0.15",
+        "-f", "s16le", "-ar", "48000", "-ac", "2",
+        "-i", "udp://127.0.0.1:54321",
+    ]
+    assert output._soundcard_audio is sender
+
+
+def test_windows_rtmp_audio_keeps_aac_for_nvidia_rocm():
+    # Windows/Linux RTMP (the SRT ingest used by NVIDIA/ROCm) keeps AAC; only
+    # the macOS RTSP/Opus path was aligned with v2.5.0. A bare dshow-style
+    # device label exercises the non-loopback Windows input.
+    output = FfmpegDirectSbsOutput(
+        base_dir=str(APP_ROOT),
+        protocol="RTMP",
+        port=1935,
+        stream_key="live",
+        fps=30,
+        crf=20,
+        os_name="Windows",
+        stereo_mix_device="virtual-audio-capturer",
+    )
+
+    command = output._ffmpeg_command(3840, 1080)
+
+    assert command[command.index("-c:a") + 1] == "aac"
+    assert "libopus" not in command
+    # The audio timeline is normalized on every platform (wall-clock inputs +
+    # v2.5.0 async=1 drift absorption); the codec stays AAC for NVIDIA/ROCm.
+    assert command[command.index("-af") + 1] == "aresample=async=1"
+
+
 def test_macos_audio_uses_avfoundation_device_index():
     output = object.__new__(FfmpegDirectSbsOutput)
     output.os_name = "Darwin"
     output.stereo_mix_device = "2"
     output.audio_delay = -0.1
 
+    # v2.5.0 parity: the AVFoundation audio input keeps the 256 MB ring
+    # buffer (rtbufsize) used by the reference macOS build.
     assert output._audio_input_args() == [
-        "-itsoffset", "-0.1", "-f", "avfoundation", "-i", ":2"
+        "-itsoffset", "-0.1", "-f", "avfoundation", "-rtbufsize", "256M", "-i", ":2"
     ]
+
+
+def test_macos_rtmp_stream_audio_uses_opus_like_v250(monkeypatch) -> None:
+    # v2.5.0 macOS parity: every non-WebRTC client protocol (RTMP/RTSP/HLS)
+    # publishes Opus 96k/48k to MediaMTX's RTSP ingest; AAC is only used on
+    # the Windows/Linux SRT/RTMP paths (NVIDIA/ROCm soundcard chain).
+    monkeypatch.setenv("D2S_FFMPEG_PATH", str(Path(__file__).resolve()))
+    monkeypatch.setenv("D2S_MEDIAMTX_PATH", str(Path(__file__).resolve()))
+    output = FfmpegDirectSbsOutput(
+        base_dir=str(APP_ROOT),
+        protocol="RTMP",
+        port=1935,
+        stream_key="live",
+        fps=30,
+        crf=20,
+        os_name="Darwin",
+        stereo_mix_device="soundcard:Virtual Desktop Speakers",
+        audio_delay=-0.1,
+    )
+    monkeypatch.setattr(
+        direct_sbs,
+        "_list_darwin_audio_devices",
+        lambda ff: [(8, "Virtual Desktop Speakers")],
+    )
+
+    command = output._ffmpeg_command(3840, 1080)
+
+    assert command[command.index("-c:a") + 1] == "libopus"
+    # macOS normalizes AVFoundation's absolute microsecond timestamp to the
+    # stream time base and folds in the -0.1s audio delay.
+    assert command[command.index("-af") + 1] == (
+        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+    )
+    assert command[command.index("-ar") + 1] == "48000"
+    assert command[command.index("-ac") + 1] == "2"
+    assert command[command.index("-b:a") + 1] == "96k"
+    assert command[command.index("-rtbufsize") + 1] == "256M"
+    assert "aac" not in command
+    # The device NAME is resolved to its AVFoundation index; the audio
+    # input's "-i" follows "-rtbufsize" (the video input is rawvideo pipe:0).
+    audio_i = command.index("-i", command.index("-rtbufsize"))
+    assert command[audio_i + 1] == ":8"
+    # Professional A/V sync: only the VIDEO input uses the demuxer wall-clock
+    # option (audio is re-anchored in the filter graph — see _audio_filter_graph)
+    # and each input demuxes on its own thread (audio can't be starved by a
+    # stalled video pipe producer).
+    assert command.count("-use_wallclock_as_timestamps") == 1
+    assert command.count("-thread_queue_size") == 2
+    assert command[command.index("-use_wallclock_as_timestamps") + 1] == "1"
+    # Immediate mux flushing keeps audio RTP delivery from batching into
+    # bursts when the app-paced video stalls.
+    assert "-flush_packets" in command
+
+
+def test_macos_webrtc_stream_audio_uses_opus_async1(monkeypatch) -> None:
+    monkeypatch.setenv("D2S_FFMPEG_PATH", str(Path(__file__).resolve()))
+    monkeypatch.setenv("D2S_MEDIAMTX_PATH", str(Path(__file__).resolve()))
+    output = FfmpegDirectSbsOutput(
+        base_dir=str(APP_ROOT),
+        protocol="WebRTC",
+        port=1122,
+        stream_key="live",
+        fps=30,
+        crf=20,
+        os_name="Darwin",
+        stereo_mix_device="soundcard:BlackHole 2ch",
+    )
+    monkeypatch.setattr(
+        direct_sbs,
+        "_list_darwin_audio_devices",
+        lambda ff: [(1, "BlackHole 2ch")],
+    )
+
+    command = output._ffmpeg_command(3840, 1080)
+
+    assert command[command.index("-c:a") + 1] == "libopus"
+    # Default audio_delay (-0.1s) folds into the normalized macOS timestamp.
+    assert command[command.index("-af") + 1] == (
+        "asetpts=(RTCTIME-STARTT-100000)/(1000000*TB),aresample=async=1"
+    )
+    assert "aac" not in command
 
 
 def test_qsv_and_amf_commands_avoid_nvenc_only_options():
@@ -654,7 +1093,11 @@ def test_nvenc_command_uses_low_latency_hardware_encoder():
     assert command[command.index("-zerolatency") + 1] == "1"
     assert command[command.index("-forced-idr") + 1] == "1"
     assert command[command.index("-strict_gop") + 1] == "1"
-    assert "-use_wallclock_as_timestamps" not in command
+    # The FFmpeg path applies the same wall-clock A/V sync as the NVIDIA SRT
+    # path: the video input is timestamped at read time so its PTS tracks the
+    # real-time audio clock (no audio device here, so only the video input).
+    assert command.count("-use_wallclock_as_timestamps") == 1
+    # Frame pacing stays the app's job; fps_mode is not imposed.
     assert "-fps_mode" not in command
 
 
@@ -815,7 +1258,9 @@ def test_dynamic_rate_budget_covers_rtmp_and_webrtc_but_not_rtsp():
     assert command[command.index("-maxrate") + 1] == "49M"
     assert command[command.index("-bufsize") + 1] == "49M"
     assert command[command.index("-g") + 1] == "50"
-    assert command[command.index("-force_key_frames") + 1] == "expr:gte(t,n_forced*1)"
+    # Frame-based keyframe cadence: time expressions (gte(t,...)) break once
+    # the input carries wall-clock PTS (t would force every frame).
+    assert command[command.index("-force_key_frames") + 1] == "expr:eq(mod(n,50),0)"
     assert command[command.index("-pkt_size") + 1] == "1452"
     assert command[-1] == "rtsp://127.0.0.1:8554/live?pkt_size=1452"
 
@@ -860,7 +1305,7 @@ def test_windows_webrtc_stream_audio_uses_opus():
     command = output._ffmpeg_command(3840, 1080)
 
     assert command[command.index("-c:a") + 1] == "libopus"
-    assert command[command.index("-af") + 1] == "aresample=async=1000:first_pts=0"
+    assert command[command.index("-af") + 1] == "aresample=async=1"
     assert command[command.index("-ar") + 1] == "48000"
     assert command[command.index("-ac") + 1] == "2"
     assert command[command.index("-b:a") + 1] == "96k"
@@ -1147,3 +1592,10 @@ def test_pynv_output_uses_rtsp_for_webrtc_and_soundcard_loopback(monkeypatch):
         ("start", None),
         ("close", None),
     ]
+
+
+def test_darwin_loopback_routing_hint_only_for_virtual_devices() -> None:
+    assert "BlackHole" in direct_sbs._darwin_loopback_routing_hint(":1 BlackHole 2ch")
+    assert "BlackHole" in direct_sbs._darwin_loopback_routing_hint(":8 Virtual Desktop Speakers")
+    assert direct_sbs._darwin_loopback_routing_hint(":2 iMac Microphone") == ""
+    assert direct_sbs._darwin_loopback_routing_hint("") == ""

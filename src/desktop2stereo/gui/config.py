@@ -3,7 +3,7 @@ import os
 
 import yaml
 
-from utils import DEFAULT_PORT
+from utils import DEFAULT_PORT, OS_NAME
 from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL
 
 from .model_catalog import GUI_MODEL_CATALOG
@@ -95,6 +95,11 @@ def default_base_depth_model():
     return DEFAULT_MODEL_LIST[0]
 
 
+def default_coreml_enabled(os_name=None):
+    """CoreML is the default Apple depth accelerator, never a vendor default."""
+    return (OS_NAME if os_name is None else os_name) == "Darwin"
+
+
 DEFAULTS = {
     "Startup GUI": "gui2",
     "Capture Mode": "Monitor",
@@ -154,7 +159,7 @@ DEFAULTS = {
     "Parallel Inference": False,
     "Parallel Inference Workers": 1,
     "Recompile TensorRT": False,
-    "CoreML": False,
+    "CoreML": default_coreml_enabled(),
     "Recompile CoreML": False,
     "MIGraphX": False,
     "Recompile MIGraphX": False,
@@ -170,6 +175,10 @@ DEFAULTS = {
     "Processing Resolution": "Auto",
     "Render Size Policy": "scaled",
     "Render Scale": "4K / 100%",
+    # OpenXR projection target multiplier. This is independent from the
+    # capture/inference Render Scale above.
+    "XR Render": 1.0,
+    "XR Render Mode": "auto",
     "Render Fixed Width": 1920,
     "Render Fixed Height": 1080,
     "Render Max Pixels": 3840 * 2160,
@@ -189,14 +198,16 @@ DEFAULTS = {
     "Audio Capture Backend": "auto",
     "Video Encoder Backend": "auto",
     "CRF": 23,
-    "Audio Delay": -0.1,
+    "Audio Delay": 0.0,
     "Controller Model": "PICO",
     "Environment Model": "Default",
     "NVIDIA Frame Generation": False,
     # Legacy key is read only for migration from pre-NvFRUC settings.
     "Lossless Scaling Support": False,
+    "LSFG Support": False,
     "Capture Tool": "none",
     "Display Fit Mode": "contain",
+    "Stream Display Fit Mode": "contain",
     "Fill 16:9": True,
     "Fix Viewer Aspect": False,
     "Stereo Output": None,

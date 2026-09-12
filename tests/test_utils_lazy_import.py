@@ -32,3 +32,14 @@ def test_light_utils_import_does_not_load_settings(tmp_path):
     assert result.stdout.splitlines() == ["True", "True"]
 
 
+def test_gui_import_does_not_validate_stale_display_profile(tmp_path):
+    result = _run_python(
+        "import gui.gui; "
+        "import sys; "
+        "print('xr_viewer.core_openxr_vulkan' not in sys.modules); "
+        "print('app_runtime.runtime_entry' not in sys.modules)",
+        tmp_path,
+    )
+
+    assert result.stdout.splitlines() == ["True", "True"]
+

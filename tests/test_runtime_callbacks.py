@@ -236,3 +236,88 @@ def test_settings_menu_persists_dedicated_openxr_render_scale(
         "persist_openxr_render_scale", value=1.75
     ) is True
     assert "OpenXR Render Scale: 1.75" in settings_path.read_text(encoding="utf-8")
+    assert "XR Render: 1.75" in settings_path.read_text(encoding="utf-8")
+
+
+def test_settings_menu_persists_and_resets_openxr_screen_state(tmp_path) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "Environment Model: Default\nOpenXR Render Scale: 1.0\n",
+        encoding="utf-8",
+    )
+    state = {
+        "position": [1.0, 1.6, -2.5],
+        "width": 3.2,
+        "height": 1.8,
+        "rotation_deg": [-90.0, 5.0, 0.0],
+        "curved": True,
+        "curve_half_angle_rad": 0.72,
+    }
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_screen_state",
+        environment="Default",
+        state=state,
+    ) is True
+
+    from stereo_runtime.hot_reload import read_yaml
+
+    settings = read_yaml(str(settings_path))
+    assert settings["OpenXR Render Scale"] == 1.0
+    assert settings["OpenXR Screen States"]["Default"] == state
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "reset_openxr_screen_state", environment="Default"
+    ) is True
+    settings = read_yaml(str(settings_path))
+    assert settings["OpenXR Screen States"] == {}
+
+
+def test_settings_menu_persists_default_environment_glow_mode(tmp_path) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "Environment Model: Default\nOpenXR Glow Modes:\n  Cinema: veil\n",
+        encoding="utf-8",
+    )
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_glow_mode",
+        environment="Default",
+        mode="off",
+    ) is True
+
+    from stereo_runtime.hot_reload import read_yaml
+
+    settings = read_yaml(str(settings_path))
+    assert settings["OpenXR Glow Modes"] == {
+        "Cinema": "veil",
+        "Default": "off",
+    }
+
+
+def test_settings_menu_persists_default_environment_glow_transparency(tmp_path) -> None:
+    callbacks = _callbacks(0.6)
+    callbacks.context.base_dir = str(tmp_path)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(
+        "OpenXR Glow Transparency:\n  Cinema: 0.4\n",
+        encoding="utf-8",
+    )
+
+    assert callbacks.on_openxr_controller_shortcut(
+        "persist_openxr_glow_transparency",
+        environment="Default",
+        transparency=0.65,
+    ) is True
+
+    from stereo_runtime.hot_reload import read_yaml
+
+    settings = read_yaml(str(settings_path))
+    assert settings["OpenXR Glow Transparency"] == {
+        "Cinema": 0.4,
+        "Default": 0.65,
+    }

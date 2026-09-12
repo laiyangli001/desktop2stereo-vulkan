@@ -25,7 +25,10 @@ class OpenXRRenderConfig:
     midground_shift_scale: float = 1.0
     background_shift_scale: float = 1.0
     screen_roll: float = 0.0
-    padding_mode: PaddingMode = "reflection"
+    # A reflected sample creates a mirrored copy of objects at the screen
+    # boundary when disparity pushes a pixel outside the source image.  Clamp
+    # to the edge instead; this keeps the final eye image free of double edges.
+    padding_mode: PaddingMode = "border"
     vulkan_projection_min_lod: float = 0.0
     vulkan_projection_max_lod: float = 0.35
     vulkan_projection_mip_lod_bias: float = -0.35
@@ -143,7 +146,12 @@ def _render_eye_from_matched(
         base_shift = compute_shift_px(depth_matched, w, _shift_params(config))
 
     if config.screen_roll == 0.0:
-        return warp_horizontal(rgb, base_shift, eye_sign=float(eye_sign))
+        return warp_horizontal(
+            rgb,
+            base_shift,
+            eye_sign=float(eye_sign),
+            padding_mode=config.padding_mode,
+        )
 
     shift_px = base_shift * float(eye_sign)
     yy, xx = _base_grid_components(h, w, rgb.device, rgb.dtype)

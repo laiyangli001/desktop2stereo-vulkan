@@ -18,7 +18,7 @@ def test_screen_sampling_visual_regression_settings_are_program_controlled() -> 
     assert config.openxr_visual_regression_dir == "artifacts/screen-mip"
 
 
-def test_stream_output_quality_uses_selected_headset_and_pico4_default() -> None:
+def test_stream_output_quality_skips_headset_resampling_but_keeps_pico4_tier() -> None:
     config = runtime_config_from_d2s_settings(
         {
             "Depth Model": "Distill-Any-Depth-Base",
@@ -33,7 +33,7 @@ def test_stream_output_quality_uses_selected_headset_and_pico4_default() -> None
     )
 
     assert DEFAULT_XR_HEADSET_MODEL == "Pico 4 / 4 Ultra"
-    assert config.output_quality_enabled is True
+    assert config.output_quality_enabled is False
     assert config.output_headset_tier_k == 4
     assert config.output_min_lod == 0.5
     assert config.output_max_lod == 1.5
@@ -54,3 +54,18 @@ def test_local_output_quality_uses_the_same_selected_headset_target() -> None:
     )
 
     assert config.output_headset_tier_k == 4
+
+
+def test_openxr_keeps_native_source_for_runtime_projection_resolution() -> None:
+    config = runtime_config_from_d2s_settings(
+        {
+            "Depth Model": "Distill-Any-Depth-Base",
+            "Run Mode": "OpenXR Link",
+            "XR Headset Model": "Meta Quest 2",
+        },
+        cache_dir="models",
+        device="cpu",
+        depth_only=False,
+    )
+
+    assert config.output_quality_enabled is False

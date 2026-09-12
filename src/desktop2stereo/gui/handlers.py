@@ -19,13 +19,14 @@ from streaming.audio import (
 from streaming.wasapi_audio import query_soundcard_loopback_devices
 from utils.run_mode import target_fps_setting_key
 from utils.xr_headset_presets import display_to_xr_headset, xr_headset_options, xr_headset_to_display
+from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 from . import devices as devices_module
 from .capture_sources import (
     get_capture_tool_options, get_primary_monitor_index, list_windows,
 )
 from .config import (
     DEFAULTS, FAMILY_SIZE_TO_MODEL, FAMILY_TO_SIZES,
-    environment_display_label, environment_key_from_label,
+    environment_display_label, environment_key_from_label, save_yaml,
     get_environment_model_options, load_environment_display_names,
 )
 from .controls import FONT_SIZE
@@ -72,6 +73,46 @@ class GUIHandlerMixin:
             "1K / 50%",
         ]
 
+    def _openxr_render_resolution_options(self):
+        return ["Auto (Headset)", "50%", "75%", "100%", "124%", "125%", "150%", "175%", "200%", "250%", "300%", "350%", "400%"]
+
+    def _openxr_render_resolution_to_display(self, value):
+        if str(value or "").strip().lower() in {
+            "auto", "auto (headset)", "headset optimized",
+        }:
+            return "Auto (Headset)"
+        try:
+            raw = str(value).strip()
+            multiplier = float(raw[:-1]) / 100.0 if raw.endswith("%") else float(value)
+        except (TypeError, ValueError):
+            multiplier = DEFAULTS["XR Render"]
+        percent = int(round(
+            max(OPENXR_RENDER_SCALE_MIN, min(OPENXR_RENDER_SCALE_MAX, multiplier))
+            * 100.0
+        ))
+        options = [
+            item for item in self._openxr_render_resolution_options()
+            if item.endswith("%")
+        ]
+        return min(options, key=lambda item: abs(int(item[:-1]) - percent))
+
+    def _openxr_render_resolution_is_auto(self, value):
+        return str(value or "").strip().lower() in {
+            "auto", "auto (headset)", "headset optimized",
+        }
+
+    def _display_to_openxr_render_resolution(self, value):
+        try:
+            return max(
+                OPENXR_RENDER_SCALE_MIN,
+                min(
+                    OPENXR_RENDER_SCALE_MAX,
+                    float(str(value).rstrip("%")) / 100.0,
+                ),
+            )
+        except (TypeError, ValueError):
+            return DEFAULTS["XR Render"]
+
     def _render_scale_to_display(self, value):
         return self._normalize_render_scale_tier(value)
 
@@ -94,6 +135,7 @@ class GUIHandlerMixin:
         self.row6d.visible = show_render_size
         self.row6e.visible = False
         self.row6f.visible = False
+        self.row6g.visible = False
         for ctrl in [self.render_policy_label, self.render_policy_dd]:
             ctrl.visible = False
         for ctrl in [self.render_scale_label, self.render_scale_dd]:
@@ -106,6 +148,8 @@ class GUIHandlerMixin:
             ctrl.visible = False
         for ctrl in [self.render_align_label, self.render_align_dd]:
             ctrl.visible = show_render_size
+        self.openxr_render_resolution_label.visible = False
+        self.openxr_render_resolution_dd.visible = False
 
     def _preset_to_display(self, value):
         mapping = {
@@ -176,6 +220,7 @@ class GUIHandlerMixin:
             self.capture_tool_dd.update()
         self._update_accelerator_visibility(device_label)
         self._sync_nvfruc_visibility(device_label)
+        self._sync_lsfg_visibility()
         self.auto_enable_optimizers_based_on_device()
         self._fit_window_to_content()
 
@@ -188,6 +233,13 @@ class GUIHandlerMixin:
         )
         self.lossless_cb.visible = is_nvidia_cuda
         self.lossless_cb.disabled = not is_nvidia_cuda
+
+    def _sync_lsfg_visibility(self):
+        self.lsfg_cb.visible = (
+            OS_NAME == "Windows"
+            and self.run_mode_key in {"Local Viewer", "3D Monitor"}
+        )
+        self.lsfg_cb.disabled = False
 
     def _update_accelerator_visibility(self, device_label):
         cuda = "CUDA" in device_label
@@ -560,6 +612,10 @@ class GUIHandlerMixin:
         self.row6c.visible = show_enhance
         show_render_size = advanced and mode in ["Local Viewer", "3D Monitor", "OpenXR Link"]
         self._update_render_size_control_visibility(show_render_size)
+        show_openxr_resolution = advanced and mode == "OpenXR Link"
+        self.row6g.visible = show_openxr_resolution
+        self.openxr_render_resolution_label.visible = show_openxr_resolution
+        self.openxr_render_resolution_dd.visible = show_openxr_resolution
         self.target_fps_label.visible = show_timing
         self.target_fps_dd.visible = show_timing
         self.xr_preview_cb.visible = advanced and mode == "OpenXR Link"
@@ -581,7 +637,10 @@ class GUIHandlerMixin:
         self.run_mode_dd.value = mode_reverse.get(mode, texts["Local Viewer"])
         streamer_modes = {"MJPEG Streamer", "RTMP Streamer"}
         is_streamer = mode in streamer_modes
-        self.stream_url_row.visible = is_streamer
+        if hasattr(self, "stream_url_row"):
+            self.stream_url_row.visible = is_streamer
+        if hasattr(self, "stream_url_container"):
+            self.stream_url_container.visible = is_streamer
         self.stream_settings_cb.visible = is_streamer
         is_openxr = mode == "OpenXR Link"
         self.display_mode_label.visible = not is_openxr
@@ -611,6 +670,7 @@ class GUIHandlerMixin:
         if hasattr(self, '_stereo_spacer'):
             self._stereo_spacer.visible = stereo_full
         self._sync_nvfruc_visibility()
+        self._sync_lsfg_visibility()
         self.row9.visible = (not is_openxr) and (
             stereo_full or display_fit_visible
         )
@@ -688,8 +748,16 @@ class GUIHandlerMixin:
             self.locale = lang
             os.environ["DESKTOP2STEREO_LOCALE"] = self.locale
             self._config["Language"] = lang
+            # OpenXR runs in the child runtime process. Persist the locale so
+            # its hot-reloader can publish the change to the Flet mirror and
+            # in-headset menu without restarting the session.
+            ok, error = save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
+            if not ok:
+                logger.warning("Failed to save language change: %s", error)
             self.update_ui_texts()
             self._sync_visibility()
+            # Refresh backend status display if visible
+            self._refresh_backend_status_display()
             if self._status_key:
                 self.set_status(UI_MESSAGES[self.locale].get(self._status_key, self.status_text.value), key=self._status_key)
             t = UI_MESSAGES[self.locale]
@@ -808,6 +876,19 @@ class GUIHandlerMixin:
         render_scale = self._display_to_render_scale(self.render_scale_dd.value)
         self.render_scale_dd.options = self._render_scale_options()
         self.render_scale_dd.value = self._render_scale_to_display(render_scale)
+        self.openxr_render_resolution_label.value = t.get(
+            "XR Render:", "XR Render:"
+        )
+        openxr_resolution_value = self.openxr_render_resolution_dd.value
+        openxr_resolution = self._display_to_openxr_render_resolution(
+            openxr_resolution_value
+        )
+        self.openxr_render_resolution_dd.options = self._openxr_render_resolution_options()
+        self.openxr_render_resolution_dd.value = (
+            "Auto (Headset)"
+            if self._openxr_render_resolution_is_auto(openxr_resolution_value)
+            else self._openxr_render_resolution_to_display(openxr_resolution)
+        )
         self.render_fixed_label.value = t["Render Fixed Size:"]
         self.render_max_pixels_label.value = t["Render Pixel Cap:"]
         self.render_min_dimension_label.value = t["Render Min Side:"]
@@ -831,8 +912,13 @@ class GUIHandlerMixin:
         self.display_fit_dd.options = self._display_fit_options()
         self.display_fit_dd.value = self._display_fit_to_display(display_fit_mode)
         self.display_fit_dd.set_tooltip(t["tooltip_display_fit"])
+        if hasattr(self, "stream_display_fit_label"):
+            self.stream_display_fit_label.value = t.get("Stream Fit:", "Stream Fit:")
+            self.stream_display_fit_label.tooltip = t["tooltip_display_fit"]
         self.lossless_cb.label = t["Lossless Scaling Support"]
         self.lossless_cb.tooltip = t["tooltip_nvfruc"]
+        self.lsfg_cb.label = t["LSFG Support"]
+        self.lsfg_cb.tooltip = t["tooltip_lsfg"]
         self.controller_label.value = t["Controller:"]
         self.environment_label.value = t["Environment:"]
         self._refresh_environment_options()
@@ -872,7 +958,7 @@ class GUIHandlerMixin:
             0 if calibration_auto else 1
         ]
         self.stream_calibration_btn.content.value = t.get(
-            "Start Calibration", "Start Calibration"
+            "Calibrate", "Calibrate"
         )
         self.audio_label.value = t["Stereo Mix"]
         self.crf_label.value = t["CRF"]
@@ -936,6 +1022,7 @@ class GUIHandlerMixin:
             (self.xr_preview_cb, "tooltip_xr_preview"),
             (self.render_policy_dd, "tooltip_render_policy"),
             (self.render_scale_dd, "tooltip_render_scale"),
+            (self.openxr_render_resolution_dd, "tooltip_openxr_render_resolution"),
             (self.render_fixed_dd, "tooltip_render_fixed_size"),
             (self.render_max_pixels_dd, "tooltip_render_max_pixels"),
             (self.render_min_dimension_dd, "tooltip_render_min_dimension"),
@@ -1029,6 +1116,29 @@ class GUIHandlerMixin:
         self.update_stream_url()
         self._fit_window_to_content()
 
+    def on_audio_device_change(self, e):
+        # Persist an explicit Stereo Mix selection on macOS only (v2.5.0
+        # parity: the configured device name is captured by the runtime).
+        # Windows/Linux resolve the default output device on every start and
+        # must not save a stale name. Placeholder labels are never saved.
+        if OS_NAME != "Darwin":
+            return
+        value = str(getattr(e, "control", None) and e.control.value or "").strip()
+        if not value:
+            return
+        placeholders = (
+            "no stereo mix device found",
+            "sounddevice not available",
+            "no audio capture devices found",
+            "no audio devices found",
+            "no audio sources found",
+            "pacmd not available",
+        )
+        if value.casefold() in placeholders:
+            self._config.pop("Stereo Mix", None)
+            return
+        self._config["Stereo Mix"] = value
+
     def _on_stream_key_change(self, e):
         val = e.control.value or ""
         if not re.match(r'^[A-Za-z0-9_-]*$', val) or len(val) > 64:
@@ -1045,10 +1155,35 @@ class GUIHandlerMixin:
             self._populate_audio_generic()
         self._apply_audio_devices_to_dropdown()
 
+    def _saved_audio_device(self):
+        """Return the persisted Stereo Mix device when it is still present.
+
+        The runtime (and the old GUI) may store a bare device name or a
+        "soundcard:"/"wasapi:"-prefixed label; match case-insensitively
+        against the currently discovered devices so the dropdown reflects the
+        saved choice instead of defaulting to the first discovered device.
+        """
+        saved = str((getattr(self, "_config", None) or {}).get("Stereo Mix", "") or "").strip()
+        if not saved:
+            return None
+        for prefix in ("soundcard:", "wasapi:"):
+            if saved.casefold().startswith(prefix):
+                saved = saved.split(":", 1)[1].strip()
+                break
+        if not saved:
+            return None
+        for device in self.audio_devices or []:
+            if str(device).casefold() == saved.casefold():
+                return device
+        return None
+
     def _apply_audio_devices_to_dropdown(self):
         if self.audio_devices:
             self.audio_dd.options = [d for d in self.audio_devices]
-            self.audio_dd.value = self.audio_devices[0]
+            # Prefer the persisted Stereo Mix device so the dropdown reflects
+            # what the stream will actually capture (macOS persists the
+            # selection; Windows/Linux keep the auto-resolved default).
+            self.audio_dd.value = self._saved_audio_device() or self.audio_devices[0]
             self.audio_dd.update()
             if self.audio_devices[0] in ["No Stereo Mix device found", "sounddevice not available"]:
                 self.set_status(self.audio_devices[0])
@@ -1156,6 +1291,13 @@ class GUIHandlerMixin:
 
     def auto_select_stereo_mix(self):
         if not self.audio_devices:
+            return
+        # A persisted macOS selection wins over the first-discovered loopback
+        # (e.g. a silent BlackHole); Windows/Linux keep their auto behavior.
+        saved = self._saved_audio_device()
+        if saved is not None:
+            self.audio_dd.value = saved
+            self.audio_dd.update()
             return
         for dev in self.audio_devices:
             dl = dev.lower()

@@ -1,9 +1,12 @@
+import re
 from pathlib import Path
 
 from path_config import APP_ROOT
 
+from gui.model_catalog import GUI_MODEL_CATALOG, V25_GUI_MODEL_NAMES
 from stereo_runtime import DepthRuntimeConfig, ModelRegistry, resolve_model_dir
 from stereo_runtime.adapter import depth_provider_config_from_runtime
+from stereo_runtime.model_capabilities import DISABLE_MIGRAPHX_KEYWORDS
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,6 +81,24 @@ def test_model_registry_is_d2s_model_mapping_source():
     assert "depth-anything-indoor-large" in names
     assert "depth-anything-outdoor-large" in names
     assert "DepthPro-Large" in names
+
+
+def test_migraphx_is_not_hidden_for_registered_model_families():
+    assert DISABLE_MIGRAPHX_KEYWORDS == []
+
+
+def test_gui_model_catalog_matches_v25_model_list_without_legacy_models():
+    settings = (APP_ROOT / "settings.yaml").read_text(encoding="utf-8")
+    model_block = settings.replace("\r\n", "\n").split("Model List:\n", 1)[1]
+    model_block = model_block.split("\nDepth Model:", 1)[0]
+    settings_names = re.findall(r"^  ([^ \n:][^\n:]*):$", model_block, flags=re.MULTILINE)
+
+    assert list(GUI_MODEL_CATALOG) == list(V25_GUI_MODEL_NAMES)
+    assert settings_names == list(V25_GUI_MODEL_NAMES)
+    assert settings.count("  dpt-") == 0
+    assert settings.count("  zoedepth-") == 0
+    assert settings.count("  depth-ai:") == 0
+    assert len(GUI_MODEL_CATALOG) == 35
 
 
 def test_utils_model_mapping_delegates_to_runtime_registry():

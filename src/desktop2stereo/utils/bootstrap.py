@@ -7,7 +7,7 @@ from .platform_env import configure_platform_environment
 from .settings import load_settings
 
 
-def _normalize_legacy_settings(settings: dict) -> dict:
+def _normalize_legacy_settings(settings: dict, *, os_name: str | None = None) -> dict:
     """Expose the flat settings contract while the new schema is being migrated."""
     if "Stream Quality" in settings:
         return settings
@@ -54,7 +54,7 @@ def _normalize_legacy_settings(settings: dict) -> dict:
         "Recompile TensorRT": False,
         "MIGraphX": False,
         "Recompile MIGraphX": False,
-        "CoreML": False,
+        "CoreML": os_name == "Darwin",
         "Recompile CoreML": False,
         "OpenVINO": False,
         "Recompile OpenVINO": False,
@@ -84,10 +84,13 @@ def _normalize_legacy_settings(settings: dict) -> dict:
         "Capture Tool": str(capture.get("tool", "none")),
         "NVIDIA Frame Generation": False,
         "Lossless Scaling Support": False,
+        "LSFG Support": False,
         "Stereo Output": None,
         "Stereo Output Identity": None,
         "Render Size Policy": "scaled",
         "Render Scale": "4K / 100%",
+        "XR Render": 1.0,
+        "XR Render Mode": "auto",
         "Render Fixed Width": 1920,
         "Render Fixed Height": 1080,
         "Render Max Pixels": 3840 * 2160,
@@ -103,7 +106,7 @@ def _normalize_legacy_settings(settings: dict) -> dict:
 
 
 def bootstrap_settings(path: str, *, os_name: str) -> dict:
-    settings = _normalize_legacy_settings(load_settings(path))
+    settings = _normalize_legacy_settings(load_settings(path), os_name=os_name)
     configure_platform_environment(os_name)
     configure_huggingface_endpoint()
     if str(settings.get("Debug Mode", False) or False).strip().lower() in ("1", "true", "yes", "on"):

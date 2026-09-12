@@ -6,6 +6,7 @@ from dataclasses import replace
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 
@@ -13,7 +14,11 @@ import torch
 
 from .adapter import StereoRuntimeConfig, depth_provider_config_from_runtime, stereo_config_from_runtime
 from .baseline_shift import ShiftParams, compute_shift_px, shift_debug_info
-from .depth_postprocess import postprocess_depth
+from .depth_postprocess import (
+    anti_alias_depth_guided,
+    apply_depth_pop,
+    postprocess_depth,
+)
 from .depth_provider import DepthProfileResult, create_depth_provider
 from .openxr_render import OpenXRRenderConfig, render_openxr_stereo
 from .parallax import parallax_debug_info, resolve_parallax_budget
@@ -25,7 +30,7 @@ from .settings_snapshot import (
     SnapshotChangeClass,
 )
 from .compute_backend import probe_opengl_stereo_backend, resolve_stereo_compute_backend
-from .output import make_sbs, match_depth
+from .output import ensure_bchw, make_sbs, match_depth
 from .output_quality import apply_output_quality, output_quality_requires_eye_images
 from .synthesis import StereoConfig, StereoResult, synthesize_stereo
 from .temporal import TemporalState, apply_temporal
@@ -37,9 +42,11 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class DepthRuntimeResult:
-    depth: torch.Tensor
+    depth: Any
     timing: dict[str, float] = field(default_factory=dict)
     provider_info: dict[str, Any] = field(default_factory=dict)
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
 
 
 class DepthRuntime:
@@ -70,6 +77,18 @@ class DepthRuntime:
         if callable(load):
             load()
         self._loaded = True
+
+    def native_coreml_io_ready(self, size: tuple[int, int] | list[int]) -> bool:
+        """Return whether the macOS native Core ML bridge is ready for size."""
+        if not isinstance(size, (tuple, list)) or len(size) != 2:
+            return False
+        checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(int(size[0]), int(size[1])))
+        except Exception:
+            return False
 
     def set_inference_active(self, active: bool) -> None:
         self._active = bool(active)
@@ -115,6 +134,7 @@ class DepthRuntime:
             "depth_model_ms": float(profile.model_ms),
             "depth_slot_wait_ms": float(profile.slot_wait_ms),
             "depth_postprocess_ms": float(profile.postprocess_ms),
+            "depth_nonfinite_count": int(profile.nonfinite_count),
             "depth_total_ms": float(total_ms),
             "total_ms": float(total_ms),
         }
@@ -122,9 +142,43 @@ class DepthRuntime:
         self.last_timing = timing
         self.last_memory = memory
         self.stats.update(timing, memory)
-        return DepthRuntimeResult(depth=profile.depth, timing=timing, provider_info=self.provider_report())
+        return DepthRuntimeResult(
+            depth=profile.depth,
+            timing=timing,
+            provider_info=self.provider_report(),
+            native_resource_handle=getattr(profile, "native_resource_handle", None),
+            native_zero_copy=bool(getattr(profile, "native_zero_copy", False)),
+        )
 
-    def _predict_depth_profile(self, rgb_frame: torch.Tensor) -> DepthProfileResult:
+    def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        if native_capture is not None and capture_frame_id is not None:
+            native_predict = getattr(self.depth_provider, "predict_profile_native", None)
+            if callable(native_predict):
+                try:
+                    native_result = native_predict(
+                        rgb_frame, native_capture, int(capture_frame_id)
+                    )
+                    if isinstance(native_result, DepthProfileResult):
+                        return native_result
+                except Exception as exc:
+                    self._native_io_last_error = f"{type(exc).__name__}: {exc}"
+                    if type(exc).__name__ == "NativeCoreMLBusy":
+                        raise
+                    if not getattr(self, "_native_io_error_logged", False):
+                        self._native_io_error_logged = True
+                        print(
+                            f"[CoreMLNativeIO] prediction failed; using Python fallback: "
+                            f"{self._native_io_last_error}",
+                            flush=True,
+                        )
+                    if getattr(rgb_frame, "device", None) is not None and rgb_frame.device.type == "meta":
+                        raise
         predict_profile = getattr(self.depth_provider, "predict_profile", None)
         if callable(predict_profile):
             result = predict_profile(rgb_frame)
@@ -139,6 +193,8 @@ class DepthRuntime:
                     postprocess_ms=float(getattr(result, "postprocess_ms", 0.0)),
                     cuda_timing_events=dict(getattr(result, "cuda_timing_events", None) or {}),
                     slot_wait_ms=float(getattr(result, "slot_wait_ms", 0.0)),
+                    finite_depth=bool(getattr(result, "finite_depth", True)),
+                    nonfinite_count=int(getattr(result, "nonfinite_count", 0)),
                 )
 
         start = time.perf_counter()
@@ -185,7 +241,7 @@ class DepthRuntime:
 
 @dataclass(frozen=True)
 class StereoRuntimeResult:
-    depth: torch.Tensor
+    depth: Any
     left_eye: torch.Tensor
     right_eye: torch.Tensor
     sbs: torch.Tensor
@@ -194,6 +250,37 @@ class StereoRuntimeResult:
     output_format: str | None = None
     output_dtype: str | None = None
     output_pack_backend: str | None = None
+    # Deferred shader-warp handoff (macOS Local Viewer): the viewer samples
+    # these directly in its fragment shader, so no SBS is synthesized here.
+    viewer_rgb: torch.Tensor | None = None
+    viewer_depth: torch.Tensor | None = None
+    # Host-packed presentation frame (HWC RGBA8 numpy): produced on the
+    # runtime thread right after synthesis while the MPS queue is drained,
+    # so the viewer never pays an MPS sync mid-present.
+    viewer_frame_np: Any | None = None
+    # Owned zero-copy capture frame (SCK CVPixelBuffer+CVMetalTexture):
+    # the warp viewer samples it directly instead of uploading packed RGB.
+    viewer_bgra: Any | None = None
+    # The packer may write the fused output directly into a Vulkan source's
+    # mapped staging pages. Kept as a dataclass field so dataclasses.replace()
+    # in the packer does not discard the ownership token.
+    viewer_frame_direct: Any | None = None
+    # Native CoreML/Metal local-viewer result. The bridge owns the capture
+    # texture and normalized model-resolution depth until it is packed or
+    # released by the presenter queue.
+    viewer_native: Any | None = None
+    # Native CoreML/Metal stream result. The direct stream consumer packs it
+    # on its own thread so the next CoreML prediction can overlap the warp.
+    native_stream_frame: Any | None = None
+    native_stream_fallback: Any | None = None
+    # Opaque native resource handle and its measured ownership mode. These
+    # fields keep the native handoff explicit for callers and telemetry.
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
+    capture_frame_id: int | None = None
+    depth_frame_id: int | None = None
+    depth_complete: bool = False
+    depth_finite: bool = True
     active_settings_version: int | None = None
     hot_reload_class: str | None = None
     hot_reload_changed_fields: tuple[str, ...] = ()
@@ -989,6 +1076,48 @@ class StereoRuntime:
             load()
         self._loaded = True
 
+    def native_coreml_io_ready(self, size: tuple[int, int] | list[int]) -> bool:
+        """Return whether the macOS native Core ML bridge is ready for size."""
+        if not isinstance(size, (tuple, list)) or len(size) != 2:
+            return False
+        # All local-viewer display modes have a native GPU pack implementation.
+        # Stateful or color-transforming features still use the established
+        # compositor because they cannot be represented by this stateless pass.
+        if str(getattr(self.stereo_config, "output_format", "half_sbs")) not in {
+            "half_sbs",
+            "full_sbs",
+            "half_tab",
+            "full_tab",
+            "mono",
+            "depth_map",
+            "anaglyph",
+            "interleaved",
+            "leia",
+        }:
+            return False
+        if any(
+            bool(getattr(self.stereo_config, field_name, False))
+            for field_name in (
+                "temporal",
+                "refine",
+                "cross_eyed",
+                "output_quality_enabled",
+                "dynamic_convergence_enabled",
+            )
+        ):
+            return False
+        if isinstance(getattr(self.stereo_config, "convergence", None), torch.Tensor):
+            return False
+        if not _viewer_color_adjustments_neutral(self.config):
+            return False
+        checker = getattr(self.depth_provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(int(size[0]), int(size[1])))
+        except Exception:
+            return False
+
     def set_inference_active(self, active: bool) -> None:
         """Pause or resume depth and stereo processing for headset idle state."""
         self._active = bool(active)
@@ -1042,6 +1171,35 @@ class StereoRuntime:
         if change_class is SnapshotChangeClass.PIPELINE_REBUILD and _DEPTH_PROVIDER_REBUILD_FIELDS.intersection(changed_fields):
             self._rebuild_depth_provider()
         return change_class
+
+    def _temporal_stabilize_depth(self, depth):
+        """EMA-smooth the shipped warp depth across frames (fused leg only).
+
+        Kills frame-to-frame dither (ANE fp16 quantization, ViT global
+        attention sensitivity) that the native-resolution warp converts
+        into visible edge shimmer. Kill switch: D2S_DEPTH_TEMPORAL=0.
+        """
+        if os.environ.get("D2S_DEPTH_TEMPORAL", "1") in {"0", "false", "off"}:
+            return depth
+        prev = getattr(self, "_fused_depth_prev", None)
+        if (
+            prev is None
+            or prev.shape != depth.shape
+            or prev.device != depth.device
+        ):
+            self._fused_depth_prev = depth.detach().clone()
+            return depth
+        # Out-of-place: the previous state must never be mutated while the
+        # packer thread may still be reading the tensor we shipped last frame.
+        st = self._fused_depth_prev.mul(0.35).add_(depth.detach(), alpha=0.65)
+        # One poisoned fp16 frame must not poison the EMA forever; sanitize
+        # the blended state and reseed on non-finite input.
+        if st.is_floating_point() and not torch.isfinite(st).all():
+            st = torch.nan_to_num(st, nan=1.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+            self._fused_depth_prev = st.detach().clone()
+        else:
+            self._fused_depth_prev = st
+        return st
 
     def _rebuild_depth_provider(self) -> None:
         close = getattr(self.depth_provider, "close", None)
@@ -1157,10 +1315,25 @@ class StereoRuntime:
         *,
         skip_sbs_output: bool = False,
         depth_profile: DepthProfileResult | None = None,
+        pixel_buffer: Any | None = None,
+        capture_frame_id: int | None = None,
     ) -> StereoRuntimeResult:
         if not self._active:
             raise RuntimeError("StereoRuntime inference is paused")
         self.load()
+
+        # Owned zero-copy capture frame (SCK): either ship it to the warp
+        # viewer or release it here — never leak it.
+        viewer_bgra = None
+        if pixel_buffer is not None:
+            if (
+                not skip_sbs_output
+                and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
+                and _viewer_color_adjustments_neutral(self.config)
+                and hasattr(pixel_buffer, "mtl_texture")
+            ):
+                viewer_bgra = pixel_buffer
+
         self._reset_cuda_peak_if_needed()
         rgb_frame = _validate_runtime_rgb_frame(rgb_frame)
 
@@ -1168,7 +1341,194 @@ class StereoRuntime:
         _record_cuda_event(cuda_events, "start", rgb_frame)
         total_start = time.perf_counter()
         depth_start = time.perf_counter()
-        profile = depth_profile or self._predict_depth_profile(rgb_frame)
+        profile = depth_profile or self._predict_depth_profile(
+            rgb_frame,
+            native_capture=pixel_buffer,
+            capture_frame_id=capture_frame_id,
+        )
+        native_depth = getattr(profile, "native_depth", None)
+        if native_depth is not None:
+            # The bridge retained the CVPixelBuffer while moving it into its
+            # native slot. Its slot now owns the capture resource until the
+            # presenter or stream consumer releases the native frame.
+            if pixel_buffer is not None:
+                try:
+                    pixel_buffer.release()
+                except Exception:
+                    pass
+            if _macos_stream_native_io_enabled():
+                source_size = getattr(native_depth, "source_size", None)
+                if source_size is None:
+                    source_size = _runtime_frame_size(rgb_frame)
+                if source_size is None:
+                    native_depth.release()
+                    raise RuntimeError("native CoreML stream result has no source size")
+                width, height = (int(source_size[0]), int(source_size[1]))
+                output_format = str(self.stereo_config.output_format)
+                output_width, output_height = _native_output_size(
+                    width, height, output_format
+                )
+                native_warp_debug = _configure_native_coreml_warp(
+                    native_depth,
+                    self.stereo_config,
+                    width=width,
+                    height=height,
+                )
+                total_ms = (time.perf_counter() - total_start) * 1000.0
+                provider_info = self.provider_report()
+                debug = {
+                    "backend": self.stereo_config.backend,
+                    "sbs_backend": "native_coreml_metal_stream_warp_deferred",
+                    "runtime_output_pack_backend": "native_coreml_metal_stream_pack",
+                    "runtime_output_dtype": "native_deferred_rgb24",
+                    "native_coreml_io": True,
+                    "native_coreml_stream_pack": 0,
+                    "native_coreml_stream_pack_deferred": 1,
+                    "native_coreml_input_shared": int(bool(native_depth.input_shared)),
+                    "native_coreml_output_backing": int(
+                        bool(native_depth.output_backing_used)
+                    ),
+                    "native_coreml_output_zero_copy": int(
+                        bool(native_depth.output_zero_copy)
+                    ),
+                    "native_coreml_metal_vulkan_alias": 0,
+                    "native_coreml_host_handoff_copy_count": 1,
+                    "native_coreml_gpu_copy_count": 1,
+                    "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
+                    "depth_finite": int(bool(native_depth.finite_depth)),
+                    "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
+                    "runtime_depth_backend": "coreml",
+                    "runtime_output_format": output_format,
+                    "runtime_output_eye_size": f"{width}x{height}",
+                    "runtime_output_display_size": f"{output_width}x{output_height}",
+                    "native_coreml_stream_host_rgb_handoff": 1,
+                    **native_warp_debug,
+                }
+                native_error = getattr(self, "_native_io_last_error", None)
+                if native_error:
+                    debug["native_coreml_previous_error"] = str(native_error)
+                timing = {
+                    "depth_preprocess_ms": float(profile.preprocess_ms),
+                    "depth_model_ms": float(profile.model_ms),
+                    "depth_postprocess_ms": float(profile.postprocess_ms),
+                    "depth_total_ms": float(profile.total_ms),
+                    "synthesis_ms": 0.0,
+                    "pack_ms": 0.0,
+                    "total_ms": float(total_ms),
+                    "depth_nonfinite_count": int(profile.nonfinite_count),
+                    "native_coreml_stream_pack_ms": 0.0,
+                }
+                self.last_timing = timing
+                self.last_memory = {}
+                self.stats.update(timing, {})
+                return StereoRuntimeResult(
+                    depth=native_depth,
+                    left_eye=rgb_frame,
+                    right_eye=rgb_frame,
+                    sbs=rgb_frame,
+                    output_eye_size=(width, height),
+                    output_display_size=(output_width, output_height),
+                    output_format=output_format,
+                    output_dtype="uint8",
+                    output_pack_backend="native_coreml_metal_stream_pack",
+                    native_stream_frame=native_depth,
+                    native_stream_fallback=lambda: self.process_rgb_frame(
+                        rgb_frame,
+                        pixel_buffer=None,
+                        capture_frame_id=capture_frame_id,
+                    ),
+                    native_resource_handle=None,
+                    native_zero_copy=False,
+                    depth_finite=bool(profile.finite_depth),
+                    capture_frame_id=capture_frame_id,
+                    depth_frame_id=capture_frame_id,
+                    depth_complete=bool(profile.finite_depth),
+                    debug_info=debug,
+                    timing=timing,
+                    provider_info=provider_info,
+                )
+            width, height = _runtime_frame_size(rgb_frame) or (0, 0)
+            native_warp_debug = _configure_native_coreml_warp(
+                native_depth,
+                self.stereo_config,
+                width=int(width),
+                height=int(height),
+            )
+            provider_info = self.provider_report()
+            debug = {
+                "backend": self.stereo_config.backend,
+                "sbs_backend": "native_coreml_metal_layered",
+                "runtime_output_pack_backend": "native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
+                "runtime_output_dtype": "native",
+                "native_coreml_io": True,
+                "native_coreml_input_shared": int(bool(native_depth.input_shared)),
+                "native_coreml_output_backing": int(
+                    bool(native_depth.output_backing_used)
+                ),
+                "native_coreml_output_zero_copy": int(
+                    bool(native_depth.output_zero_copy)
+                ),
+                # The native warp is GPU-side, but MoltenVK does not expose
+                # its mapped allocation as a Metal MTLBuffer on this host.
+                "native_coreml_metal_vulkan_alias": 0,
+                "native_coreml_host_handoff_copy_count": 1,
+                "native_coreml_gpu_copy_count": 1,
+                "native_coreml_nonfinite_count": int(native_depth.nonfinite_count),
+                "depth_finite": int(bool(native_depth.finite_depth)),
+                "native_coreml_normalize_lo": float(native_depth.normalize_lo),
+                "native_coreml_normalize_hi": float(native_depth.normalize_hi),
+                "depth_render_size": f"{native_depth.depth_width}x{native_depth.depth_height}",
+                "runtime_depth_backend": "coreml",
+                "runtime_output_format": str(self.stereo_config.output_format),
+                **native_warp_debug,
+            }
+            native_error = getattr(self, "_native_io_last_error", None)
+            if native_error:
+                debug["native_coreml_previous_error"] = str(native_error)
+            timing = {
+                "depth_preprocess_ms": float(profile.preprocess_ms),
+                "depth_model_ms": float(profile.model_ms),
+                "depth_postprocess_ms": float(profile.postprocess_ms),
+                "depth_total_ms": float(profile.total_ms),
+                "synthesis_ms": 0.0,
+                "pack_ms": 0.0,
+                "total_ms": float(profile.total_ms),
+                "depth_nonfinite_count": int(profile.nonfinite_count),
+            }
+            if pixel_buffer is not None:
+                try:
+                    pixel_buffer.release()
+                except Exception:
+                    pass
+            return StereoRuntimeResult(
+                depth=native_depth,
+                left_eye=rgb_frame,
+                right_eye=rgb_frame,
+                sbs=rgb_frame,
+                output_eye_size=(int(width), int(height)),
+                output_display_size=(int(width), int(height)),
+                output_format=str(self.stereo_config.output_format),
+                output_dtype="native",
+                output_pack_backend="native_coreml_metal_layered_vulkan_gpu_warp_host_handoff",
+                viewer_native=native_depth,
+                native_resource_handle=native_depth,
+                native_zero_copy=bool(native_depth.output_zero_copy),
+                depth_finite=bool(profile.finite_depth),
+                capture_frame_id=capture_frame_id,
+                depth_frame_id=capture_frame_id,
+                depth_complete=bool(profile.finite_depth),
+                debug_info=debug,
+                timing=timing,
+                provider_info=provider_info,
+            )
+        elif pixel_buffer is not None and viewer_bgra is None:
+            # Native prediction either was unavailable or fell back to the
+            # regular tensor path. The fallback no longer needs the retained
+            # IOSurface lease; release it after inference has decided.
+            try:
+                pixel_buffer.release()
+            except Exception:
+                pass
         depth_total_ms = (
             float(profile.total_ms)
             if depth_profile is not None
@@ -1183,80 +1543,121 @@ class StereoRuntime:
         synth_start = time.perf_counter()
         deferred_vulkan_request = None
         deferred_vulkan_reason = "disabled"
-        if _intel_vulkan_network_path_enabled() and not skip_sbs_output:
-            deferred_vulkan_request, deferred_vulkan_reason = self._build_vulkan_compute_request(
-                output_rgb,
-                depth,
-                stereo_config,
-            )
-        if deferred_vulkan_request is not None:
-            vulkan_stereo = None
-            vulkan_skip = "intel_network_deferred"
-            fused_sbs = None
-            fused_skip = "intel_network_deferred"
+        # Deferred Metal shader warp (macOS Local Viewer): skip torch-side
+        # synthesis entirely; the viewer's fragment shader samples rgb+depth
+        # at draw time (v2.5 approach). runtime_entry sets the env default to
+        # "1" only for Darwin Local Viewer, so stream/OpenXR paths never see
+        # it unless a user opts in explicitly.
+        deferred_warp = (
+            not skip_sbs_output
+            and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
+        )
+        # Advanced macOS streaming has no native Metal-to-encoder texture
+        # bridge in this output path. Use the same synthesis contract as
+        # CUDA/ROCm rather than the Vulkan layered pass, which currently
+        # performs a GPU -> host -> GPU roundtrip before the host encoder.
+        # This is deliberately limited to Darwin network streaming; the
+        # local Vulkan viewer and vendor paths keep their existing routing.
+        macos_stream_canonical_synthesis = (
+            sys.platform == "darwin"
+            and os.environ.get("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and not _intel_vulkan_network_path_enabled()
+        )
+        vulkan_skip = "not_attempted"
+        fused_skip = "not_attempted"
+        if deferred_warp:
             stereo = StereoResult(
                 left_eye=output_rgb,
                 right_eye=output_rgb,
                 sbs=output_rgb,
                 debug_info={
                     "backend": stereo_config.backend,
-                    "sbs_backend": "vulkan_deferred_intel_network",
-                    "stereo_compute_backend": "vulkan",
-                    "vulkan_zero_copy_deferred": 1,
-                    "vulkan_zero_copy_reason": deferred_vulkan_reason,
+                    "sbs_backend": "metal_shader_warp",
+                    "fast_plus_fused_backend": "not_used",
+                    "fast_plus_fused_skip": "shader_warp",
                 },
             )
         else:
-            vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
-                output_rgb,
-                depth,
-                stereo_config,
-                skip_sbs_output=skip_sbs_output,
-            )
-            fused_sbs, fused_skip = (None, "vulkan_selected") if vulkan_stereo is not None else (
-                (None, "skip_sbs_output")
-                if skip_sbs_output
-                else self._try_fast_plus_fused_sbs(output_rgb, depth, stereo_config)
-            )
-        if vulkan_stereo is not None:
-            stereo = vulkan_stereo
-            stereo.debug_info.setdefault("fast_plus_fused_backend", "not_used")
-            stereo.debug_info.setdefault("fast_plus_fused_skip", vulkan_skip)
-        elif fused_sbs is not None:
-            stereo = StereoResult(
-                left_eye=output_rgb,
-                right_eye=output_rgb,
-                sbs=fused_sbs,
-                debug_info={
-                    "backend": stereo_config.backend,
-                    "sbs_backend": "triton_fast_plus_fused_half_sbs_uint8",
-                    "fast_plus_fused_backend": "triton_half_sbs_uint8",
-                    "fast_plus_fused_temporal_bypass": int(bool(stereo_config.temporal)),
-                    "occlusion_mask_backend": "triton_fused_radius1",
-                    "hole_fill_backend": "triton_fused_directional_4tap",
-                },
-            )
-        elif deferred_vulkan_request is not None:
-            # The deferred branch already created a lightweight placeholder;
-            # the Intel network sink performs the actual image dispatch.
-            pass
-        else:
-            stereo_config_for_frame = stereo_config
-            if skip_sbs_output:
-                stereo_config_for_frame = replace(stereo_config, output_format="mono")
-            stereo = synthesize_stereo(
-                output_rgb,
-                depth,
-                stereo_config_for_frame,
-                temporal_state=self.temporal_state,
-                sbs_only=not skip_sbs_output,
-            )
-            cuda_events.update(getattr(stereo, "cuda_timing_events", None) or {})
-            stereo.debug_info.setdefault("fast_plus_fused_backend", "not_used")
-            stereo.debug_info.setdefault("fast_plus_fused_skip", fused_skip)
-            if stereo_config_for_frame is not stereo_config:
-                stereo.debug_info["sbs_backend"] = "openxr_eyes_only"
-                stereo.debug_info["make_sbs_ms"] = 0.0
+            if _intel_vulkan_network_path_enabled() and not skip_sbs_output:
+                deferred_vulkan_request, deferred_vulkan_reason = self._build_vulkan_compute_request(
+                    output_rgb,
+                    depth,
+                    stereo_config,
+                )
+            if deferred_vulkan_request is not None:
+                vulkan_stereo = None
+                vulkan_skip = "intel_network_deferred"
+                fused_sbs = None
+                fused_skip = "intel_network_deferred"
+                stereo = StereoResult(
+                    left_eye=output_rgb,
+                    right_eye=output_rgb,
+                    sbs=output_rgb,
+                    debug_info={
+                        "backend": stereo_config.backend,
+                        "sbs_backend": "vulkan_deferred_intel_network",
+                        "stereo_compute_backend": "vulkan",
+                        "vulkan_zero_copy_deferred": 1,
+                        "vulkan_zero_copy_reason": deferred_vulkan_reason,
+                    },
+                )
+            elif macos_stream_canonical_synthesis:
+                vulkan_stereo = None
+                vulkan_skip = "macos_stream_canonical_synthesis"
+                fused_sbs = None
+                fused_skip = "macos_stream_canonical_synthesis"
+            else:
+                vulkan_stereo, vulkan_skip = self._try_vulkan_fused_stereo(
+                    output_rgb,
+                    depth,
+                    stereo_config,
+                    skip_sbs_output=skip_sbs_output,
+                )
+                fused_sbs, fused_skip = (None, "vulkan_selected") if vulkan_stereo is not None else (
+                    (None, "skip_sbs_output")
+                    if skip_sbs_output
+                    else self._try_fast_plus_fused_sbs(output_rgb, depth, stereo_config)
+                )
+            if vulkan_stereo is not None:
+                stereo = vulkan_stereo
+                stereo.debug_info.setdefault("fast_plus_fused_backend", "not_used")
+                stereo.debug_info.setdefault("fast_plus_fused_skip", vulkan_skip)
+            elif fused_sbs is not None:
+                stereo = StereoResult(
+                    left_eye=output_rgb,
+                    right_eye=output_rgb,
+                    sbs=fused_sbs,
+                    debug_info={
+                        "backend": stereo_config.backend,
+                        "sbs_backend": "triton_fast_plus_fused_half_sbs_uint8",
+                        "fast_plus_fused_backend": "triton_half_sbs_uint8",
+                        "fast_plus_fused_temporal_bypass": int(bool(stereo_config.temporal)),
+                        "occlusion_mask_backend": "triton_fused_radius1",
+                        "hole_fill_backend": "triton_fused_directional_4tap",
+                    },
+                )
+            elif deferred_vulkan_request is not None:
+                # The deferred branch already created a lightweight placeholder;
+                # the Intel network sink performs the actual image dispatch.
+                pass
+            else:
+                stereo_config_for_frame = stereo_config
+                if skip_sbs_output:
+                    stereo_config_for_frame = replace(stereo_config, output_format="mono")
+                stereo = synthesize_stereo(
+                    output_rgb,
+                    depth,
+                    stereo_config_for_frame,
+                    temporal_state=self.temporal_state,
+                    sbs_only=not skip_sbs_output,
+                )
+                cuda_events.update(getattr(stereo, "cuda_timing_events", None) or {})
+                stereo.debug_info.setdefault("fast_plus_fused_backend", "not_used")
+                stereo.debug_info.setdefault("fast_plus_fused_skip", fused_skip)
+                if stereo_config_for_frame is not stereo_config:
+                    stereo.debug_info["sbs_backend"] = "openxr_eyes_only"
+                    stereo.debug_info["make_sbs_ms"] = 0.0
         synthesis_ms = (time.perf_counter() - synth_start) * 1000.0
         _record_cuda_event(cuda_events, "synthesis", rgb_frame)
         total_ms = (time.perf_counter() - total_start) * 1000.0
@@ -1266,6 +1667,7 @@ class StereoRuntime:
             "depth_model_ms": float(profile.model_ms),
             "depth_slot_wait_ms": float(profile.slot_wait_ms),
             "depth_postprocess_ms": float(profile.postprocess_ms),
+            "depth_nonfinite_count": int(profile.nonfinite_count),
             "depth_total_ms": float(depth_total_ms),
             "synthesis_ms": float(synthesis_ms),
             "total_ms": float(total_ms),
@@ -1276,6 +1678,9 @@ class StereoRuntime:
         self.stats.update(timing, memory)
 
         debug = dict(stereo.debug_info)
+        if macos_stream_canonical_synthesis:
+            debug["macos_stream_canonical_synthesis"] = 1
+            debug["macos_stream_vulkan_skip"] = vulkan_skip
         debug["runtime_depth_backend"] = self.depth_config.backend
         debug["runtime_output_format"] = self.stereo_config.output_format
         debug["packing_format"] = self.stereo_config.output_format
@@ -1290,6 +1695,12 @@ class StereoRuntime:
         _add_runtime_config_debug_info(debug, stereo_config)
         debug.update(convergence_debug)
         provider_info = self.provider_report()
+        # The configured backend is commonly "auto" on macOS. CoreML is
+        # selected lazily, so report it once the provider has become active;
+        # leave synthetic/test provider labels and existing vendor telemetry
+        # unchanged.
+        if provider_info.get("depth_backend") == "coreml":
+            debug["runtime_depth_backend"] = "coreml"
         _add_depth_contract_debug_info(debug, depth, provider_info)
         _add_preprocess_debug_info(debug, rgb_frame)
         if memory:
@@ -1297,7 +1708,12 @@ class StereoRuntime:
 
         sbs = stereo.sbs
         pack_start = time.perf_counter()
-        if skip_sbs_output:
+        if deferred_warp:
+            # The viewer consumes rgb+depth directly; nothing to pack.
+            debug["runtime_output_pack_backend"] = "metal_shader_warp"
+            debug["runtime_output_dtype"] = "deferred_to_viewer"
+            sbs = output_rgb
+        elif skip_sbs_output:
             debug["runtime_output_pack_backend"] = "openxr_eyes_only"
             debug["runtime_output_dtype"] = str(sbs.dtype).replace("torch.", "")
         elif _runtime_output_uint8_enabled() and sbs.is_floating_point():
@@ -1318,6 +1734,34 @@ class StereoRuntime:
         _record_cuda_event(cuda_events, "pack", rgb_frame)
         _record_cuda_event(cuda_events, "end", rgb_frame)
         timing["pack_ms"] = float(pack_ms)
+        # Host presentation frame: pack HWC RGBA8 on the device and pull one
+        # copy on the runtime thread (its MPS queue is drained here), so the
+        # viewer thread does a plain memcpy instead of an MPS sync mid-frame.
+        viewer_frame_np = None
+        # When the dedicated packer thread owns packing
+        # (D2S_PACKER_THREAD installed entry-side, signaled here as
+        # D2S_RUNTIME_INLINE_HOST_PACK=0), ship the device SBS untouched so
+        # the runtime loop never waits on the MPS->host copy.
+        inline_host_pack = os.environ.get(
+            "D2S_RUNTIME_INLINE_HOST_PACK", "1"
+        ) not in {"0", "false", "off"}
+        if _viewer_host_frame_enabled() and inline_host_pack and sbs is not None:
+            host_start = time.perf_counter()
+            host_parts: dict[str, float] = {}
+            if os.environ.get("D2S_SBS_HOST_SYNC_PRE", "0") == "1":
+                sync_start = time.perf_counter()
+                torch.mps.synchronize()
+                timing["sbs_host_presync_ms"] = (
+                    time.perf_counter() - sync_start
+                ) * 1000.0
+            viewer_frame_np = _pack_sbs_host_frame(sbs, timings=host_parts)
+            timing["sbs_host_ms"] = (time.perf_counter() - host_start) * 1000.0
+            for key, value in host_parts.items():
+                timing[f"sbs_host_{key}_ms"] = float(value)
+            if viewer_frame_np is not None:
+                debug["runtime_output_pack_backend"] = (
+                    str(debug.get("runtime_output_pack_backend", "")) + "+host_np"
+                ).lstrip("+")
         slow_log_ms = float(os.environ.get("D2S_SLOW_RUNTIME_LOG_MS", "200") or "200")
         refresh_log_s = float(os.environ.get("D2S_RUNTIME_FRAME_LOG_REFRESH_S", "5") or "0")
         now_log = time.perf_counter()
@@ -1366,6 +1810,22 @@ class StereoRuntime:
                     f" stage_synth_gap={float(debug.get('synthesis_unaccounted_ms', 0.0)):.1f}"
                 )
 
+        if deferred_warp:
+            _vd_post = _warp_depth_postprocess(depth, stereo_config, output_rgb)
+            if fused_warp_active():
+                # Fused warp-pack reads f32 directly: antialias only.
+                # Temporal stabilize damps ANE-fp16 / model dither that
+                # native-res warp otherwise amplifies into edge shimmer.
+                viewer_depth = _rz_ship(
+                    self._temporal_stabilize_depth(_vd_post), raw=depth
+                )
+            else:
+                viewer_depth = _rz_ship(
+                    _quantize_depth_for_warp(_vd_post), raw=depth
+                )
+        else:
+            viewer_depth = None
+
         return StereoRuntimeResult(
             depth=depth,
             left_eye=stereo.left_eye,
@@ -1376,6 +1836,11 @@ class StereoRuntime:
             output_format=str(debug.get("runtime_output_format")),
             output_dtype=str(debug.get("runtime_output_dtype")),
             output_pack_backend=_optional_debug_str(debug.get("runtime_output_pack_backend")),
+            viewer_rgb=output_rgb if deferred_warp else None,
+            viewer_depth=viewer_depth,
+            viewer_frame_np=viewer_frame_np,
+            viewer_bgra=viewer_bgra,
+            depth_finite=bool(profile.finite_depth),
             active_settings_version=int(self.active_settings_version),
             hot_reload_class=self.last_settings_change_class,
             hot_reload_changed_fields=tuple(self.last_settings_changed_fields),
@@ -1399,6 +1864,17 @@ class StereoRuntime:
         self.load()
         self._reset_cuda_peak_if_needed()
         rgb_frame = _validate_runtime_rgb_frame(rgb_frame)
+        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+            import time as _time
+
+            if getattr(self, "_shape_diag_last", 0.0) == 0.0 or (
+                _time.monotonic() - getattr(self, "_shape_diag_last", 0.0)
+            ) > 2.0:
+                self._shape_diag_last = _time.monotonic()
+                print(
+                    "[FrameShape] rgb_frame=" + str(tuple(rgb_frame.shape)),
+                    flush=True,
+                )
 
         cuda_events: dict[str, Any] = {}
         _record_cuda_event(cuda_events, "start", rgb_frame)
@@ -1522,10 +1998,13 @@ class StereoRuntime:
                     _record_cuda_event(cuda_events, "openxr_render", rgb_frame)
                 elif _is_triton_stereo_compute_backend(self._resolve_stereo_compute_backend(output_rgb)):
                     render_start = time.perf_counter()
-                    if output_quality_requires_eye_images(
-                        openxr_stereo_config,
-                        int(output_rgb.shape[-1]),
-                        int(output_rgb.shape[-2]),
+                    if (
+                        not os.environ.get("D2S_OPENXR_NO_EYE_QUALITY")
+                        and output_quality_requires_eye_images(
+                            openxr_stereo_config,
+                            int(output_rgb.shape[-1]),
+                            int(output_rgb.shape[-2]),
+                        )
                     ):
                         no_fill_fused = None
                         no_fill_fused_reason = "common_output_quality_requires_eyes"
@@ -1540,6 +2019,8 @@ class StereoRuntime:
                         synthesis_left, synthesis_right, fused_debug = no_fill_fused
                         left_eye = synthesis_left
                         right_eye = synthesis_right
+                        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+                            print("[FrameShape] branch=no_fill_fused eye=" + str(tuple(left_eye.shape)), flush=True)
                         if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                             left_eye, right_eye = right_eye, left_eye
                         output_format = "openxr_eye_views"
@@ -1566,6 +2047,8 @@ class StereoRuntime:
 
                         left_eye = triton_stereo.left_eye
                         right_eye = triton_stereo.right_eye
+                        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+                            print("[FrameShape] branch=synthesize eye=" + str(tuple(left_eye.shape)), flush=True)
                         output_format = "openxr_eye_views"
                         render_backend = dict(triton_stereo.debug_info)
                         render_backend["sbs_backend"] = "openxr_triton_eyes_only"
@@ -1602,11 +2085,14 @@ class StereoRuntime:
                     right_eye = openxr.right_eye
                     if bool(getattr(openxr_stereo_config, "cross_eyed", False)):
                         left_eye, right_eye = right_eye, left_eye
-                    left_eye, right_eye, quality_debug = apply_output_quality(
-                        left_eye,
-                        right_eye,
-                        openxr_stereo_config,
-                    )
+                    if not os.environ.get("D2S_OPENXR_NO_EYE_QUALITY"):
+                        left_eye, right_eye, quality_debug = apply_output_quality(
+                            left_eye,
+                            right_eye,
+                            openxr_stereo_config,
+                        )
+                    else:
+                        quality_debug = {"output_quality_mode": "skipped_openxr_env"}
                     _record_cuda_event(cuda_events, "openxr_pack_start", left_eye)
                     if _openxr_runtime_output_uint8_enabled():
                         packed_left, left_pack_backend = _pack_openxr_eye_rgba_u8_with_backend(left_eye)
@@ -1713,6 +2199,19 @@ class StereoRuntime:
                 flush=True,
             )
 
+        if os.environ.get("D2S_FRAME_SHAPE_DIAG"):
+            import time as _time
+
+            if getattr(self, "_shape_diag_last_out", 0.0) == 0.0 or (
+                _time.monotonic() - getattr(self, "_shape_diag_last_out", 0.0)
+            ) > 2.0:
+                self._shape_diag_last_out = _time.monotonic()
+                print(
+                    "[FrameShape] eye_out=" + str(tuple(left_eye.shape))
+                    + " src=" + str(tuple(source_rgb.shape))
+                    + " ofmt=" + str(debug.get("runtime_output_format")),
+                    flush=True,
+                )
         return OpenXRRuntimeResult(
             depth=depth,
             left_eye=left_eye,
@@ -1880,7 +2379,35 @@ class StereoRuntime:
         self._openxr_depth_temporal = out.detach()
         return out
 
-    def _predict_depth_profile(self, rgb_frame: torch.Tensor) -> DepthProfileResult:
+    def _predict_depth_profile(
+        self,
+        rgb_frame: torch.Tensor,
+        *,
+        native_capture: Any | None = None,
+        capture_frame_id: int | None = None,
+    ) -> DepthProfileResult:
+        if native_capture is not None and capture_frame_id is not None:
+            native_predict = getattr(self.depth_provider, "predict_profile_native", None)
+            if callable(native_predict):
+                try:
+                    native_result = native_predict(
+                        rgb_frame, native_capture, int(capture_frame_id)
+                    )
+                    if isinstance(native_result, DepthProfileResult):
+                        return native_result
+                except Exception as exc:
+                    self._native_io_last_error = f"{type(exc).__name__}: {exc}"
+                    if type(exc).__name__ == "NativeCoreMLBusy":
+                        raise
+                    if not getattr(self, "_native_io_error_logged", False):
+                        self._native_io_error_logged = True
+                        print(
+                            f"[CoreMLNativeIO] prediction failed; using Python fallback: "
+                            f"{self._native_io_last_error}",
+                            flush=True,
+                        )
+                    if getattr(rgb_frame, "device", None) is not None and rgb_frame.device.type == "meta":
+                        raise
         predict_profile = getattr(self.depth_provider, "predict_profile", None)
         if callable(predict_profile):
             result = predict_profile(rgb_frame)
@@ -2306,6 +2833,90 @@ StereoLabDepthRuntime = DepthRuntime
 StereoLabDepthRuntimeResult = DepthRuntimeResult
 
 
+def _configure_native_coreml_warp(
+    native_depth: Any,
+    config: Any,
+    *,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    """Use the same layered-warp controls as the Vulkan CUDA/ROCm path."""
+    configure = getattr(native_depth, "configure_warp", None)
+    if not callable(configure):
+        return {"native_coreml_stereo_postprocess": "legacy_native_warp"}
+    try:
+        from .vulkan_stereo_pass import (
+            resolve_vulkan_hole_fill_mode,
+            resolve_vulkan_hole_fill_parameters,
+        )
+
+        budget = resolve_parallax_budget(
+            render_width=int(width),
+            render_height=int(height),
+            preset=getattr(config, "parallax_preset", "standard"),
+            convergence=float(getattr(config, "convergence", 0.0)),
+            max_disparity_px=getattr(config, "max_disparity_px", None),
+        )
+        hole_fill = str(getattr(config, "hole_fill", "edge_aware")).strip().lower()
+        hole_fill_mode = str(getattr(config, "hole_fill_mode", "balanced")).strip().lower()
+        vulkan_mode = resolve_vulkan_hole_fill_mode(hole_fill, hole_fill_mode)
+        fill_radius, fill_strength = resolve_vulkan_hole_fill_parameters(
+            vulkan_mode,
+            fill_radius=getattr(config, "hole_fill_radius", 3),
+            fill_strength=getattr(config, "hole_fill_strength", 1.0),
+        )
+        values = {
+            "depth_strength": max(0.0, float(getattr(config, "depth_strength", 1.0))),
+            "max_disparity_px": float(budget.max_disparity_px),
+            "convergence": float(getattr(config, "convergence", 0.0)),
+            "edge_threshold": float(getattr(config, "edge_threshold", 0.04)),
+            "fill_strength": float(fill_strength),
+            "fill_radius": int(fill_radius),
+            "mask_feather_radius": max(
+                0, min(3, int(getattr(config, "mask_feather_radius", 3)))
+            ),
+            "symmetric": int(bool(getattr(config, "symmetric", True))),
+            "layers": max(1, min(4, int(getattr(config, "layers", 2)))),
+            "softness": 0.08,
+            "foreground_scale": max(
+                0.0, float(getattr(config, "foreground_shift_scale", 1.0))
+            ),
+            "midground_scale": max(
+                0.0, float(getattr(config, "midground_shift_scale", 1.0))
+            ),
+            "background_scale": max(
+                0.0, float(getattr(config, "background_shift_scale", 1.0))
+            ),
+            "edge_dilation": max(0, min(3, int(getattr(config, "edge_dilation", 2)))),
+            "screen_edge_suppression": max(
+                0, int(getattr(config, "screen_edge_mask_suppression", 0))
+            ),
+            "hole_fill_mode": int(vulkan_mode),
+            "occlusion_enabled": int(bool(getattr(config, "occlusion", True))),
+            "depth_pop": float(getattr(config, "depth_pop", 0.0)),
+            "antialias_strength": float(
+                getattr(config, "depth_antialias_strength", 0.0)
+            ),
+            "anaglyph_method": str(
+                getattr(config, "anaglyph_method", "red_cyan")
+            ),
+        }
+        configure(**values)
+        return {
+            "native_coreml_stereo_postprocess": "vulkan_layered_equivalent",
+            "native_coreml_layers": values["layers"],
+            "native_coreml_occlusion_enabled": values["occlusion_enabled"],
+            "native_coreml_hole_fill_mode": values["hole_fill_mode"],
+            "native_coreml_max_disparity_px": values["max_disparity_px"],
+        }
+    except Exception as exc:
+        LOGGER.warning("Native CoreML stereo configuration failed: %s", exc)
+        return {
+            "native_coreml_stereo_postprocess": "legacy_native_warp",
+            "native_coreml_stereo_postprocess_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _provider_report(depth_provider: Any) -> dict[str, Any]:
     info = getattr(depth_provider, "info", None)
     if info is None:
@@ -2468,6 +3079,370 @@ def _runtime_eye_size(eye) -> str:
     return "unknown"
 def _runtime_output_uint8_enabled() -> bool:
     return _env_flag("D2S_RUNTIME_OUTPUT_UINT8", "0")
+
+
+def _macos_stream_native_io_enabled() -> bool:
+    return sys.platform == "darwin" and _env_flag(
+        "D2S_MAC_STREAM_NATIVE_IO", "0"
+    )
+
+
+def _native_output_size(width: int, height: int, output_format: str) -> tuple[int, int]:
+    output_format = str(output_format).strip().lower()
+    if output_format == "full_sbs":
+        return int(width) * 2, int(height)
+    if output_format == "full_tab":
+        return int(width), int(height) * 2
+    return int(width), int(height)
+
+
+def _half_res_synth_enabled() -> bool:
+    """Viewer fast path: warp at half eye resolution, upscale the SBS.
+
+    Default-on for the Darwin Local Viewer (runtime_entry setdefaults "1");
+    synthesis is the dominant stage and scales with pixel count.
+    """
+    return _env_flag("D2S_HALF_RES_SYNTH", "0")
+
+
+def _needs_half_res_downscale(output_rgb, *, skip_sbs_output: bool) -> bool:
+    """True when the runtime must shrink RGB before synthesis.
+
+    False when preprocess already delivered synth-scale frames
+    (D2S_PREPROCESS_AT_SYNTH_SCALE marks them _d2s_synth_scale).
+    """
+    return (
+        _half_res_synth_enabled()
+        and not skip_sbs_output
+        and output_rgb.ndim == 3
+        and not getattr(output_rgb, "_d2s_synth_scale", False)
+    )
+
+
+def _viewer_host_frame_enabled() -> bool:
+    """Ship a ready-to-upload HWC RGBA8 numpy frame beside the SBS tensor."""
+    return _env_flag("D2S_VIEWER_HOST_FRAME", "0")
+
+
+def _viewer_color_adjustments_neutral(config: Any) -> bool:
+    """True when no color adjustment would be skipped by sampling raw BGRA.
+
+    The zero-copy warp path samples the captured frame directly; any
+    non-neutral brightness/contrast/saturation/gamma/temperature/tint must
+    fall back to the preprocessed-tensor path.
+    """
+    if config is None:
+        return True
+    for attr in (
+        "color_brightness",
+        "color_contrast",
+        "color_saturation",
+        "color_gamma",
+    ):
+        try:
+            if abs(float(getattr(config, attr, 1.0)) - 1.0) > 1e-6:
+                return False
+        except (TypeError, ValueError):
+            continue
+    for attr in ("color_temperature", "color_tint"):
+        try:
+            if abs(float(getattr(config, attr, 0.0))) > 1e-6:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
+def _pack_sbs_host_frame(
+    sbs: torch.Tensor,
+    timings: dict[str, float] | None = None,
+    host_out=None,
+) -> Any | None:
+    """Pack an accelerator SBS tensor to HWC RGBA8 host memory.
+
+    One flat CHW pull from the device, then numpy HWC/alpha transform:
+    avoids a second device materialization (permute+alpha live on device)
+    whose lazy MPS completion lands as an extra full-queue stall.
+    """
+
+    def _mark(name: str, _t: list) -> None:
+        if timings is not None:
+            timings[name] = (time.perf_counter() - _t[0]) * 1000.0
+            _t[0] = time.perf_counter()
+
+    try:
+        import numpy as np
+
+        _t = [time.perf_counter()]
+        if not (hasattr(sbs, "device") and getattr(sbs.device, "type", "cpu") != "cpu"):
+            return None
+        image = sbs.detach()
+        if image.ndim == 4:
+            image = image[0]
+        elif image.ndim != 3:
+            return None
+        # Normalize to CHW (channels-first).
+        if image.shape[-1] in (1, 3, 4) and image.shape[0] > 8:
+            image = image.permute(2, 0, 1)  # HWC source -> CHW
+        channels = int(image.shape[0])
+        if channels not in (1, 3, 4):
+            return None
+        if image.is_floating_point():
+            # NaN/Inf must not reach the u8 host frame (silent 0 = black).
+            image = torch.nan_to_num(image, nan=1.0, posinf=1.0, neginf=0.0)
+            image = (image.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+        elif image.dtype != torch.uint8:
+            return None
+        height, width = int(image.shape[-2]), int(image.shape[-1])
+        if (
+            sys.platform == "darwin"
+            and os.environ.get("D2S_DEVICE_PACK", "1") in ("1", "true", "on")
+        ):
+            # Do CHW->HWC (+alpha) on the GPU: the .cpu() pull then lands as
+            # final HWC RGBA8, removing the second full-frame host copy
+            # (moveaxis+ascontiguousarray). Safe since this runs in the
+            # packer thread where the MPS-stream wait is already paid.
+            import torch as _torch
+
+            chw = image
+            if channels == 1:
+                chw = chw.expand(3, -1, -1)
+            if channels in (1, 3):
+                alpha = _torch.empty(
+                    (1, height, width), dtype=_torch.uint8, device=chw.device
+                ).fill_(255)
+                chw = _torch.cat((chw, alpha), dim=0)
+            dev_out = chw.permute(1, 2, 0).contiguous()
+            if host_out is None:
+                # Prefer the IOSurface stage ring when enabled: the DMA
+                # lands directly in shared surface memory.
+                try:
+                    from utils.iosurface_stage import acquire_stage
+
+                    got = acquire_stage(width, height)
+                    if got is not None:
+                        host_out = got[1].writable_view()
+                except Exception:
+                    host_out = None
+            if host_out is not None:
+                # Direct D2H into caller-provided memory (IOSurface stage):
+                # no intermediate CPU tensor allocation at all.
+                try:
+                    import torch as _t2
+
+                    dst = _t2.frombuffer(host_out, dtype=_torch.uint8)
+                    dst.copy_(dev_out.reshape(-1))
+                    _mark("copy", _t)
+                    return (
+                        np.frombuffer(host_out, dtype=np.uint8).reshape(
+                            height, width, 4
+                        ),
+                        int(width),
+                        int(height),
+                    )
+                except Exception:
+                    pass  # fall through to legacy .cpu() path
+            host = dev_out.cpu().numpy()
+            _mark("copy", _t)
+            return host, int(width), int(height)
+        if not image.is_contiguous():
+            image = image.contiguous()
+        host = image.cpu().numpy()  # CHW uint8, single device pull
+        _mark("copy", _t)
+        if channels == 1:
+            out = np.empty((height, width, 4), dtype=np.uint8)
+            out[..., :3] = host[0][..., None]
+            out[..., 3] = 255
+        elif channels == 3:
+            out = np.empty((height, width, 4), dtype=np.uint8)
+            out[..., :3] = np.moveaxis(host, 0, -1)
+            out[..., 3] = 255
+        else:
+            out = np.ascontiguousarray(np.moveaxis(host, 0, -1))
+        _mark("numpy", _t)
+        return out, int(width), int(height)
+    except Exception:
+        return None
+
+
+def _rz_ship(t, raw=None):
+    try:
+        from utils.residency import mark as _rz_mark
+
+        if raw is not None:
+            _rz_mark("depth_out", raw)
+        _rz_mark("warp_depth_ship", t)
+    except Exception:
+        pass
+    return t
+
+
+def fused_warp_active() -> bool:
+    """Fused Metal warp-pack for the Vulkan viewer path (darwin only)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        from stereo_runtime._fused_warp_mps import fused_enabled
+
+        return fused_enabled()
+    except Exception:
+        return False
+
+
+def _quantize_depth_for_warp(depth: torch.Tensor) -> torch.Tensor:
+    """u8 depth for the Metal warp viewer: 4x smaller host pull.
+
+    Stays the DEFAULT transport (round-18 A/B: 37.5 -> 43.1 fps on the
+    Metal leg); "0"/"false"/"off" ships the original fp32 tensor instead.
+    Depth-edge flicker is addressed upstream by the v2.5-parity antialias
+    pass (`_warp_depth_postprocess`), not by dropping u8. R8Unorm sampling
+    reproduces the same [0,1] values.
+    """
+    if sys.platform != "darwin" or os.environ.get(
+        "D2S_WARP_DEPTH_U8", "1"
+    ) in {"0", "false", "off"}:
+        return depth
+    try:
+        # Clone: detach() shares storage and in-place ops would corrupt
+        # the caller's depth tensor.
+        q = depth.detach().clone()
+        if q.is_floating_point():
+            # NaN/Inf (fp16 dither) must not survive the u8 transport:
+            # torch casts NaN to 0 silently, punching a near-plane hole.
+            q = torch.nan_to_num(q, nan=1.0, posinf=1.0, neginf=0.0)
+            q = q.clamp_(0.0, 1.0).mul_(255.0).round_()
+        return q.to(torch.uint8)
+    except Exception:
+        return depth
+
+
+def _needs_depth_postprocess(stereo_config: Any) -> bool:
+    """True only when Depth Pop or Anti-aliasing is actually enabled.
+
+    Mode-isolation guard: cinema/game/image presets run with both knobs at
+    their preset values, and every non-warp consumer must stay on the
+    exact pre-existing code path (zero extra passes) unless the user
+    explicitly raised a knob.
+    """
+    pop = float(getattr(stereo_config, "depth_pop", 0.0) or 0.0)
+    aa = float(getattr(stereo_config, "depth_antialias_strength", 0.0) or 0.0)
+    return abs(pop) >= 1e-6 or aa > 0.0
+
+
+def _warp_depth_postprocess(
+    depth: torch.Tensor,
+    stereo_config: Any,
+    guide_rgb: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """v2.5-parity depth prep for the deferred warp (traditional) leg.
+
+    The torch and Vulkan synthesis paths run `postprocess_depth` (Depth
+    Pop + Anti-aliasing) before warping; the deferred Metal-shader-warp
+    path -- the v2.5 traditional method -- shipped the raw model output
+    and skipped both, so depth edges kept their per-frame aliasing and
+    flicker. Apply the same pass here. Zero extra passes when both knobs
+    are off (the common realtime default).
+
+    With a guide frame, the antialiasing becomes RGB-guided edge-aware
+    smoothing (arXiv 1911.07036 "3D Photography" stage 1): depth averages
+    only across color-similar neighbors, denoising flat regions WITHOUT
+    widening object-edge transition bands. D2S_GUIDED_DEPTH_SMOOTH=0
+    restores the plain gaussian.
+    """
+    pop = float(getattr(stereo_config, "depth_pop", 0.0) or 0.0)
+    aa = float(getattr(stereo_config, "depth_antialias_strength", 0.0) or 0.0)
+    if not _needs_depth_postprocess(stereo_config):
+        return depth
+    guide = None
+    if aa > 0.0 and guide_rgb is not None and os.environ.get(
+        "D2S_GUIDED_DEPTH_SMOOTH", "1"
+    ) not in {"0", "false", "off"}:
+        guide = _match_guide_to_depth(guide_rgb, depth)
+    return _postprocess_depth_fast(depth, pop, aa, guide)
+
+
+def _postprocess_depth_fast(
+    depth: torch.Tensor,
+    depth_pop: float,
+    antialias_strength: float,
+    guide: torch.Tensor | None,
+):
+    """Realtime form of ``postprocess_depth`` for native-res frames.
+
+    The guided AA is dispatch-cheap at synth-scale but measurably heavy at
+    1080p+ (rt_loop 20ms -> ~60ms measured). Compute the gaussian + guided
+    blend at half resolution and bilinear back up: ~4x cheaper, visually
+    near-identical (the edge map is low-frequency). Small planes keep the
+    exact full-res math. Kill switch: D2S_GUIDED_AA_HALFRES=0.
+    """
+    if guide is None:
+        return postprocess_depth(
+            depth, depth_pop=depth_pop, antialias_strength=antialias_strength
+        )
+    if os.environ.get("D2S_GUIDED_AA_HALFRES", "1") in {"0", "false", "off"}:
+        return postprocess_depth(
+            depth, depth_pop=depth_pop, antialias_strength=antialias_strength
+        )
+    h, w = int(depth.shape[-2]), int(depth.shape[-1])
+    if min(h, w) < 256 or antialias_strength <= 0.0:
+        return postprocess_depth(
+            depth,
+            depth_pop=depth_pop,
+            antialias_strength=antialias_strength,
+            guide=guide,
+        )
+    out = depth.clamp(0.0, 1.0)
+    if abs(float(depth_pop)) >= 1e-6:
+        out = apply_depth_pop(out, depth_pop)
+    half = torch.nn.functional.interpolate(
+        out, scale_factor=0.5, mode="bilinear", align_corners=False
+    ).clamp(0.0, 1.0)
+    g_lo = torch.nn.functional.interpolate(
+        guide, size=half.shape[-2:], mode="bilinear", align_corners=False
+    )
+    lo = anti_alias_depth_guided(half, g_lo, antialias_strength)
+    return torch.nn.functional.interpolate(
+        lo, size=(h, w), mode="bilinear", align_corners=False
+    )
+
+
+def _match_guide_to_depth(guide_rgb: torch.Tensor, depth: torch.Tensor) -> torch.Tensor:
+    """Downscale the render-res RGB guide to the depth plane resolution."""
+    g = ensure_bchw(guide_rgb, name="guide_rgb").float()
+    th, tw = int(depth.shape[-2]), int(depth.shape[-1])
+    if int(g.shape[-2]) == th and int(g.shape[-1]) == tw:
+        return g
+    return torch.nn.functional.interpolate(
+        g, size=(th, tw), mode="bilinear", align_corners=False
+    )
+
+
+def _upscale_sbs_to_output(sbs: torch.Tensor, output_rgb: torch.Tensor) -> torch.Tensor:
+    """Bilinear-upscale a half-res SBS back to the display frame size."""
+    target_h, target_w = int(output_rgb.shape[-2]), int(output_rgb.shape[-1])
+    if tuple(sbs.shape[-2:]) == (target_h, target_w):
+        return sbs
+    x = sbs
+    squeezed = None
+    if x.ndim == 3:  # CHW
+        squeezed = 0
+        x = x.unsqueeze(0)
+    if x.ndim != 4:
+        return sbs
+    upscaled = torch.nn.functional.interpolate(
+        x,
+        size=(target_h, target_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    if squeezed is not None:
+        upscaled = upscaled.squeeze(squeezed)
+    if isinstance(upscaled, torch.Tensor) and upscaled.is_contiguous():
+        return upscaled
+    return upscaled.contiguous()
+
+
+
 
 
 def _openxr_runtime_output_uint8_enabled() -> bool:

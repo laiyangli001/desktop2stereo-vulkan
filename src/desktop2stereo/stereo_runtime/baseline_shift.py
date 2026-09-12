@@ -134,7 +134,13 @@ def shift_debug_info(depth: torch.Tensor, width: int, params: ShiftParams) -> di
     return debug
 
 
-def warp_horizontal(rgb: torch.Tensor, shift_px: torch.Tensor, eye_sign: float) -> torch.Tensor:
+def warp_horizontal(
+    rgb: torch.Tensor,
+    shift_px: torch.Tensor,
+    eye_sign: float,
+    *,
+    padding_mode: str = "border",
+) -> torch.Tensor:
     rgb = ensure_bchw(rgb, name="rgb").float()
     b, _, h, w = rgb.shape
     shift_px = match_depth(shift_px, h, w)
@@ -143,7 +149,16 @@ def warp_horizontal(rgb: torch.Tensor, shift_px: torch.Tensor, eye_sign: float) 
     grid_x = xx.unsqueeze(0) + shift_norm
     grid_y = yy.expand(b, h, w)
     grid = torch.stack((grid_x, grid_y), dim=-1)
-    return F.grid_sample(rgb, grid, mode="bilinear", padding_mode="reflection", align_corners=True)
+    if padding_mode not in {"zeros", "border", "reflection"}:
+        raise ValueError(f"unsupported stereo warp padding mode: {padding_mode!r}")
+    if rgb.device.type == "mps" and padding_mode == "border":
+        # MPS does not implement grid_sample's border mode. Clamping the
+        # normalized coordinates first is equivalent to border sampling and
+        # lets the operation use MPS's supported zeros mode. Other devices
+        # retain the native path and its original padding semantics.
+        grid = grid.clamp(-1.0, 1.0)
+        padding_mode = "zeros"
+    return F.grid_sample(rgb, grid, mode="bilinear", padding_mode=padding_mode, align_corners=True)
 
 
 def synthesize_baseline(rgb: torch.Tensor, depth: torch.Tensor, params: ShiftParams) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -14,6 +14,7 @@ from capture import capture_frame_to_rgb, prepare_rgb_for_stereo_runtime
 from capture.adaptive_rate import AdaptiveCaptureRate, adaptive_capture_enabled_for_mode
 from capture.session import CaptureSessionLoop
 from stereo_runtime.pipeline import RuntimePipelineLoop
+from stereo_runtime.render_size import RenderSizePolicy
 from utils import (
     CAPTURE_MODE,
     CAPTURE_TOOL,
@@ -25,8 +26,6 @@ from utils import (
     FPS,
     LOCAL_VSYNC,
     MONITOR_INDEX,
-    OPENXR_SCREEN_DISTANCE,
-    OPENXR_SCREEN_WIDTH,
     OS_NAME,
     OUTPUT_RESOLUTION,
     RENDER_SIZE_CONFIG,
@@ -40,7 +39,11 @@ from utils import (
 )
 from utils.display_info import resolve_windows_fullscreen_policy
 from utils.run_mode import normalize_run_mode, target_fps_for_run_mode
-from utils.xr_headset_presets import DEFAULT_XR_HEADSET_MODEL
+from utils.xr_headset_presets import (
+    DEFAULT_XR_HEADSET_MODEL,
+    resolve_xr_headset_preset,
+)
+from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 from streaming.stream_session import (
     CALIBRATABLE_STREAM_MODES,
     NetworkStreamSessionConfig,
@@ -157,22 +160,60 @@ def _resolve_openxr_render_scale(
     ``processing_size`` remains accepted for compatibility with callers and
     tests, but is intentionally not used for projection sizing.
     """
-    env_value = os.environ.get("D2S_OPENXR_RENDER_SCALE")
+    # This is the OpenXR projection resolution multiplier, expressed as a
+    # percentage in the GUI.  Keep the old name as a compatibility alias for
+    # existing settings files and launch scripts.
+    env_value = os.environ.get("D2S_OPENXR_RENDER_RESOLUTION")
+    if not env_value:
+        env_value = os.environ.get("D2S_OPENXR_RENDER_SCALE")
     if env_value:
         try:
-            return max(0.5, min(2.0, float(env_value)))
+            text = str(env_value).strip()
+            value = float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+            return max(OPENXR_RENDER_SCALE_MIN, min(OPENXR_RENDER_SCALE_MAX, value))
         except ValueError:
             pass
-    try:
-        return max(0.5, min(2.0, float(settings.get("OpenXR Render Scale", 1.0))))
-    except (TypeError, ValueError):
-        return 1.0
+    if _openxr_render_scale_is_auto(settings):
+        return max(
+            OPENXR_RENDER_SCALE_MIN,
+            min(
+                OPENXR_RENDER_SCALE_MAX,
+                float(resolve_xr_headset_preset(settings.get("XR Headset Model")).recommended_render_scale),
+            ),
+        )
+    for key in ("XR Render", "OpenXR Render Resolution", "OpenXR Render Scale"):
+        if key not in settings:
+            continue
+        try:
+            raw = settings[key]
+            text = str(raw).strip()
+            value = float(text[:-1]) / 100.0 if text.endswith("%") else float(raw)
+            return max(OPENXR_RENDER_SCALE_MIN, min(OPENXR_RENDER_SCALE_MAX, value))
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def _openxr_render_scale_is_auto(settings: dict) -> bool:
+    mode = str(settings.get("XR Render Mode", "")).strip().lower()
+    if mode in {"auto", "headset", "headset optimized", "headset optimized mode"}:
+        return True
+    for key in ("XR Render", "OpenXR Render Resolution", "OpenXR Render Scale"):
+        value = settings.get(key)
+        if isinstance(value, str) and value.strip().lower() in {
+            "auto",
+            "auto (headset)",
+            "headset optimized",
+        }:
+            return True
+    return False
 
 
 def _openxr_projection_config(settings: dict) -> dict[str, object]:
     """Resolve OpenXR presentation settings independently of Filament."""
     return {
         "render_scale": _resolve_openxr_render_scale(settings),
+        "render_scale_auto": _openxr_render_scale_is_auto(settings),
         "swapchain_color_mode": str(
             settings.get("OpenXR Color Mode", "sRGB")
         ).strip().lower(),
@@ -181,6 +222,17 @@ def _openxr_projection_config(settings: dict) -> dict[str, object]:
             settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
         ),
         "monitor_index": max(1, int(settings.get("Monitor Index", 1) or 1)),
+    }
+
+
+def _openxr_glow_modes(settings: dict) -> dict[str, object]:
+    """Load glow modes while handling YAML 1.1's ``off`` boolean alias."""
+    modes = settings.get("OpenXR Glow Modes", {})
+    if not isinstance(modes, dict):
+        return {}
+    return {
+        str(environment): ("off" if value is False else value)
+        for environment, value in modes.items()
     }
 
 
@@ -204,12 +256,31 @@ def _openxr_filament_config(
     common_filament = _load_common_filament_defaults(src_root)
     environment_name = str(settings.get("Environment Model", "Default")).strip()
     default_environment = not environment_name or environment_name.lower() in {"default", "none"}
+    headset_preset = resolve_xr_headset_preset(
+        settings.get("XR Headset Model", DEFAULT_XR_HEADSET_MODEL)
+    )
 
     bridge_path = os.environ.get("D2S_FILAMENT_BRIDGE") or (
         str(platform_bridge) if platform_bridge and platform_bridge.is_file() else None
     )
     configured_glb = os.environ.get("D2S_FILAMENT_GLB")
     configured_profile = os.environ.get("D2S_FILAMENT_PROFILE")
+    saved_transparency = settings.get("OpenXR Glow Transparency")
+    if not isinstance(saved_transparency, dict):
+        # Migrate the previous opacity-oriented setting without changing its
+        # visual result: transparency is the inverse of opacity.
+        saved_opacity = settings.get("OpenXR Glow Opacity")
+        if isinstance(saved_opacity, dict):
+            saved_transparency = {}
+            for environment, opacity in saved_opacity.items():
+                try:
+                    saved_transparency[str(environment)] = 1.0 - min(
+                        1.0, max(0.0, float(opacity))
+                    )
+                except (TypeError, ValueError):
+                    continue
+        else:
+            saved_transparency = {}
     return {
         "filament_bridge_path": bridge_path,
         "filament_glb_path": configured_glb or (
@@ -332,10 +403,18 @@ def _openxr_filament_config(
         "filament_glow_smoothing_seconds": float(
             common_filament.get("glow_smoothing_seconds", 0.10)
         ),
-        # These values are resolved by the legacy viewer-settings path and
-        # exported through utils; keep the Vulkan entrypoint as a consumer.
-        "filament_screen_width": float(OPENXR_SCREEN_WIDTH),
-        "filament_screen_distance": float(OPENXR_SCREEN_DISTANCE),
+        # Resolve geometry from this invocation's selected headset instead of
+        # the process-global settings snapshot. This keeps GUI hot selection
+        # and focused configuration tests aligned with the active preset.
+        "filament_screen_width": float(headset_preset.width_m),
+        "filament_screen_distance": float(headset_preset.distance_m),
+        "filament_screen_states": (
+            dict(settings.get("OpenXR Screen States", {}))
+            if isinstance(settings.get("OpenXR Screen States", {}), dict)
+            else {}
+        ),
+        "filament_glow_modes": _openxr_glow_modes(settings),
+        "filament_glow_transparencies": dict(saved_transparency),
     }
 
 
@@ -418,8 +497,65 @@ def _wait_for_runtime_ready(
     return False
 
 
-def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: threading.Event | None = None) -> int:
+def _resolve_local_viewer_render_size_config(settings, run_mode, device):
+    """Use the v2.5 local-viewer source size while keeping 4K I/O.
+
+    The old local path captured the 4K monitor and presented to the 4K
+    display, but ran the Half-SBS warp at one eye (1920x1080) and upscaled
+    that packed result in the display shader.  The current scaled/native path
+    accidentally moved depth and warp to 3840x2160.  Restore that contract
+    only for the non-Darwin GPU local viewer; the Vulkan swapchain and capture
+    target remain native 4K.  D2S_LOCAL_VIEWER_NATIVE_4K=1 is an explicit
+    escape hatch for full-resolution processing.
+    """
+    if platform.system() == "Darwin" or run_mode not in {"Local Viewer", "Viewer"}:
+        return RENDER_SIZE_CONFIG
+    if str(getattr(device, "type", device)).strip().lower() != "cuda":
+        return RENDER_SIZE_CONFIG
+    if os.environ.get("D2S_LOCAL_VIEWER_NATIVE_4K", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        return RENDER_SIZE_CONFIG
+    if str(settings.get("Processing Resolution", "Auto")).strip().lower() != "auto":
+        return RENDER_SIZE_CONFIG
+    if str(settings.get("Display Mode", "")).strip().lower().replace("_", "-") != "half-sbs":
+        return RENDER_SIZE_CONFIG
+    if RENDER_SIZE_CONFIG.policy is not RenderSizePolicy.SCALED:
+        return RENDER_SIZE_CONFIG
+    if RENDER_SIZE_CONFIG.scale_factor != "4K / 100%":
+        return RENDER_SIZE_CONFIG
+    if not isinstance(OUTPUT_RESOLUTION, (tuple, list)) or len(OUTPUT_RESOLUTION) != 2:
+        return RENDER_SIZE_CONFIG
+    output_width, output_height = (int(OUTPUT_RESOLUTION[0]), int(OUTPUT_RESOLUTION[1]))
+    if output_width < 2 or output_height < 2:
+        return RENDER_SIZE_CONFIG
+    return replace(
+        RENDER_SIZE_CONFIG,
+        policy=RenderSizePolicy.FIXED,
+        fixed_width=output_width // 2,
+        fixed_height=output_height // 2,
+    )
+
+
+def run_processing_runtime(
+    *,
+    max_seconds: float | None = None,
+    lease_lost: threading.Event | None = None,
+) -> int:
     """Run capture, inference, and pipeline threads until shutdown is requested."""
+
+    if platform.system() == "Windows":
+        # DPI awareness is first-wins per process: later calls silently
+        # return E_ACCESSDENIED, so the window can be created unaware while
+        # whatever raced ahead is already set. An unaware/system-aware
+        # process on a scaled (e.g. 150%) monitor gets a DWM-virtualized
+        # framebuffer (1920x1200 -> 1280x800), putting the fullscreen SBS
+        # image in the monitor's top-left instead of covering it. main.py
+        # already requests per-monitor v2 before any import; keep the
+        # first-wins-safe guard here for direct/non-main callers.
+        from windows_dpi import set_per_monitor_dpi_v2
+
+        set_per_monitor_dpi_v2()
 
     shutdown_event.clear()
     stop_request_thread = None
@@ -440,9 +576,80 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
     configured_run_mode = normalize_run_mode(
         settings.get("Run Mode", "Local Viewer")
     )
+    if configured_run_mode in {"Local Viewer", "Viewer"} and platform.system() == "Darwin":
+        # Local Viewer presents to a physical display; skip the headset-tier
+        # upscale chain (see output_sampling_plan_for_config).
+        os.environ.setdefault("D2S_CAP_OUTPUT_UPSCALE", "1")
+        # Ship packed uint8 SBS so the viewer skips float32 transport
+        # and re-quantization (pack once in the runtime, upload once in the
+        # viewer). setdefault keeps an explicit user override authoritative.
+        os.environ.setdefault("D2S_RUNTIME_OUTPUT_UINT8", "1")
+        # Deferred Metal shader warp is armed for the Metal viewer (the
+        # macOS default) and dropped if it falls back; see the Darwin viewer
+        # selection below.
+        # Vulkan fused warp-pack ships INPUT-RESOLUTION SBS (NVIDIA-path
+        # contract: 1080p in -> half_sbs 1920x1080). Quarter-res synth-scale
+        # preprocess would read as blur once packed at input res, so the
+        # fused path runs the pipeline at full render size. Explicit user
+        # overrides of either env stay authoritative.
+        _mac_viewer = os.environ.get("D2S_MAC_VIEWER") or "vulkan"
+        _vk_fused_on = os.environ.get("D2S_VK_FUSED_WARP", "1") not in {
+            "0", "false", "off",
+        }
+        if _mac_viewer == "vulkan" and _vk_fused_on:
+            os.environ.setdefault("D2S_HALF_RES_SYNTH", "0")
+            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "0")
+        else:
+            # Halve synthesis resolution and upscale: warp cost scales with
+            # pixel count, so this cuts the dominant stage ~4x for the Metal
+            # viewer (its warp path skips synthesis; sampling upscales).
+            os.environ.setdefault("D2S_HALF_RES_SYNTH", "1")
+            # Preprocess directly at synthesis scale: skips a display-size
+            # upscale plus redundant downscale per frame.
+            os.environ.setdefault("D2S_PREPROCESS_AT_SYNTH_SCALE", "1")
+        # Depth input scale is OPT-IN (e.g. D2S_DEPTH_INPUT_SCALE=0.75 buys
+        # ~2x faster M1 MPS depth at corr 0.95); no default anymore. The
+        # softened 0.75x depth made object-edge parallax flicker vs v2.5.0,
+        # so the Local Viewer runs full export resolution unless this is
+        # explicitly set. "0"/"false"/"off" disable it explicitly as well.
+        # Default macOS viewer is now Vulkan (fused Metal warp-pack
+        # kernel beat the CAMetalLayer path in round-24 A/Bs:
+        # 46.7 vs 45.5-45.9 fps). D2S_MAC_VIEWER=metal restores it.
+        os.environ.setdefault("D2S_MAC_VIEWER", "vulkan")
+        # Pack the presentation frame on the runtime thread (queue drained)
+        # so viewers memcpy instead of syncing MPS mid-present.
+        os.environ.setdefault("D2S_VIEWER_HOST_FRAME", "1")
+        # Wrap every SCK frame as an owned CVPixelBuffer+CVMetalTexture so
+        # the warp viewer can sample the capture directly (zero-copy).
+        os.environ.setdefault("D2S_SCK_ZEROCOPY_TEX", "1")
+        # Native Core ML consumes the IOSurface directly. The capture callback
+        # therefore skips its CPU base-address read; it re-materializes only
+        # if the bridge capability preflight fails.
+        if bool(settings.get("CoreML", False)):
+            os.environ.setdefault("D2S_SCK_NATIVE_ONLY", "1")
+    elif configured_run_mode in {"Local Viewer", "Viewer"}:
+        # The Vulkan local viewer consumes GPU RGBA8 directly.  Pack on the
+        # producer GPU so the external buffer transfers 1 byte/channel rather
+        # than a float32 frame.  Keep the Darwin branch above unchanged: its
+        # viewer has platform-specific output handling and owns this setting.
+        os.environ.setdefault("D2S_RUNTIME_OUTPUT_UINT8", "1")
     direct_stream_mode = is_network_stream_mode(configured_run_mode) or configured_run_mode == "MJPEG Streamer"
     if direct_stream_mode:
         os.environ["D2S_RUNTIME_OUTPUT_UINT8"] = "1"
+        if platform.system() == "Darwin":
+            # The macOS network sink currently consumes host RGB frames. Keep
+            # stereo generation on the canonical path so its geometry and
+            # postprocessing match CUDA/ROCm instead of paying the Vulkan
+            # layered pass's host readback and using different edge rules.
+            os.environ.setdefault("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "1")
+            # Prefer the existing IOSurface -> CoreML -> Metal pack bridge for
+            # network streams. It is attempted only after native capability
+            # preflight; the pipeline retains the Python CoreML fallback.
+            os.environ.setdefault("D2S_MAC_STREAM_NATIVE_IO", "1")
+            # Replace MPS grid_sample's two full-frame synchronization points
+            # with the canonical two-layer Metal kernel for the eligible
+            # realtime profile. Unsupported profiles still use torch.
+            os.environ.setdefault("D2S_MAC_STREAM_MPS_FUSED", "1")
     configured_target_fps = target_fps_for_run_mode(settings)
     nvfruc_requested = bool(
         settings.get(
@@ -468,6 +675,21 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
             configured_run_mode, configured_target_fps
         ),
     )
+    effective_render_size_config = _resolve_local_viewer_render_size_config(
+        settings,
+        configured_run_mode,
+        DEVICE,
+    )
+    if effective_render_size_config is not RENDER_SIZE_CONFIG:
+        print(
+            "[Main] Local Viewer v2.5 source path: "
+            f"capture={OUTPUT_RESOLUTION[0]}x{OUTPUT_RESOLUTION[1]} "
+            f"processing={effective_render_size_config.fixed_width}x"
+            f"{effective_render_size_config.fixed_height} "
+            "presentation=native-4K; set D2S_LOCAL_VIEWER_NATIVE_4K=1 "
+            "to force native processing",
+            flush=True,
+        )
     if is_network_stream_mode(configured_run_mode):
         probe_capture_fps = adaptive_capture_rate.begin_stream_probe(int(base_runtime_fps))
         print(
@@ -482,7 +704,7 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
         device=DEVICE,
         device_info=DEVICE_INFO,
         output_resolution=OUTPUT_RESOLUTION,
-        render_size_config=RENDER_SIZE_CONFIG,
+        render_size_config=effective_render_size_config,
         fps=base_runtime_fps,
         window_title=WINDOW_TITLE,
         capture_mode=CAPTURE_MODE,
@@ -500,47 +722,56 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
         if not nvfruc_probe.available:
             print(
                 "[NvFRUC] Frame generation requested but unavailable: "
-                f"{nvfruc_probe.reason}",
+                f"{nvfruc_probe.reason}. Continuing without NvFRUC.",
                 flush=True,
             )
-            shutdown_event.set()
-            close_runtime = getattr(context.stereo_runtime, "close", None)
-            if callable(close_runtime):
-                close_runtime()
-            if stop_request_thread is not None:
-                stop_request_thread.join(timeout=0.2)
-            return 1
-
-        calibration_values = {
-            "device": str(DEVICE_INFO),
-            "depth_model": str(settings.get("Depth Model", "")),
-            "inference_backend": str(settings.get("Inference Backend", "")),
-            "precision": str(settings.get("Precision", "")),
-            "input_resolution": str(OUTPUT_RESOLUTION),
-            "run_mode": configured_run_mode,
-            "output_format": str(settings.get("Output Format", "")),
-            "encoder": str(settings.get("Video Encoder Backend", "auto")),
-        }
-        calibration_fingerprint_value = calibration_fingerprint(calibration_values)
-        calibration_cache = NvFrucCalibrationCache(
-            Path(context.base_dir) / "models" / "nvfruc"
-        )
-
-        def apply_nvfruc_limit(output_limit: int) -> None:
-            base_limit = output_base_fps(output_limit, enabled=True)
-            adaptive_capture_rate.set_calibration_limit(base_limit)
-            print(
-                "[NvFRUC] calibrated output limit: "
-                f"output={int(output_limit)} base_runtime={int(base_limit)}",
-                flush=True,
+            # Disable NvFRUC for this session and continue
+            context.nvfruc_frame_generation = False
+            base_runtime_fps = output_base_fps(FPS, enabled=False)
+            adaptive_capture_rate = AdaptiveCaptureRate(
+                base_runtime_fps,
+                enabled=adaptive_capture_enabled_for_mode(
+                    configured_run_mode, configured_target_fps
+                ),
+            )
+            if is_network_stream_mode(configured_run_mode):
+                probe_capture_fps = adaptive_capture_rate.begin_stream_probe(int(base_runtime_fps))
+                print(
+                    "[DirectSbsStream] Stream-rate probe capture headroom: "
+                    f"requested={int(base_runtime_fps)} capture={probe_capture_fps} FPS",
+                    flush=True,
+                )
+        else:
+            calibration_values = {
+                "device": str(DEVICE_INFO),
+                "depth_model": str(settings.get("Depth Model", "")),
+                "inference_backend": str(settings.get("Inference Backend", "")),
+                "precision": str(settings.get("Precision", "")),
+                "input_resolution": str(OUTPUT_RESOLUTION),
+                "run_mode": configured_run_mode,
+                "output_format": str(settings.get("Output Format", "")),
+                "encoder": str(settings.get("Video Encoder Backend", "auto")),
+            }
+            calibration_fingerprint_value = calibration_fingerprint(calibration_values)
+            calibration_cache = NvFrucCalibrationCache(
+                Path(context.base_dir) / "models" / "nvfruc"
             )
 
-        nvfruc_calibration = NvFrucCalibrationController(
-            output_target_fps=int(nvfruc_output_fps),
-            fingerprint=calibration_fingerprint_value,
-            cache=calibration_cache,
-            on_limit=apply_nvfruc_limit,
-        )
+            def apply_nvfruc_limit(output_limit: int) -> None:
+                base_limit = output_base_fps(output_limit, enabled=True)
+                adaptive_capture_rate.set_calibration_limit(base_limit)
+                print(
+                    "[NvFRUC] calibrated output limit: "
+                    f"output={int(output_limit)} base_runtime={int(base_limit)}",
+                    flush=True,
+                )
+
+            nvfruc_calibration = NvFrucCalibrationController(
+                output_target_fps=int(nvfruc_output_fps),
+                fingerprint=calibration_fingerprint_value,
+                cache=calibration_cache,
+                on_limit=apply_nvfruc_limit,
+            )
 
     callbacks = RuntimeCallbacks(
         context,
@@ -710,8 +941,10 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
     output_thread = None
     local_viewer_thread = None
     network_output = None
+    main_thread_job = None
     nvfruc_stage = None
     nvfruc_thread = None
+    fatal_openxr_device_loss = False
     presentation_q = context.runtime_q
     if context.nvfruc_frame_generation:
         nvfruc_stage = NvFrucStage(
@@ -790,12 +1023,39 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
             )
             from streaming.stream_calibration import build_calibration_fingerprint
 
+            # Stream aspect: follow local viewer's keep-ratio logic to avoid distortion when not 16:9
+            stream_fit_mode = str(settings.get("Stream Display Fit Mode", settings.get("Display Fit Mode", "contain"))).strip()
+            # Shared input_size (tex_w,tex_h) for dynamic eye ratio like VulkanLocalViewer
+            cap_mode_stream = str(settings.get("Capture Mode", "")).strip()
+            stream_input_size: tuple[int, int] | None = None
+            try:
+                if cap_mode_stream.casefold() == "window":
+                    title_stream = str(settings.get("Window Title", "")).strip()
+                    if title_stream and OS_NAME == "Windows":
+                        try:
+                            import win32gui
+                            hwnd_stream = win32gui.FindWindow(None, title_stream)
+                            if hwnd_stream:
+                                _, _, w_stream, h_stream = win32gui.GetClientRect(hwnd_stream)
+                                if w_stream > 0 and h_stream > 0:
+                                    stream_input_size = (int(w_stream), int(h_stream))
+                        except Exception:
+                            pass
+                    if stream_input_size is None:
+                        from utils.display import get_monitor_size
+                        stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+                else:
+                    from utils.display import get_monitor_size
+                    stream_input_size = get_monitor_size(int(MONITOR_INDEX))
+            except Exception:
+                stream_input_size = None
+
             if configured_run_mode in CALIBRATABLE_STREAM_MODES:
                 audio_backend = str(
                     settings.get("Audio Capture Backend", "auto") or "auto"
                 ).strip().casefold()
                 selected_audio = str(settings.get("Stereo Mix", "") or "").strip()
-                if audio_backend in {"auto", "soundcard"} and not selected_audio.casefold().startswith(
+                if selected_audio and audio_backend in {"auto", "soundcard"} and not selected_audio.casefold().startswith(
                     ("soundcard:", "wasapi:")
                 ):
                     selected_audio = f"soundcard:{selected_audio}"
@@ -820,6 +1080,8 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
                         and "NVIDIA" in str(DEVICE_INFO).upper()
                     ),
                     display_mode=stream_config.display_mode,
+                    fit_mode=stream_fit_mode,
+                    input_size=stream_input_size,
                     target_bitrate_mbps=(
                         stream_config.target_bitrate_mbps
                         if bool(settings.get("Use Stream Calibration", True))
@@ -943,6 +1205,10 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
                     port=int(settings.get("Streamer Port", 1122)),
                     fps=int(FPS),
                     quality=int(settings.get("Stream Quality", 90)),
+                    display_mode=str(settings.get("Display Mode", "Half-SBS")),
+                    fit_mode=stream_fit_mode,
+                    input_size=stream_input_size,
+                    on_stream_fps_selected=adaptive_capture_rate.finish_stream_probe,
                 )
             callbacks.set_stream_output(network_output)
             network_output.start()
@@ -1013,19 +1279,107 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
                     f"source={target_source} mode={fullscreen_policy}",
                     flush=True,
                 )
+            exclude_from_capture = _exclude_local_output_from_capture(
+                settings,
+                os_name=OS_NAME,
+            )
+            # Enable cursor passthrough when the SBS fullscreen window covers
+            # the same display that is being captured. This applies to
+            # 3D Monitor single-display (no second output) and to Window capture
+            # when the selected window lives on the chosen stereo-output
+            # monitor. The window is made click-through (WS_EX_TRANSPARENT /
+            # GLFW_MOUSE_PASSTHROUGH) so the system cursor stays visible over
+            # the stereo image and input reaches the underlying desktop.
+            cursor_passthrough = False
+            capture_mode = str(settings.get("Capture Mode", "")).strip()
+            if exclude_from_capture:
+                try:
+                    no_second_output = not bool(STEREO_DISPLAY_SELECTION) or int(
+                        STEREO_DISPLAY_INDEX
+                    ) == int(MONITOR_INDEX)
+                    if no_second_output:
+                        cursor_passthrough = True
+                    else:
+                        try:
+                            import mss
+
+                            with mss.mss() as sct:
+                                if len(sct.monitors) - 1 <= 1:
+                                    cursor_passthrough = True
+                        except Exception:
+                            pass
+                except Exception:
+                    cursor_passthrough = True
+            # Window capture on the same monitor as the stereo output also
+            # needs passthrough even when a second display exists (Local Viewer
+            # or 3 to 2 case). The monitor index for Window mode is the window's
+            # display (via get_monitor_index_for_point), so equality means the
+            # window and the SBS output share one screen.
+            if not cursor_passthrough and capture_mode.casefold() == "window":
+                try:
+                    if bool(STEREO_DISPLAY_SELECTION) and int(
+                        STEREO_DISPLAY_INDEX
+                    ) == int(MONITOR_INDEX):
+                        cursor_passthrough = True
+                except Exception:
+                    pass
+            if cursor_passthrough:
+                reason = (
+                    "single-display 3D Monitor mode"
+                    if exclude_from_capture
+                    else "window capture on stereo-output display"
+                )
+                print(
+                    f"[VulkanLocalViewer] Cursor passthrough enabled for {reason}",
+                    flush=True,
+                )
+            # tex_w,tex_h in legacy viewer: original capture size before packing,
+            # used so eye ratio stays dynamic with input (W/2 for HalfSBS etc.).
+            input_size: tuple[int, int] | None = None
+            try:
+                cap_mode = str(settings.get("Capture Mode", "")).strip()
+                if cap_mode.casefold() == "window":
+                    title = str(settings.get("Window Title", "")).strip()
+                    if title and OS_NAME == "Windows":
+                        try:
+                            import win32gui
+
+                            hwnd = win32gui.FindWindow(None, title)
+                            if hwnd:
+                                _, _, w, h = win32gui.GetClientRect(hwnd)
+                                if w > 0 and h > 0:
+                                    input_size = (int(w), int(h))
+                        except Exception:
+                            pass
+                    if input_size is None:
+                        from utils.display import get_monitor_size
+
+                        input_size = get_monitor_size(int(MONITOR_INDEX))
+                else:
+                    from utils.display import get_monitor_size
+
+                    input_size = get_monitor_size(int(MONITOR_INDEX))
+            except Exception:
+                input_size = None
             local_viewer_config = VulkanLocalViewerConfig(
                 title=f"{WINDOW_TITLE or 'Desktop2Stereo'} Vulkan Viewer",
                 monitor_index=max(0, selected_monitor),
-                fullscreen=bool(STEREO_DISPLAY_SELECTION),
+                fullscreen=bool(STEREO_DISPLAY_SELECTION) or bool(cursor_passthrough),
                 capture_compatible_fullscreen=(
                     fullscreen_policy == "capture_compatible"
                 ),
                 window_preview=bool(settings.get("Window Preview", False)),
                 preview_monitor_index=max(0, int(MONITOR_INDEX)),
-                exclude_from_capture=_exclude_local_output_from_capture(
-                    settings,
-                    os_name=OS_NAME,
+                exclude_from_capture=exclude_from_capture,
+                show_taskbar_button=(
+                    OS_NAME == "Windows"
+                    and configured_run_mode in {"Local Viewer", "3D Monitor"}
+                    and bool(settings.get("LSFG Support", False))
                 ),
+                cursor_passthrough=cursor_passthrough,
+                input_size=input_size,
+                capture_mode=str(settings.get("Capture Mode", "Monitor")),
+                window_title=str(settings.get("Window Title", "") or "") if str(settings.get("Capture Mode", "")).casefold() == "window" else None,
                 vsync=bool(LOCAL_VSYNC),
                 show_fps=bool(SHOW_FPS),
                 show_fps_provider=callbacks.show_fps,
@@ -1038,17 +1392,100 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
                 on_breakdown_inc=callbacks.breakdown_inc,
                 on_breakdown_add_time=callbacks.breakdown_add_time,
             )
-            local_viewer_thread = threading.Thread(
-                target=run_vulkan_local_viewer,
-                kwargs={
-                    "runtime_q": presentation_q,
-                    "shutdown_event": shutdown_event,
-                    "config": local_viewer_config,
-                },
-                name="VulkanLocalViewer",
-                daemon=True,
-            )
-            local_viewer_thread.start()
+            local_viewer_kwargs = {
+                "runtime_q": presentation_q,
+                "shutdown_event": shutdown_event,
+                "config": local_viewer_config,
+            }
+
+            def _packer_on_stat(name: str, value: float) -> None:
+                # Durations aggregate as times; counters as increments.
+                if name == "packer_ms":
+                    # add_time appends _ms; store as packer_ms directly.
+                    callbacks.breakdown_add_time("packer", value / 1000.0)
+                elif name == "fused_pack_ms":
+                    callbacks.breakdown_add_time("rt_fused_pack", value / 1000.0)
+                else:
+                    callbacks.breakdown_inc(name, int(value))
+
+            if OS_NAME == "Darwin":
+                from viewer.host_frame_packer import (
+                    maybe_install_local_viewer_packer,
+                )
+
+                _maybe_install_local_viewer_packer = (
+                    maybe_install_local_viewer_packer
+                )
+            else:
+                def _maybe_install_local_viewer_packer(**_kw):
+                    return False
+            if _maybe_install_local_viewer_packer(
+                pipeline_q=presentation_q,
+                local_viewer_kwargs=local_viewer_kwargs,
+                on_stat=_packer_on_stat,
+                os_name=OS_NAME,
+            ):
+                # Pipeline still writes to presentation_q untouched; the
+                # viewer consumes from the packer's output instead.
+                pass
+            if OS_NAME == "Darwin":
+                # macOS GLFW/NSApp requires every windowing call on the
+                # process main thread (glfw.init deadlocks off it). The idle
+                # wait loop below is parked on a helper thread instead and the
+                # viewer owns the main thread.
+                #
+                # Default viewer on macOS is Vulkan since round 24 (fused
+                # Metal warp-pack kernel via torch.mps.compile_shader beats
+                # the CAMetalLayer path). D2S_MAC_VIEWER=metal selects the
+                # full CAMetalLayer deferred-warp path; on its failure this
+                # still falls back to run_vulkan_local_viewer, which chains
+                # Vulkan -> Metal stub -> OpenGL.
+                use_metal_viewer = (
+                    os.environ.get("D2S_MAC_VIEWER", "vulkan").strip().lower()
+                    == "metal"
+                )
+
+                def _run_viewer_on_main_thread():
+                    try:
+                        if use_metal_viewer:
+                            try:
+                                os.environ.setdefault("D2S_METAL_SHADER_WARP", "1")
+                                from viewer.macos_metal_viewer import (
+                                    run_metal_local_viewer,
+                                )
+
+                                run_metal_local_viewer(**local_viewer_kwargs)
+                                return
+                            except Exception as exc:
+                                # Fallback viewers consume synthesized SBS;
+                                # drop the deferred-warp flag so the runtime
+                                # stops shipping raw rgb+depth.
+                                os.environ.pop("D2S_METAL_SHADER_WARP", None)
+                                print(
+                                    f"[MetalLocalViewer] Metal viewer failed "
+                                    f"({type(exc).__name__}: {exc}); falling "
+                                    "back to Vulkan",
+                                    flush=True,
+                                )
+                        else:
+                            # Primary/fallback Vulkan path: the fused
+                            # warp-pack needs the runtime to ship raw
+                            # rgb+depth tensors instead of synthesized SBS.
+                            os.environ.setdefault("D2S_METAL_SHADER_WARP", "1")
+                        # Vulkan first; internally falls back Metal -> OpenGL.
+                        run_vulkan_local_viewer(**local_viewer_kwargs)
+                    finally:
+                        shutdown_event.set()
+
+                main_thread_job = _run_viewer_on_main_thread
+            else:
+                local_viewer_thread = threading.Thread(
+                    target=run_vulkan_local_viewer,
+                    kwargs=local_viewer_kwargs,
+                    name="VulkanLocalViewer",
+                    daemon=True,
+                )
+                local_viewer_thread.start()
         print(
             f"Desktop2Stereo Vulkan runtime started: mode={RUN_MODE} device={DEVICE_INFO}",
             flush=True,
@@ -1058,14 +1495,30 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
             if max_seconds is None
             else time.monotonic() + max(0.0, max_seconds)
         )
-        while not shutdown_event.is_set():
-            if lease_lost is not None and lease_lost.is_set():
-                print("[AUTH] Online authorization lease expired; stopping runtime.", flush=True)
-                shutdown_event.set()
-                break
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            time.sleep(0.05)
+        def _wait_until_shutdown():
+            while not shutdown_event.is_set():
+                if lease_lost is not None and lease_lost.is_set():
+                    print(
+                        "[AUTH] Online authorization lease expired; stopping runtime.",
+                        flush=True,
+                    )
+                    shutdown_event.set()
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    # Also unblock a viewer that owns the main thread.
+                    shutdown_event.set()
+                    break
+                time.sleep(0.05)
+
+        if main_thread_job is not None:
+            threading.Thread(
+                target=_wait_until_shutdown,
+                name="RuntimeWait",
+                daemon=True,
+            ).start()
+            main_thread_job()
+        else:
+            _wait_until_shutdown()
     except KeyboardInterrupt:
         pass
     finally:
@@ -1089,11 +1542,18 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
             if callable(close_output_consumer):
                 close_output_consumer()
         if network_output is not None:
-            network_output.close()
+            try:
+                network_output.close()
+            except Exception:
+                pass
         if presenter_thread is not None:
             # run_until owns Filament/Vulkan teardown on the Presenter thread.
             # Do not let the main thread race that teardown after a timeout.
             presenter_thread.join()
+        fatal_openxr_device_loss = bool(
+            presenter is not None
+            and getattr(presenter, "fatal_device_loss", False)
+        )
         if local_viewer_thread is not None:
             local_viewer_thread.join(timeout=2.0)
         if presenter is not None:
@@ -1101,4 +1561,6 @@ def run_processing_runtime(*, max_seconds: float | None = None, lease_lost: thre
         close = getattr(context.stereo_runtime, "close", None)
         if callable(close):
             close()
-    return 0
+    # rc=77 is handled by the GUI with a bounded fresh-process relaunch.  A
+    # dead Vulkan device cannot be repaired by in-process OpenXR reconnects.
+    return 77 if fatal_openxr_device_loss else 0

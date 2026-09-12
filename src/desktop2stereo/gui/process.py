@@ -16,7 +16,13 @@ import traceback
 import flet as ft
 from utils import OS_NAME, DEFAULT_PORT, shutdown_event, read_yaml
 from . import devices as devices_module
-from .config import DEFAULTS, DEFAULT_MODEL_LIST, default_base_depth_model, save_yaml
+from .config import (
+    DEFAULTS,
+    DEFAULT_MODEL_LIST,
+    default_base_depth_model,
+    default_coreml_enabled,
+    save_yaml,
+)
 from .paths import (
     BASE_DIR,
     DIAG_LOG,
@@ -79,6 +85,8 @@ _PROGRESS_PREFIX = "[D2S_PROGRESS] "
 _STATUS_PREFIX = "[D2S_STATUS] "
 _BACKEND_STATUS_PREFIX = "[D2S_BACKEND_STATUS] "
 _DISPLAY_REFRESH_WARNING_PREFIX = "[D2S_DISPLAY_REFRESH_WARNING] "
+_TCL_SHUTDOWN_NOISE_MARKER = "tcl_asyncdelete: async handler deleted by the wrong thread"
+_TCL_SHUTDOWN_STACK_RE = re.compile(r"^0x[0-9a-f]+(?:,|\s)", re.IGNORECASE)
 _ASYNCIO_SHUTDOWN_UNRAISABLE_MODULES = (
     "asyncio.base_subprocess",
     "asyncio.proactor_events",
@@ -95,6 +103,21 @@ _file_log_handler = None
 logger = logging.getLogger(__name__)
 status_logger = logging.getLogger("status")
 child_logger = logging.getLogger("child")
+
+
+def _save_run_completion_flags(settings_path: str) -> tuple[bool, str]:
+    """Clear one-shot compile flags without clobbering child-runtime changes."""
+    settings = read_yaml(settings_path) or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    for key in (
+        "Recompile TensorRT",
+        "Recompile MIGraphX",
+        "Recompile CoreML",
+        "Recompile OpenVINO",
+    ):
+        settings[key] = False
+    return save_yaml(settings_path, settings)
 
 
 class FirewallProbeError(RuntimeError):
@@ -506,11 +529,27 @@ class GUIProcessMixin:
         control = getattr(self, "backend_status_text", None)
         if control is None or not isinstance(payload, dict):
             return
+        # Store payload for language switch refresh
+        self._backend_status_payload = payload
+        self._refresh_backend_status_display()
+
+    def _refresh_backend_status_display(self):
+        """Refresh the backend status display with current locale."""
+        control = getattr(self, "backend_status_text", None)
+        payload = getattr(self, "_backend_status_payload", None)
+        if control is None:
+            return
+        # Show placeholder when no payload is available (before runtime starts)
+        if payload is None:
+            control.value = ""
+            self._safe_update(control)
+            return
+        t = UI_MESSAGES.get(getattr(self, "locale", "EN"), UI_MESSAGES["EN"])
         depth = payload.get("depth_backend") or "unknown"
         stereo = payload.get("stereo_backend") or "unknown"
-        fallback = "是" if payload.get("fallback") else "否"
-        gpu_to_cpu = "是" if payload.get("gpu_to_cpu") else "否"
-        zero_copy = "是" if payload.get("zero_copy") else "否"
+        fallback = t.get("Status Yes", "Yes") if payload.get("fallback") else t.get("Status No", "No")
+        gpu_to_cpu = t.get("Status Yes", "Yes") if payload.get("gpu_to_cpu") else t.get("Status No", "No")
+        zero_copy = t.get("Status Yes", "Yes") if payload.get("zero_copy") else t.get("Status No", "No")
         copies = payload.get("gpu_copy_count", 0)
         resource_kind = payload.get("resource_kind") or "unknown"
         resource_format = payload.get("resource_format") or "unknown"
@@ -519,15 +558,25 @@ class GUIProcessMixin:
         reason_text = "; ".join(str(item) for item in reasons if item)
         if len(reason_text) > 220:
             reason_text = reason_text[:217] + "..."
+        # Get localized labels
+        lbl_depth = t.get("Status Depth", "Depth")
+        lbl_stereo = t.get("Status Stereo", "Stereo")
+        lbl_fallback = t.get("Status Fallback", "Fallback")
+        lbl_gpu_to_cpu = t.get("Status CPU Readback", "CPU readback")
+        lbl_copies = t.get("Status GPU Copies", "GPU copies")
+        lbl_zero_copy = t.get("Status Zero Readback", "Zero readback")
+        lbl_resource = t.get("Status Resource", "Resource")
+        lbl_directml = t.get("Status DirectML", "DirectML")
+        lbl_reason = t.get("Status Reason", "Reason")
         text = (
-            f"深度={depth} | 合成={stereo} | 回退={fallback} | "
-            f"CPU回读={gpu_to_cpu} | GPU复制={copies} | 零回读={zero_copy} | "
-            f"资源={resource_kind}/{resource_format}"
+            f"{lbl_depth}={depth} | {lbl_stereo}={stereo} | {lbl_fallback}={fallback} | "
+            f"{lbl_gpu_to_cpu}={gpu_to_cpu} | {lbl_copies}={copies} | {lbl_zero_copy}={zero_copy} | "
+            f"{lbl_resource}={resource_kind}/{resource_format}"
         )
         if directml_mode:
-            text += f" | DirectML资源={directml_mode}"
+            text += f" | {lbl_directml}={directml_mode}"
         if reason_text:
-            text += f" | 原因={reason_text}"
+            text += f" | {lbl_reason}={reason_text}"
         control.value = text
         control.visible = True
         bar = getattr(self, "_backend_status_bar", None)
@@ -903,7 +952,7 @@ class GUIProcessMixin:
         if not supports_network_calibration(self.run_mode_key, self.stream_proto_dd.value):
             self.set_status(UI_MESSAGES[self.locale].get(
                 "calibration_requires_advanced",
-                "Automatic calibration requires Advanced Network Streaming with WebRTC.",
+                "Automatic calibration requires Advanced Streaming with WebRTC.",
             ))
             return
         if int(self.stream_port_tf.value or DEFAULT_PORT) >= 65535:
@@ -1269,9 +1318,15 @@ class GUIProcessMixin:
             getattr(self, "_missing_stereo_output_identity", False)
             or not self.stereo_monitor_dd.value
         ):
-            return False, UI_MESSAGES[self.locale][
-                "Selected stereo output display is unavailable"
-            ]
+            # 3D Monitor with a single display has no second output monitor;
+            # cursor passthrough keeps the system cursor visible over the
+            # fullscreen SBS window covering the captured display.
+            if self.run_mode_key == "3D Monitor" and self._get_monitor_count() <= 1:
+                pass
+            else:
+                return False, UI_MESSAGES[self.locale][
+                    "Selected stereo output display is unavailable"
+                ]
         try:
             port_val = int(self.stream_port_tf.value) if self.stream_port_tf.value else DEFAULT_PORT
             if not (1 <= port_val <= 65535):
@@ -1334,6 +1389,8 @@ class GUIProcessMixin:
         self._cancel_starting = False
         self._esc_stopped = False
         self._stopping = False
+        # A manual Start resets the OpenXR fatal auto-relaunch budget.
+        self._auto_relaunch_count = 0
         # Re-attach the file handler (append mode) for this run's log output;
         # it was released after the previous run so the file stayed free.
         _setup_file_log_handler()
@@ -1389,6 +1446,10 @@ class GUIProcessMixin:
             child_env = os.environ.copy()
             child_env["DESKTOP2STEREO_LOCALE"] = self.locale
             child_env["PYTHONIOENCODING"] = "utf-8"
+            if OS_NAME == "Darwin":
+                from utils.vulkan_env import apply_macos_vulkan_env
+
+                apply_macos_vulkan_env(child_env)
             child_env["D2S_STOP_REQUEST_FILE"] = STOP_REQUEST_FILE
             calibration_requested = self._calibration_run_requested
             self._calibration_run_requested = False
@@ -1425,11 +1486,7 @@ class GUIProcessMixin:
                 if self.process and self.process.returncode is not None:
                     self._diag(f"process exited during wait, code={self.process.returncode}")
                     break
-            self._config["Recompile TensorRT"] = False
-            self._config["Recompile MIGraphX"] = False
-            self._config["Recompile CoreML"] = False
-            self._config["Recompile OpenVINO"] = False
-            save_yaml(os.path.join(BASE_DIR, "settings.yaml"), self._config)
+            _save_run_completion_flags(os.path.join(BASE_DIR, "settings.yaml"))
         except Exception as e:
             self._diag(f"_countdown_and_run failed:\n{traceback.format_exc()}", error=True)
             if self._calibration_active:
@@ -1472,6 +1529,18 @@ class GUIProcessMixin:
         text = str(line or "").strip()
         if not text:
             return
+        # Tk can emit this native panic while the runtime is exiting if a
+        # background Tk thread is being finalized at the same time.  It is
+        # not an application failure, and the stack is not useful in the GUI
+        # log.  Keep the filter stateful so the complete native stack is
+        # hidden, without suppressing unrelated child errors.
+        if _TCL_SHUTDOWN_NOISE_MARKER in text.casefold():
+            self._tcl_shutdown_noise_active = True
+            return
+        if getattr(self, "_tcl_shutdown_noise_active", False):
+            if text.startswith("Exception Code:") or _TCL_SHUTDOWN_STACK_RE.match(text):
+                return
+            self._tcl_shutdown_noise_active = False
         if _VULKAN_DESCRIPTOR_DETAIL_RE.match(text):
             if not getattr(self, "_vulkan_descriptor_summary_logged", False):
                 self._vulkan_descriptor_summary_logged = True
@@ -1560,13 +1629,52 @@ class GUIProcessMixin:
                     self._restore_precalibration_target()
                     self._close_stream_calibration_dialog()
             code = proc.returncode if proc else None
-            if code and code != 0:
+            if code == 77:
+                # Terminal OpenXR failure (device loss / exhausted reconnects):
+                # VDXR cannot re-create an instance in-process, so relaunch the
+                # runtime in a fresh process (bounded to avoid a crash loop).
+                relaunches = int(getattr(self, "_auto_relaunch_count", 0))
+                if relaunches < 2:
+                    self._auto_relaunch_count = relaunches + 1
+                    self._diag(
+                        "child exited rc=77 (OpenXR fatal); auto-relaunching "
+                        f"runtime ({self._auto_relaunch_count}/2)",
+                        error=True,
+                    )
+                    _set_console_quick_edit(True)
+                    self._set_running_ui(True)
+                    self.set_status(
+                        UI_MESSAGES[self.locale].get(
+                            "Auto Restart",
+                            "OpenXR failure - restarting runtime...",
+                        ),
+                        key="Running",
+                    )
+                    asyncio.create_task(self._countdown_and_run(2.0))
+                    self._diag("auto-relaunch scheduled")
+                else:
+                    self._diag(
+                        "child exited rc=77 twice; auto-relaunch budget "
+                        "exhausted - manual restart required",
+                        error=True,
+                    )
+                    self.set_status(
+                        UI_MESSAGES[self.locale].get(
+                            "Auto Restart Failed",
+                            "OpenXR failure repeated - press Start to retry",
+                        )
+                    )
+                    _set_console_quick_edit(True)
+                    self._set_running_ui(False)
+            elif code and code != 0:
                 self._diag(f"child exited rc={code}; see {LOG_FILE} for details", error=True)
                 self.set_status(UI_MESSAGES[self.locale]["exited_with_code"].format(code))
+                _set_console_quick_edit(True)
+                self._set_running_ui(False)
             else:
                 self.set_status(UI_MESSAGES[self.locale]["Stopped"], key="Stopped")
-            _set_console_quick_edit(True)
-            self._set_running_ui(False)
+                _set_console_quick_edit(True)
+                self._set_running_ui(False)
             self._diag("monitor_task done, status updated")
 
     # ── stop ──
@@ -1733,6 +1841,21 @@ class GUIProcessMixin:
                                 os.makedirs(LOG_DIR, exist_ok=True)
                                 with open(STOP_REQUEST_FILE, "w", encoding="utf-8") as f:
                                     f.write(str(saved_pid))
+                            elif OS_NAME == "Darwin":
+                                import signal
+                                os.makedirs(LOG_DIR, exist_ok=True)
+                                with open(STOP_REQUEST_FILE, "w", encoding="utf-8") as f:
+                                    f.write(str(saved_pid))
+                                # Signal only the runtime process, NOT its
+                                # whole group: MediaMTX and FFmpeg run in the
+                                # child's process group, so killpg(SIGINT)
+                                # shuts the RTSP server down first and the
+                                # FFmpeg publisher dies with "Broken pipe" /
+                                # "End of file" errors. The runtime handles
+                                # SIGINT itself and stops FFmpeg before
+                                # MediaMTX during teardown. Windows/Linux
+                                # keep their existing stop behavior.
+                                os.kill(saved_pid, signal.SIGINT)
                             else:
                                 import signal
                                 os.killpg(os.getpgid(saved_pid), signal.SIGINT)
@@ -1837,7 +1960,8 @@ class GUIProcessMixin:
 
     async def _resize_window_after_log_visibility_change(self):
         await asyncio.sleep(0)
-        self._fit_window_to_content(update=True, resize_window=True)
+        # Resize width only, keep height stable
+        self._fit_window_to_content(update=True, resize_window=True, resize_height=False)
         await asyncio.sleep(0.5)
         self.page.window.max_width = None
         try:
@@ -2166,6 +2290,10 @@ class GUIProcessMixin:
             except ImportError:
                 if OS_NAME == "Windows":
                     subprocess.run("clip", input=text, text=True, shell=True)
+                elif OS_NAME == "Darwin":
+                    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+                else:
+                    raise RuntimeError("pyperclip is required to copy the log")
             self.set_status(UI_MESSAGES[self.locale].get("Bug report copied to clipboard!", "Bug report copied to clipboard!"))
         except Exception as exc:
             logger.exception("Failed to build bug report")
@@ -2202,9 +2330,10 @@ class GUIProcessMixin:
             if "Distill-Any-Depth-Base" in DEFAULT_MODEL_LIST
             else default_base_depth_model()
         )
+        dynamic_defaults["CoreML"] = default_coreml_enabled(OS_NAME)
         # Reset uses the Cinema preset with hole filling disabled.
         dynamic_defaults["Hole Fill Mode"] = "none"
-        dynamic_defaults["Run Mode"] = "Local Viewer"
+        dynamic_defaults["Run Mode"] = getattr(self, "run_mode_key", "Local Viewer")
         dynamic_defaults["XR Preview Window"] = False
         if is_nvidia_cuda:
             dynamic_defaults["torch.compile"] = True
@@ -2257,29 +2386,101 @@ class GUIProcessMixin:
 
     VK_ESC = 0x1B
 
+    def _run_active(self) -> bool:
+        return bool(getattr(self, "_starting", False)) or (
+            getattr(self, "process", None) is not None
+            and getattr(self.process, "returncode", None) is None
+        )
+
     async def _esc_poll_task(self):
-        if OS_NAME != "Windows":
+        if OS_NAME == "Windows":
+            user32 = ctypes.windll.user32
+            try:
+                while not self._closed:
+                    await asyncio.sleep(0.2)
+                    if self._closed:
+                        break
+                    if user32.GetAsyncKeyState(self.VK_ESC) & 0x8000:
+                        if self._esc_down is None:
+                            self._esc_down = time.time()
+                        elif not self._esc_stopped and (time.time() - self._esc_down >= 3.0):
+                            self._esc_stopped = True
+                            self._esc_down = None
+                            self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
+                            asyncio.ensure_future(self._async_stop())
+                    else:
+                        if self._esc_down is not None:
+                            self._esc_down = None
+                            self._esc_stopped = False
+            except asyncio.CancelledError:
+                pass
             return
-        user32 = ctypes.windll.user32
+        # macOS/Linux: Flet's page.on_keyboard_event needs page focus and is
+        # unreliable there, so monitor the ESC key globally with pynput (the
+        # same "works regardless of window focus" behavior as GetAsyncKeyState
+        # on Windows). Requires Accessibility permission on macOS; when pynput
+        # is unavailable the Flet _on_key path remains as a fallback.
+        try:
+            from pynput import keyboard as _pynput_keyboard
+        except Exception:
+            return
+        state = {"down": False, "down_at": None}
+
+        def on_press(key):
+            if key == _pynput_keyboard.Key.esc:
+                state["down"] = True
+                if state["down_at"] is None:
+                    state["down_at"] = time.time()
+
+        def on_release(key):
+            if key == _pynput_keyboard.Key.esc:
+                state["down"] = False
+                state["down_at"] = None
+
+        listener = _pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+        try:
+            listener.start()
+        except Exception:
+            return  # e.g. no Accessibility permission; Flet _on_key fallback
+        if OS_NAME == "Darwin":
+            try:
+                from ApplicationServices import AXIsProcessTrusted
+
+                if not AXIsProcessTrusted():
+                    print(
+                        "[GUI] macOS Accessibility permission is not granted: "
+                        "hold-ESC-to-stop listens only while this window is "
+                        "focused. Grant Accessibility to the app in System "
+                        "Settings > Privacy & Security so ESC works globally.",
+                        flush=True,
+                    )
+            except Exception:
+                pass
         try:
             while not self._closed:
                 await asyncio.sleep(0.2)
-                if self._closed:
-                    break
-                if user32.GetAsyncKeyState(self.VK_ESC) & 0x8000:
-                    if self._esc_down is None:
-                        self._esc_down = time.time()
-                    elif not self._esc_stopped and (time.time() - self._esc_down >= 3.0):
-                        self._esc_stopped = True
-                        self._esc_down = None
-                        self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
-                        asyncio.ensure_future(self._async_stop())
-                else:
+                if not state["down"]:
                     if self._esc_down is not None:
                         self._esc_down = None
                         self._esc_stopped = False
+                    continue
+                if not self._run_active():
+                    continue
+                if state["down_at"] is None:
+                    continue
+                if not self._esc_stopped and (time.time() - state["down_at"] >= 3.0):
+                    self._esc_stopped = True
+                    state["down"] = False
+                    state["down_at"] = None
+                    self.set_status(UI_MESSAGES[self.locale]["esc_stop"])
+                    asyncio.ensure_future(self._async_stop())
         except asyncio.CancelledError:
             pass
+        finally:
+            try:
+                listener.stop()
+            except Exception:
+                pass
 
     def _on_key(self, e: ft.KeyboardEvent):
         if e.key != "Esc" or self._esc_stopped or OS_NAME == "Windows":

@@ -171,7 +171,8 @@
       "stage": "fragment",
       "entry": "main",
       "descriptor_bindings": [
-        {"set": 0, "binding": 0, "kind": "combined_image_sampler", "access": "read_only", "format": null}
+        {"set": 0, "binding": 0, "kind": "combined_image_sampler", "access": "read_only", "format": null},
+        {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null}
       ],
       "push_constants_size": 128,
       "precision": "fp32"

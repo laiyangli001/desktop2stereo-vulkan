@@ -9,6 +9,7 @@ __pycache__/
 .venv/
 venv/
 python3/
+python3_cuda/
 build/
 dist/
 *.egg-info/
@@ -22,6 +23,10 @@ src/desktop2stereo/logs/
 src/desktop2stereo/gui/flet_clients/
 src/desktop2stereo/gui/flet_packages/*.partial
 src/desktop2stereo/streaming/rtmp/ffmpeg/
+# Runtime-extracted darwin MediaMTX binary + generated macOS config (derived
+# from mediamtx.yml at startup by _darwin_safe_mediamtx_config).
+src/desktop2stereo/streaming/rtmp/mediamtx/mediamtx
+src/desktop2stereo/streaming/rtmp/mediamtx.macos.yml
 src/env_install/python3.installing/
 native/filament/sdk/
 native/filament/build/
@@ -33,3 +38,6 @@ native/nvfruc_bridge/Optical_Flow_SDK_*.zip
 .tools/
 artifacts/
 AGENTS.md
+.tmp
+.serena
+.DS_Store

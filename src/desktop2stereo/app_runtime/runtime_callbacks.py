@@ -6,6 +6,7 @@ import os
 import time
 
 from utils.queue_utils import clear_nonblocking, drain_latest, put_latest
+from xr_viewer.settings_menu import OPENXR_RENDER_SCALE_MAX, OPENXR_RENDER_SCALE_MIN
 
 
 class RuntimeCallbacks:
@@ -30,6 +31,7 @@ class RuntimeCallbacks:
         self._show_fps = bool(show_fps)
         self._display_fit_mode = str(display_fit_mode or "contain")
         self.stream_output = None
+        self._screen_state_save_error_logged = False
 
     def set_stream_output(self, output) -> None:
         self.stream_output = output
@@ -183,12 +185,19 @@ class RuntimeCallbacks:
                 return False
         if action == "persist_openxr_render_scale":
             try:
-                numeric = max(0.5, min(2.0, float(values.get("value", 1.0))))
+                numeric = max(
+                    OPENXR_RENDER_SCALE_MIN,
+                    min(OPENXR_RENDER_SCALE_MAX, float(values.get("value", 1.0))),
+                )
                 from gui.config import save_yaml
                 from stereo_runtime.hot_reload import read_yaml
 
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
                 settings = read_yaml(settings_path)
+                # Canonical name is percentage-oriented and is also read by
+                # the main Flet GUI. Keep the legacy key synchronized.
+                settings["XR Render"] = numeric
+                settings["XR Render Mode"] = "manual"
                 settings["OpenXR Render Scale"] = numeric
                 ok, error = save_yaml(settings_path, settings)
                 if not ok:
@@ -196,6 +205,125 @@ class RuntimeCallbacks:
                 return True
             except Exception as exc:
                 print(f"[OpenXRViewer] render scale save failed: {exc}", flush=True)
+                return False
+        if action == "persist_openxr_render_auto":
+            try:
+                from gui.config import save_yaml
+                from stereo_runtime.hot_reload import read_yaml
+                from utils.xr_headset_presets import resolve_xr_headset_preset
+
+                settings_path = os.path.join(self.context.base_dir, "settings.yaml")
+                settings = read_yaml(settings_path)
+                numeric = max(
+                    OPENXR_RENDER_SCALE_MIN,
+                    min(
+                        OPENXR_RENDER_SCALE_MAX,
+                        resolve_xr_headset_preset(
+                            settings.get("XR Headset Model")
+                        ).recommended_render_scale,
+                    ),
+                )
+                settings["XR Render Mode"] = "auto"
+                settings["XR Render"] = numeric
+                settings["OpenXR Render Scale"] = numeric
+                ok, error = save_yaml(settings_path, settings)
+                if not ok:
+                    raise OSError(error)
+                return True
+            except Exception as exc:
+                print(f"[OpenXRViewer] auto render scale save failed: {exc}", flush=True)
+                return False
+        if action in {"persist_openxr_screen_state", "reset_openxr_screen_state"}:
+            try:
+                environment = str(values.get("environment", "Default") or "Default").strip()
+                if not environment:
+                    environment = "Default"
+                from gui.config import save_yaml
+                from stereo_runtime.hot_reload import read_yaml
+
+                settings_path = os.path.join(self.context.base_dir, "settings.yaml")
+                settings = read_yaml(settings_path)
+                states = settings.get("OpenXR Screen States", {})
+                states = dict(states) if isinstance(states, dict) else {}
+                if action == "reset_openxr_screen_state":
+                    states.pop(environment, None)
+                else:
+                    state = values.get("state")
+                    if not isinstance(state, dict):
+                        return False
+                    states[environment] = dict(state)
+                settings["OpenXR Screen States"] = states
+                ok, error = save_yaml(settings_path, settings)
+                if not ok:
+                    raise OSError(error)
+                self._screen_state_save_error_logged = False
+                return True
+            except Exception as exc:
+                if not self._screen_state_save_error_logged:
+                    self._screen_state_save_error_logged = True
+                    print(
+                        "[OpenXRViewer] screen state save unavailable; "
+                        f"keeping the change for this session: {exc}",
+                        flush=True,
+                    )
+                return False
+        if action == "persist_openxr_glow_mode":
+            try:
+                environment = str(
+                    values.get("environment", "Default") or "Default"
+                ).strip() or "Default"
+                mode = str(values.get("mode", "off") or "off").strip().lower()
+                mode = {
+                    "none": "off",
+                    "false": "off",
+                    "0": "off",
+                    "screen": "glow",
+                }.get(mode, mode)
+                if mode not in {"off", "surround", "glow", "veil"}:
+                    return False
+                from gui.config import save_yaml
+                from stereo_runtime.hot_reload import read_yaml
+
+                settings_path = os.path.join(self.context.base_dir, "settings.yaml")
+                settings = read_yaml(settings_path)
+                modes = settings.get("OpenXR Glow Modes", {})
+                modes = dict(modes) if isinstance(modes, dict) else {}
+                modes[environment] = mode
+                settings["OpenXR Glow Modes"] = modes
+                ok, error = save_yaml(settings_path, settings)
+                if not ok:
+                    raise OSError(error)
+                return True
+            except Exception as exc:
+                print(f"[OpenXRViewer] glow mode save failed: {exc}", flush=True)
+                return False
+        if action == "persist_openxr_glow_transparency":
+            try:
+                environment = str(
+                    values.get("environment", "Default") or "Default"
+                ).strip() or "Default"
+                transparency = min(
+                    1.0,
+                    max(0.0, float(values.get("transparency", 0.0))),
+                )
+                from gui.config import save_yaml
+                from stereo_runtime.hot_reload import read_yaml
+
+                settings_path = os.path.join(self.context.base_dir, "settings.yaml")
+                settings = read_yaml(settings_path)
+                transparencies = settings.get("OpenXR Glow Transparency", {})
+                transparencies = (
+                    dict(transparencies)
+                    if isinstance(transparencies, dict) else {}
+                )
+                transparencies[environment] = transparency
+                settings["OpenXR Glow Transparency"] = transparencies
+                ok, error = save_yaml(settings_path, settings)
+                if not ok:
+                    raise OSError(error)
+                return True
+            except Exception as exc:
+                print(f"[OpenXRViewer] glow transparency save failed: {exc}", flush=True)
                 return False
         if action == "set_runtime_setting":
             return self._set_openxr_runtime_setting(
@@ -257,7 +385,7 @@ class RuntimeCallbacks:
 
     def _set_openxr_runtime_settings(self, values: dict, *, persist: bool) -> bool:
         yaml_keys = {
-            "openxr_render_scale": "OpenXR Render Scale",
+            "openxr_render_scale": "XR Render",
             "depth_strength": "Depth Strength",
             "cross_eyed": "Cross Eyed",
             "color_brightness": "Color Brightness",
@@ -277,6 +405,14 @@ class RuntimeCallbacks:
             name: (bool(value) if name == "cross_eyed" else float(value))
             for name, value in values.items()
         }
+        if "openxr_render_scale" in numeric_values:
+            numeric_values["openxr_render_scale"] = max(
+                OPENXR_RENDER_SCALE_MIN,
+                min(
+                    OPENXR_RENDER_SCALE_MAX,
+                    numeric_values["openxr_render_scale"],
+                ),
+            )
         current = self.context.openxr_state.runtime_settings_snapshot
         snapshot = replace(
             current,
@@ -297,6 +433,8 @@ class RuntimeCallbacks:
             settings = read_yaml(settings_path)
             for name, numeric in numeric_values.items():
                 settings[yaml_keys[name]] = numeric
+                if name == "openxr_render_scale":
+                    settings["OpenXR Render Scale"] = numeric
             ok, error = save_yaml(settings_path, settings)
             if not ok:
                 raise OSError(error)

@@ -9,7 +9,20 @@ from .progress import stage_progress
 
 OnnxDtypeMode = Literal["auto", "fp16", "fp32"]
 ArtifactBackend = Literal["onnx", "tensorrt", "migraphx"]
-MODEL_WEIGHT_FILENAMES = ("model.safetensors", "model.pt", "model.ckpt")
+MODEL_WEIGHT_FILENAMES = (
+    "model.safetensors",
+    "model.pt",
+    "model.ckpt",
+    "pytorch_model.bin",
+)
+VIDEO_WEIGHT_FILENAMES = (
+    "video_depth_anything_vits.pth",
+    "video_depth_anything_vitb.pth",
+    "video_depth_anything_vitl.pth",
+    "metric_video_depth_anything_vits.pth",
+    "metric_video_depth_anything_vitb.pth",
+    "metric_video_depth_anything_vitl.pth",
+)
 MODEL_CONFIG_FILENAMES = ("config.json",)
 # These model families build their network from the bundled implementation.
 # Their Hugging Face repositories provide weights, not the runtime structure.
@@ -172,8 +185,11 @@ def ensure_model_downloaded(
                 raise
     if local_files_only:
         raise FileNotFoundError(f"local model files are incomplete: {model_dir}") from last_error
+    weight_filenames = MODEL_WEIGHT_FILENAMES
+    if model_spec.family in {"video-depth-anything", "metric-video-depth-anything"}:
+        weight_filenames = (*MODEL_WEIGHT_FILENAMES, *VIDEO_WEIGHT_FILENAMES)
     for endpoint in endpoints:
-        for filename in MODEL_WEIGHT_FILENAMES:
+        for filename in weight_filenames:
             try:
                 existing = model_dir / filename
                 if existing.is_file() and existing.stat().st_size > 0:
@@ -222,6 +238,11 @@ def find_local_model_weight(model_dir: str | Path) -> Path | None:
         for path in root.rglob(filename):
             if path.is_file() and path.stat().st_size > 0:
                 return path
+    # Video-Depth-Anything repositories publish encoder checkpoints as named
+    # .pth files rather than the standard Transformers filenames.
+    for path in root.rglob("*.pth"):
+        if path.is_file() and path.stat().st_size > 0:
+            return path
     return None
 
 
@@ -298,8 +319,10 @@ def ensure_onnx_exported(
         model_id=model_spec.model_id,
         output_path=output_path,
         cache_dir=cache_dir,
-        height=height,
-        width=width,
+        # Use the same patch-aligned dimensions used in the artifact filename.
+        # Custom models such as VDA reject the unaligned request before export.
+        height=paths.export_height,
+        width=paths.export_width,
         dtype=dtype,
         local_files_only=local_files_only,
         force_download=False,

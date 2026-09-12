@@ -176,6 +176,37 @@ def _layered_synthesis(
         except Exception:
             direct_sbs = None
             direct_sbs_backend = None
+    mps_direct_eligible = (
+        sbs_only
+        and rgb.device.type == "mps"
+        and config.output_format in {"half_sbs", "full_sbs", "half_tab", "full_tab"}
+        and config.backend == "quality_4k"
+        and layer_count == 2
+        and bool(config.symmetric)
+        and bool(config.fused)
+        and str(config.hole_fill).strip().lower() == "none"
+        and not bool(config.temporal)
+        and not bool(config.refine)
+        and not bool(config.debug_output)
+        and not bool(config.cross_eyed)
+        and not output_quality_requires_eye_images(
+            config, int(rgb.shape[-1]), int(rgb.shape[-2])
+        )
+        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if direct_sbs is None and mps_direct_eligible:
+        try:
+            from ._fused_warp_mps import mps_warp_composite2_u8
+
+            direct_sbs = mps_warp_composite2_u8(
+                rgb, depth, base_shift, config.output_format
+            )
+            if direct_sbs is not None:
+                direct_sbs_backend = "metal_mps_warp_composite2_u8"
+        except Exception:
+            direct_sbs = None
+            direct_sbs_backend = None
     if direct_sbs is not None:
         left, right = rgb, rgb
         warp_composite_backend = direct_sbs_backend
@@ -188,7 +219,16 @@ def _layered_synthesis(
             symmetric=config.symmetric,
             enabled=config.fused,
         )
-        warp_composite_backend = "triton_warp_composite2" if fused is not None else "torch_grid_sample"
+        if fused is None:
+            warp_composite_backend = "torch_grid_sample"
+        elif (
+            rgb.device.type == "mps"
+            and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        ):
+            warp_composite_backend = "metal_mps_warp_composite2"
+        else:
+            warp_composite_backend = "triton_warp_composite2"
         if fused is not None:
             left, right = fused
         else:
@@ -324,7 +364,24 @@ def _try_fused_warp_composite2(
     symmetric: bool,
     enabled: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not enabled or _triton_disabled_by_env():
+    if not enabled:
+        return None
+    if (
+        rgb.device.type == "mps"
+        and layers == 2
+        and symmetric
+        and os.environ.get("D2S_MAC_STREAM_MPS_FUSED", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        try:
+            from ._fused_warp_mps import mps_warp_composite2
+
+            fused = mps_warp_composite2(rgb, depth, base_shift)
+            if fused is not None:
+                return fused
+        except Exception:
+            pass
+    if _triton_disabled_by_env():
         return None
     try:
         from .warp_composite_triton import can_use_triton_warp_composite2, warp_composite2
@@ -514,7 +571,10 @@ def synthesize_stereo(
 
     stage_start = time.perf_counter()
     if direct_sbs is None:
-        left, right, quality_debug = apply_output_quality(left, right, config)
+        if os.environ.get("D2S_OPENXR_NO_EYE_QUALITY"):
+            left, right, quality_debug = left, right, {"output_quality_mode": "skipped_env"}
+        else:
+            left, right, quality_debug = apply_output_quality(left, right, config)
     else:
         plan = output_sampling_plan_for_config(
             config, int(left.shape[-1]), int(left.shape[-2])

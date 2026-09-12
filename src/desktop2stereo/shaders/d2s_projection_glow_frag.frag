@@ -69,7 +69,7 @@ void screen_glow() {
         density = density * density * (3.0 - 2.0 * density);
         amount *= density;
     }
-    amount *= state.glow.x * state.glow.z;
+    amount *= state.glow.x * state.glow.z * state.veil.y;
     if (amount <= 0.001) discard;
     vec2 raw = (texture_uv - (vec2(0.5) - screen_half)) /
         max(screen_half * 2.0, vec2(0.00001));
@@ -109,7 +109,7 @@ void surround_glow() {
     float radial_distance = clamp(effect_uv.x, 0.0, 1.0);
     float edge_field = exp2(-5.0 * radial_distance)
         * (1.0 - smoothstep(0.88, 1.0, radial_distance));
-    float amount = edge_field * state.glow.x * state.glow.w;
+    float amount = edge_field * state.glow.x * state.glow.w * state.veil.y;
     if (amount <= 0.002) discard;
     vec3 shell_color = sample_region_average(texture_uv);
     output_color = vec4(shell_color * min(amount, 1.0), 1.0);

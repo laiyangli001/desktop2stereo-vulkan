@@ -13,6 +13,9 @@ layout(set = 0, binding = 3, std430) buffer GlowHistoryBuffer {
 layout(set = 0, binding = 4, std430) writeonly buffer EdgeLightBuffer {
     vec4 edge_light_linear[24];
 };
+layout(set = 0, binding = 5, std430) writeonly buffer CropDetectionBuffer {
+    vec4 detected_crop_uv;
+};
 
 layout(push_constant) uniform GlowSourceParams {
     uint source_width;
@@ -23,6 +26,8 @@ layout(push_constant) uniform GlowSourceParams {
     uint surround_region_average;
     float temporal_alpha;
     uint write_glow;
+    vec4 source_crop;
+    uvec4 crop_detection;
 } params;
 
 uint source_pixel_count() {
@@ -45,6 +50,131 @@ vec3 source_encoded_at(ivec2 coordinate) {
             vec3(0.0), vec3(1.0));
 }
 
+vec2 crop_min_uv() {
+    return clamp(params.source_crop.xy, vec2(0.0), vec2(0.9));
+}
+
+vec2 crop_size_uv() {
+    vec2 minimum = crop_min_uv();
+    return clamp(params.source_crop.zw, vec2(0.1), vec2(1.0) - minimum);
+}
+
+bool uniform_row(int y) {
+    float total = 0.0;
+    float squared = 0.0;
+    for (int index = 0; index < 128; ++index) {
+        float x = mix(float(params.source_width) * 0.10,
+                      float(params.source_width) * 0.90,
+                      (float(index) + 0.5) / 128.0);
+        vec3 color = source_encoded_at(ivec2(int(x), y));
+        float value = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        total += value;
+        squared += value * value;
+    }
+    float mean = total / 128.0;
+    return max(0.0, squared / 128.0 - mean * mean) < 0.000554;
+}
+
+bool uniform_column(int x) {
+    float total = 0.0;
+    float squared = 0.0;
+    for (int index = 0; index < 128; ++index) {
+        float y = mix(float(params.source_height) * 0.10,
+                      float(params.source_height) * 0.90,
+                      (float(index) + 0.5) / 128.0);
+        vec3 color = source_encoded_at(ivec2(x, int(y)));
+        float value = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        total += value;
+        squared += value * value;
+    }
+    float mean = total / 128.0;
+    return max(0.0, squared / 128.0 - mean * mean) < 0.000554;
+}
+
+vec4 detect_letterbox_crop() {
+    int width = int(params.source_width);
+    int height = int(params.source_height);
+    if (width < 64 || height < 64) return vec4(0.0, 0.0, 1.0, 1.0);
+
+    int top = 0;
+    int bottom = 0;
+    for (int index = 0; index < 360; ++index) {
+        int y = (index * (height - 1)) / 359;
+        if (!uniform_row(y)) break;
+        top = y + 1;
+    }
+    for (int index = 0; index < 360; ++index) {
+        int y = height - 1 - (index * (height - 1)) / 359;
+        if (!uniform_row(y)) break;
+        bottom = height - y;
+    }
+    int left = 0;
+    int right = 0;
+    for (int index = 0; index < 360; ++index) {
+        int x = (index * (width - 1)) / 359;
+        if (!uniform_column(x)) break;
+        left = x + 1;
+    }
+    for (int index = 0; index < 360; ++index) {
+        int x = width - 1 - (index * (width - 1)) / 359;
+        if (!uniform_column(x)) break;
+        right = width - x;
+    }
+
+    float center_total = 0.0;
+    float center_bright = 0.0;
+    for (int row = 0; row < 48; ++row) {
+        int y = int(mix(float(height) * 0.35, float(height) * 0.65,
+                        (float(row) + 0.5) / 48.0));
+        for (int col = 0; col < 32; ++col) {
+            int x = int(mix(float(width) * 0.10, float(width) * 0.90,
+                            (float(col) + 0.5) / 32.0));
+            float value = dot(source_encoded_at(ivec2(x, y)),
+                              vec3(0.2126, 0.7152, 0.0722));
+            center_total += value;
+            center_bright += value > 0.0784 ? 1.0 : 0.0;
+        }
+    }
+    float center_mean = center_total / (48.0 * 32.0);
+    float bright_fraction = center_bright / (48.0 * 32.0);
+    if (center_mean < 0.0549 && bright_fraction < 0.035) {
+        return vec4(0.0, 0.0, 1.0, 1.0);
+    }
+
+    vec4 crop = vec4(0.0, 0.0, 1.0, 1.0);
+    int min_y_bar = max(8, int(float(height) * 0.035));
+    if (top >= min_y_bar && bottom >= min_y_bar && top + bottom < height) {
+        int bigger = max(top, bottom);
+        int smaller = min(top, bottom);
+        if (bigger - smaller <= max(18, int(float(bigger) * 0.25))) {
+            int trim = max(2, min(8, int(round(float(height) * 0.004))));
+            int crop_top = min(height - 2, top + trim);
+            int crop_bottom = max(crop_top + 1, height - bottom - trim);
+            int crop_height = crop_bottom - crop_top;
+            if (height - crop_height >= max(16, int(float(height) * 0.07))) {
+                crop.y = float(crop_top) / float(height);
+                crop.w = float(crop_height) / float(height);
+            }
+        }
+    }
+    int min_x_bar = max(8, int(float(width) * 0.035));
+    if (left >= min_x_bar && right >= min_x_bar && left + right < width) {
+        int bigger = max(left, right);
+        int smaller = min(left, right);
+        if (bigger - smaller <= max(18, int(float(bigger) * 0.25))) {
+            int trim = max(2, min(8, int(round(float(width) * 0.004))));
+            int crop_left = min(width - 2, left + trim);
+            int crop_right = max(crop_left + 1, width - right - trim);
+            int crop_width = crop_right - crop_left;
+            if (width - crop_width >= max(16, int(float(width) * 0.07))) {
+                crop.x = float(crop_left) / float(width);
+                crop.z = float(crop_width) / float(width);
+            }
+        }
+    }
+    return crop;
+}
+
 vec3 reduce_screen_light_linear() {
     // A low-frequency stratified reduction is sufficient for reflected screen
     // illumination. This runs in Vulkan on the same source as Glow and writes
@@ -53,6 +183,7 @@ vec3 reduce_screen_light_linear() {
     for (uint sample_y = 0u; sample_y < 8u; ++sample_y) {
         for (uint sample_x = 0u; sample_x < 8u; ++sample_x) {
             vec2 sample_uv = (vec2(sample_x, sample_y) + vec2(0.5)) / 8.0;
+            sample_uv = crop_min_uv() + sample_uv * crop_size_uv();
             ivec2 source_pixel = ivec2(floor(
                     sample_uv * vec2(params.source_width, params.source_height)));
             total += srgb_to_linear(source_encoded_at(source_pixel));
@@ -69,6 +200,9 @@ void main() {
 
     if (all(equal(output_pixel, uvec2(0u)))) {
         screen_light_linear = vec4(reduce_screen_light_linear(), 1.0);
+        if (params.crop_detection.x != 0u) {
+            detected_crop_uv = detect_letterbox_crop();
+        }
     }
     if (params.write_glow == 0u) {
         return;
@@ -79,9 +213,11 @@ void main() {
     // Filament's uploaded CPU Glow texture follows the legacy OpenGL
     // bottom-left row convention. Mirror the top-left CUDA source here so the
     // external Vulkan image has the same sampling orientation.
-    vec2 source_uv = vec2(output_uv.x, 1.0 - output_uv.y);
+    vec2 crop_minimum = crop_min_uv();
+    vec2 crop_size = crop_size_uv();
+    vec2 source_uv = crop_minimum + vec2(output_uv.x, 1.0 - output_uv.y) * crop_size;
     vec2 source_center = source_uv * vec2(params.source_width, params.source_height);
-    vec2 base_footprint = vec2(params.source_width, params.source_height) /
+    vec2 base_footprint = crop_size * vec2(params.source_width, params.source_height) /
             vec2(params.target_width, params.target_height);
     // prefilter_scale is the legacy MIP footprint in source pixels, not a
     // multiplier of the already-downsampled 320x180 footprint.
@@ -96,28 +232,28 @@ void main() {
         vec2 grid = vec2(8.0, 6.0);
         vec2 region = floor(clamp(output_uv, vec2(0.0), vec2(0.999999)) * grid);
         vec2 region_uv = (region + vec2(0.5)) / grid;
-        source_uv = vec2(region_uv.x, 1.0 - region_uv.y);
+        source_uv = crop_minimum + vec2(region_uv.x, 1.0 - region_uv.y) * crop_size;
         source_center = source_uv * vec2(params.source_width, params.source_height);
-        footprint = vec2(params.source_width, params.source_height) / grid;
+        footprint = crop_size * vec2(params.source_width, params.source_height) / grid;
 
         float edge_band_pixels = clamp(
                 round(float(min(params.source_width, params.source_height)) / 270.0),
                 4.0, 16.0);
         if (region.x < 0.5) {
-            source_center.x = edge_band_pixels * 0.5;
+            source_center.x = crop_minimum.x * float(params.source_width) + edge_band_pixels * 0.5;
             footprint.x = edge_band_pixels;
         } else if (region.x > grid.x - 1.5) {
-            source_center.x = float(params.source_width) - edge_band_pixels * 0.5;
+            source_center.x = (crop_minimum.x + crop_size.x) * float(params.source_width) - edge_band_pixels * 0.5;
             footprint.x = edge_band_pixels;
         }
         // output_uv is top-left based while the external Glow image follows
         // Filament's bottom-left convention, so the first output row samples
         // the source's bottom edge and the last row samples its top edge.
         if (region.y < 0.5) {
-            source_center.y = float(params.source_height) - edge_band_pixels * 0.5;
+            source_center.y = (crop_minimum.y + crop_size.y) * float(params.source_height) - edge_band_pixels * 0.5;
             footprint.y = edge_band_pixels;
         } else if (region.y > grid.y - 1.5) {
-            source_center.y = edge_band_pixels * 0.5;
+            source_center.y = crop_minimum.y * float(params.source_height) + edge_band_pixels * 0.5;
             footprint.y = edge_band_pixels;
         }
     }

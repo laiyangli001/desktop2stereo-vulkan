@@ -137,6 +137,12 @@ def _capture_frame_to_rgb_torch(
     h0, w0 = frame_raw.shape[:2]
     new_height, new_width = _resolve_target_size(target_resolution, h0, w0)
     requested_device = torch.device(device)
+    coreml_raw_bgr = None
+    if requested_device.type == "mps" and frame_raw.device.type == "cpu":
+        # Keep the capture-owned host bytes for CoreML. The provider converts
+        # and resizes directly to model resolution, avoiding a second full
+        # render-resolution CPU preprocessing pass.
+        coreml_raw_bgr = frame_raw
 
     try:
         from capture.preprocess_triton import bgr_to_rgb_resize_norm, can_use_triton_preprocess
@@ -157,6 +163,7 @@ def _capture_frame_to_rgb_torch(
                 capture_copy_mode=capture_copy_mode,
                 capture_zero_copy=capture_zero_copy,
             )
+            _mark_coreml_raw_bgr(out, coreml_raw_bgr)
             return out
     except Exception:
         pass
@@ -179,6 +186,7 @@ def _capture_frame_to_rgb_torch(
                 capture_copy_mode=capture_copy_mode,
                 capture_zero_copy=capture_zero_copy,
             )
+            _mark_coreml_raw_bgr(out, coreml_raw_bgr)
             return out
         out = F.interpolate(
             frame_float.unsqueeze(0),
@@ -196,6 +204,7 @@ def _capture_frame_to_rgb_torch(
             capture_copy_mode=capture_copy_mode,
             capture_zero_copy=capture_zero_copy,
         )
+        _mark_coreml_raw_bgr(out, coreml_raw_bgr)
         return out
 
 
@@ -259,9 +268,15 @@ def _copy_preprocess_metadata(source, target):
         "_d2s_preprocess_device_transfer",
         "_d2s_capture_copy_mode",
         "_d2s_capture_zero_copy",
+        "_d2s_coreml_raw_bgr",
     ):
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
+
+
+def _mark_coreml_raw_bgr(tensor, value) -> None:
+    if value is not None:
+        setattr(tensor, "_d2s_coreml_raw_bgr", value)
 
 
 def _frame_kind_text(value):

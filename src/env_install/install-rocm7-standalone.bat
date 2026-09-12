@@ -89,6 +89,14 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+rem Portable triton JIT: patch the bundled triton to compile hip_utils
+rem against the project-local msvcstub instead of the Windows SDK/MSVC.
+"%PYTHON_EXE%" "%SCRIPT_DIR%apply-triton-portable-patches.py" "%PYTHON_ROOT%\Lib\site-packages"
+if errorlevel 1 (
+    echo Failed to apply triton portable patches
+    pause
+    exit /b 1
+)
 echo Python environment deployed successfully.
 
 echo To enable torch.compile on AMD ROCm7 supported GPUs, you must install vs_buildtools https://aka.ms/vs/17/release/vs_buildtools.exe and select the "Desktop development with C++" to install (~6GB). OR you can just run with the torch.compile unchecked.

@@ -1,8 +1,13 @@
 import sys
 import types
+from types import SimpleNamespace
 
 from stereo_runtime.depth_provider import DepthProviderConfig, create_depth_provider
-from stereo_runtime.providers.amd import GenericTorchRocmDepthProvider, TorchRocmDepthProvider
+from stereo_runtime.providers.amd import (
+    GenericTorchRocmDepthProvider,
+    MIGraphXDepthProvider,
+    TorchRocmDepthProvider,
+)
 import stereo_runtime.providers.amd.migraphx as migraphx_provider
 
 
@@ -61,6 +66,74 @@ def test_create_migraphx_rocm_provider_falls_back_to_pytorch_rocm(monkeypatch):
     assert isinstance(provider, TorchRocmDepthProvider)
     assert provider.info.depth_backend == "pytorch_rocm"
     assert provider.info.fallback_reason == "migraphx is not installed"
+
+
+def test_create_migraphx_rocm_provider_preserves_model_id_and_size(monkeypatch, tmp_path):
+    monkeypatch.setattr(migraphx_provider, "is_rocm_torch_available", lambda: True)
+    monkeypatch.setattr(migraphx_provider, "is_migraphx_available", lambda: True)
+
+    provider = create_depth_provider(
+        DepthProviderConfig(
+            backend="migraphx_rocm",
+            model_id="apple/DepthPro-hf",
+            model_name="DepthPro-Large",
+            device="cpu",
+            cache_dir=tmp_path,
+            onnx_path=tmp_path / "model_fp16_868x1540.onnx",
+            engine_path=tmp_path / "model_fp16_868x1540.mgx",
+            depth_resolution=1536,
+            patch_size=14,
+            allow_pytorch_fallback=False,
+        )
+    )
+
+    assert isinstance(provider, MIGraphXDepthProvider)
+    assert provider.info.model_id == "apple/DepthPro-hf"
+    assert provider.info.model_name == "DepthPro-Large"
+    assert provider.info.depth_resolution == 1536
+    assert provider.preprocessor.input_size(2160, 3840) == (868, 1540)
+
+
+def test_create_migraphx_rocm_provider_resolves_missing_onnx_before_rebuild(monkeypatch, tmp_path):
+    monkeypatch.setattr(migraphx_provider, "is_rocm_torch_available", lambda: True)
+    monkeypatch.setattr(migraphx_provider, "is_migraphx_available", lambda: True)
+    generated_onnx = tmp_path / "generated.onnx"
+    generated_onnx.write_bytes(b"onnx")
+    generated_graph = tmp_path / "generated.mgx"
+    calls = {}
+
+    def prepare_model_artifacts(model_id, **kwargs):
+        calls["model_id"] = model_id
+        calls["kwargs"] = kwargs
+        return SimpleNamespace(
+            selected_onnx_path=generated_onnx,
+            selected_migraphx_path=None,
+            paths=SimpleNamespace(migraphx_fp16_path=generated_graph),
+        )
+
+    import stereo_runtime.model_artifacts as model_artifacts
+
+    monkeypatch.setattr(model_artifacts, "prepare_model_artifacts", prepare_model_artifacts)
+    missing_onnx = tmp_path / "model_fp16_196x336.onnx"
+    graph_path = tmp_path / "model_fp16_196x336.mgx"
+
+    provider = migraphx_provider.create_migraphx_rocm_provider(
+        model_id="depth-anything/Video-Depth-Anything-Small",
+        model_name="Video-Depth-Anything-Small",
+        device="cpu",
+        cache_dir=tmp_path,
+        onnx_path=missing_onnx,
+        graph_path=graph_path,
+        build_graph=True,
+        depth_resolution=336,
+        patch_size=14,
+        allow_pytorch_fallback=False,
+    )
+
+    assert calls["model_id"] == "depth-anything/Video-Depth-Anything-Small"
+    assert calls["kwargs"]["export_width"] == 336
+    assert provider.onnx_path == generated_onnx
+    assert provider.graph_path == graph_path
 
 
 def test_build_migraphx_graph_uses_fp8_then_saves(monkeypatch, tmp_path):

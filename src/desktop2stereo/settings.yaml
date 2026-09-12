@@ -41,33 +41,6 @@ Model List:
     - 392
     - 448
     - 518
-  Depth-Anything-V2-Small:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  Depth-Anything-V2-Base:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  Depth-Anything-V2-Large:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
   InfiniDepth-Small:
     resolutions:
     - 192
@@ -104,6 +77,33 @@ Model List:
     - 384
     - 448
     - 512
+  Depth-Anything-V2-Small:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
+  Depth-Anything-V2-Base:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
+  Depth-Anything-V2-Large:
+    resolutions:
+    - 196
+    - 238
+    - 294
+    - 336
+    - 392
+    - 448
+    - 518
   Video-Depth-Anything-Small:
     resolutions:
     - 196
@@ -167,15 +167,6 @@ Model List:
     - 378
     - 434
     - 504
-  DA3METRIC-LARGE:
-    resolutions:
-    - 182
-    - 224
-    - 280
-    - 322
-    - 378
-    - 434
-    - 504
   DA3NESTED-GIANT-LARGE:
     resolutions:
     - 182
@@ -186,6 +177,15 @@ Model List:
     - 434
     - 504
   DA3MONO-LARGE:
+    resolutions:
+    - 182
+    - 224
+    - 280
+    - 322
+    - 378
+    - 434
+    - 504
+  DA3METRIC-LARGE:
     resolutions:
     - 182
     - 224
@@ -320,168 +320,15 @@ Model List:
     - 392
     - 448
     - 518
-  dpt-dinov2-small-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-base-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-large-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-giant-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-small-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-base-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-large-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-dinov2-giant-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  depth-ai:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-hybrid-midas:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-beit-base-384:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-beit-large-512:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-large:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  dpt-large-redesign:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-nyu-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-nyu:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
-  zoedepth-kitti:
-    resolutions:
-    - 196
-    - 238
-    - 294
-    - 336
-    - 392
-    - 448
-    - 518
   DepthPro-Large:
     resolutions:
     - 1536
-Depth Model: Distill-Any-Depth-Base
+Depth Model: depth-anything-small
 Depth Strength: 0.25
 Depth Quick: Standard
-Depth Resolution: 518
-Anti-aliasing: 0
-Depth Antialias Strength: 0.0
+Depth Resolution: 336
+Anti-aliasing: 1
+Depth Antialias Strength: 1.0
 Depth Pop: 0.0
 Foreground Pop: 1.15
 Midground Pop: 1.05
@@ -518,27 +365,29 @@ Vulkan Projection MIP LOD Bias: -0.35
 Vulkan Projection RCAS Sharpness: 0.5
 Display Mode: Half-SBS
 FP16: true
-torch.compile: false
-TensorRT: true
+torch.compile: true
+TensorRT: null
 Parallel Inference: false
 Parallel Inference Workers: 1
 Recompile TensorRT: false
 CoreML: null
 Recompile CoreML: false
-MIGraphX: null
+MIGraphX: true
 Recompile MIGraphX: false
 Recompile OpenVINO: false
 Computing Device: 0
-Language: CN
-Run Mode: Local Viewer
-XR Headset Model: Pico 4 / 4 Ultra
-XR Preview Window: true
+Language: EN
+Run Mode: OpenXR Link
+XR Headset Model: Meta Quest 2
+XR Preview Window: false
 VSync: false
 Window Preview: false
 Target FPS: 0
 Processing Resolution: Auto
 Render Size Policy: scaled
 Render Scale: 4K / 100%
+XR Render: 1.0
+XR Render Mode: auto
 Render Fixed Width: 1920
 Render Fixed Height: 1080
 Render Max Pixels: 8294400
@@ -557,13 +406,15 @@ Stream Key: live
 Audio Capture Backend: auto
 Video Encoder Backend: auto
 CRF: 23
-Audio Delay: -0.1
-Controller Model: PICO
+Audio Delay: 0.0
+Controller Model: QUEST
 Environment Model: Default
 NVIDIA Frame Generation: false
 Lossless Scaling Support: false
+LSFG Support: false
 Capture Tool: WindowsCaptureCUDA
 Display Fit Mode: stretch
+Stream Display Fit Mode: contain
 Fill 16:9: false
 Fix Viewer Aspect: false
 Stereo Output: 3
@@ -581,4 +432,105 @@ Show Log Panel: true
 Input Display Resolution Tier: 4K
 Synthetic View: quality_4k
 OpenVINO: null
-Stream Target FPS: 0
+OpenXR Screen States:
+  Default:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_lakesky:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  3d_home:
+    position:
+    - -1.9610674132102057
+    - 102.81677697013133
+    - 17.986561814634758
+    width: 24.528489980622957
+    height: 13.797275614100434
+    rotation_deg:
+    - 179.917460207701
+    - 5.415848201963977
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_aurora:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  3d_theater:
+    position:
+    - 0.0
+    - 1.5344
+    - 3.8504
+    width: 5.3075
+    height: 2.98546875
+    rotation_deg:
+    - -180.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+  hdr_skycloud:
+    position:
+    - 0.0
+    - 0.0
+    - -1.3
+    width: 1.5
+    height: 0.84375
+    rotation_deg:
+    - 0.0
+    - 0.0
+    - 0.0
+    curved: false
+    curve_half_angle_rad: 0.0
+    crop_width_percent: 0.0
+    crop_height_percent: 0.0
+    dynamic_crop: false
+OpenXR Render Scale: 1.24
+OpenXR Glow Modes:
+  Default: 'off'
+OpenXR Glow Transparency:
+  Default: 0.0

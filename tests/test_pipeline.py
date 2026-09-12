@@ -4,16 +4,22 @@ import threading
 from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
+import pytest
+
 from path_config import APP_ROOT
 
 from path_config import APP_ROOT
 
 from capture.types import CapturedFrame
+from stereo_runtime.render_size import RenderSizeConfig
 
 from stereo_runtime.pipeline import (
     _ParallelDepthScheduler,
     _prepare_frame_input,
     RuntimePipelineLoop,
+    _resolve_pipeline_render_size,
+    _unpack_raw_queue_item,
     _enable_openxr_depth_cuda_graph_if_needed,
     _motion_sample,
     _motion_score,
@@ -22,7 +28,78 @@ from stereo_runtime.pipeline import (
     _runtime_motion_gate_enabled,
     _runtime_pending_depth_limit,
     _runtime_parallel_adaptive_backoff_enabled,
+    _cuda_event_ready,
+    _attach_capture_debug,
+    _native_coreml_capture_enabled,
 )
+
+
+def test_pipeline_uses_captured_dimensions_when_render_scale_is_4k():
+    captured = CapturedFrame(
+        frame=np.zeros((1200, 1920, 3), dtype=np.uint8),
+        target_height=2160,
+        timestamp=1.0,
+        capture_size=(1920, 1200),
+    )
+    _frame, source_size, _timestamp, _captured = _unpack_raw_queue_item(captured)
+    config = RenderSizeConfig(scale_factor="4K / 100%")
+
+    assert source_size == (1920, 1200)
+    assert _resolve_pipeline_render_size(source_size, config) == (1920, 1200)
+
+
+def test_attach_capture_debug_marks_depth_complete_for_current_frame():
+    result = SimpleNamespace(
+        depth=np.zeros((2, 2), dtype=np.float32),
+        depth_finite=True,
+        debug_info={},
+        timing={"depth_nonfinite_count": 0},
+    )
+    captured = CapturedFrame(
+        frame=np.zeros((2, 2, 3), dtype=np.uint8),
+        target_height=2,
+        timestamp=1.0,
+        metadata={"capture_frame_id": 42},
+    )
+
+    _attach_capture_debug(result, captured, SimpleNamespace())
+
+    assert result.capture_frame_id == 42
+    assert result.depth_frame_id == 42
+    assert result.depth_complete is True
+    assert result.debug_info["depth_finite"] == 1
+    assert result.debug_info["depth_nonfinite_count"] == 0
+
+
+def test_native_coreml_capture_is_enabled_for_macos_network_stream(monkeypatch):
+    monkeypatch.setattr("stereo_runtime.pipeline.platform.system", lambda: "Darwin")
+    monkeypatch.setenv("D2S_MAC_STREAM_NATIVE_IO", "1")
+
+    assert _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="network_stream")
+    )
+    assert not _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="local_viewer")
+    )
+    assert _native_coreml_capture_enabled(
+        SimpleNamespace(run_mode="Local Viewer", application_runtime_target="local_viewer")
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_size", "scale", "expected"),
+    [
+        ((1920, 1200), "4K / 100%", (1920, 1200)),
+        ((3840, 2160), "4K / 100%", (3840, 2160)),
+        ((3840, 2160), "1K / 50%", (1920, 1080)),
+        ((3840, 2400), "1K / 50%", (1920, 1200)),
+    ],
+)
+def test_scaled_render_size_preserves_source_aspect_ratio(source_size, scale, expected):
+    assert _resolve_pipeline_render_size(
+        source_size,
+        RenderSizeConfig(scale_factor=scale),
+    ) == expected
 
 
 def test_save_preprocess_image_diagnostic_exports_exact_pre_inference_rgb(tmp_path):
@@ -268,6 +345,24 @@ def test_pending_cuda_retains_latest_raw_frame(monkeypatch):
     assert sleeps == [0.001]
 
 
+def test_cuda_ready_event_uses_gpu_waitable_event(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: False)
+
+    assert _cuda_event_ready(event) is True
+
+
+def test_rocm_ready_event_keeps_query_pending_path(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.version, "hip", "7.0", raising=False)
+    event = SimpleNamespace(wait=lambda: None, query=lambda: False)
+
+    assert _cuda_event_ready(event) is False
+
+
 def _dual_pending_context(
     *, backend="cuda_triton", slots=2, temporal=False, workers=2, run_mode="OpenXR"
 ):
@@ -429,7 +524,40 @@ def test_pipeline_does_not_rebuild_before_threshold(monkeypatch):
     assert loop._consecutive_runtime_errors == 2
 
 
-def test_prepare_frame_input_uses_directml_native_bridge_and_records_decision():
+def test_prepare_frame_input_uses_directml_native_bridge_and_records_decision(monkeypatch):
+    from utils.display_info import DisplayInfo
+
+    monkeypatch.setattr(
+        "utils.display_info.enumerate_displays",
+        lambda: [
+            DisplayInfo(
+                capture_index=1,
+                display_number=1,
+                left=0,
+                top=0,
+                width=1920,
+                height=1080,
+                stable_id="cg:1552:41036:4251086178",
+                name="iMac",
+                manufacturer="1552",
+                model="iMac",
+                serial="4251086178",
+            ),
+            DisplayInfo(
+                capture_index=2,
+                display_number=2,
+                left=1920,
+                top=0,
+                width=1920,
+                height=1080,
+                stable_id="cg:2198:39711:3271970828",
+                name="VITURE",
+                manufacturer="2198",
+                model="VITURE",
+                serial="3271970828",
+            ),
+        ],
+    )
     class SharedResource:
         adapter_luid = 0x10
         format = "BGRA8"

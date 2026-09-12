@@ -66,11 +66,13 @@ def _probe_openxr_extensions() -> dict[str, object]:
         }
         return {
             "loader_available": True,
+            "extensions": sorted(extensions),
             "vulkan_enable2": "XR_KHR_vulkan_enable2" in extensions,
         }
     except Exception as exc:
         return {
             "loader_available": False,
+            "extensions": [],
             "vulkan_enable2": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -83,6 +85,7 @@ def _probe_gpu_producers() -> dict[str, object]:
         "selection": "auto",
         "override": override.strip() if override and override.strip() else None,
         "selected_backend": "none",
+        "selection_reason": "not_probed",
         "cuda": {"torch_available": False, "available": False},
         "rocm": {"torch_available": False, "hip_version": None, "available": False},
     }
@@ -94,21 +97,86 @@ def _probe_gpu_producers() -> dict[str, object]:
         report["cuda"] = {
             "torch_available": True,
             "available": cuda_available and not bool(hip_version),
+            "device_count": int(torch.cuda.device_count()) if cuda_available else 0,
+            "device": str(torch.cuda.get_device_name(0)) if cuda_available else None,
         }
         report["rocm"] = {
             "torch_available": True,
             "hip_version": str(hip_version) if hip_version else None,
             "available": bool(hip_version) and cuda_available,
+            "device_count": int(torch.cuda.device_count()) if cuda_available else 0,
+            "device": str(torch.cuda.get_device_name(0)) if cuda_available else None,
         }
         if override and override.strip().lower() not in {"", "auto", "default"}:
             report["selection"] = "override"
             report["selected_backend"] = override.strip().lower()
+            report["selection_reason"] = "D2S_VULKAN_GPU_BACKEND"
         elif bool(hip_version) and cuda_available:
             report["selected_backend"] = "rocm"
+            report["selection_reason"] = "torch_hip_device_available"
         elif cuda_available:
             report["selected_backend"] = "cuda"
+            report["selection_reason"] = "torch_cuda_device_available"
+        else:
+            report["selection_reason"] = "no_torch_gpu_device"
     except Exception as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
+        report["selection_reason"] = "gpu_probe_failed"
+    return report
+
+
+def _probe_runtime_configuration(src_root: Path) -> dict[str, object]:
+    """Read static sizing and fallback policy without creating an XR session."""
+    settings_path = src_root / "settings.yaml"
+    report: dict[str, object] = {
+        "settings_path": str(settings_path),
+        "settings_available": False,
+        "capture_size": None,
+        "processing": {},
+        "openxr": {},
+        "fallback_status": {
+            "static_probe": "not_run",
+            "inference_cpu": "not_probed",
+            "composition_cpu": "not_probed",
+            "gpu_to_cpu": "not_probed",
+            "session_created": False,
+        },
+    }
+    try:
+        from utils.settings import read_yaml
+
+        settings = read_yaml(str(settings_path))
+        if not isinstance(settings, dict):
+            return report
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        return report
+
+    report["settings_available"] = True
+    identity = settings.get("Monitor Identity")
+    if isinstance(identity, dict):
+        try:
+            width = int(identity.get("width", 0) or 0)
+            height = int(identity.get("height", 0) or 0)
+        except (TypeError, ValueError):
+            width = height = 0
+        if width > 0 and height > 0:
+            report["capture_size"] = {"width": width, "height": height, "pixels": width * height}
+
+    report["processing"] = {
+        "render_size_policy": settings.get("Render Size Policy", "unknown"),
+        "render_scale": settings.get("Render Scale", "unknown"),
+        "input_resolution_tier": settings.get("Input Display Resolution Tier", "unknown"),
+        "depth_resolution": settings.get("Depth Resolution", "unknown"),
+        "display_mode": settings.get("Display Mode", "unknown"),
+    }
+    report["openxr"] = {
+        "run_mode": settings.get("Run Mode", "unknown"),
+        "headset_model": settings.get("XR Headset Model", "unknown"),
+        "render_scale": settings.get("XR Render", settings.get("OpenXR Render Scale", "unknown")),
+        "render_mode": settings.get("XR Render Mode", "unknown"),
+        "target_size": "session_required",
+    }
     return report
 
 
@@ -205,6 +273,7 @@ def build_capability_report() -> dict[str, object]:
         "vulkan": _probe_vulkan_device(),
         "gpu_producers": _probe_gpu_producers(),
         "openxr": _probe_openxr_extensions(),
+        "runtime_configuration": _probe_runtime_configuration(src_root),
         "filament_bridge": {
             "expected_path": str(filament_path) if filament_path else None,
             "available": bool(filament_path and filament_path.is_file()),

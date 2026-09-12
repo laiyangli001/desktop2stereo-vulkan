@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import platform
+import warnings
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
@@ -11,6 +13,50 @@ try:
 except Exception:  # pragma: no cover - exercised on installations without Triton
     _triton = None
     tl = None
+
+
+def _ensure_windows_cc() -> None:
+    """Point Triton's C compiler at its bundled TinyCC when MSVC is absent.
+
+    On Windows, ``triton.runtime.build.get_cc()`` prefers the ROCm SDK
+    clang-cl, which needs MSVC/Windows-SDK headers for ``stdlib.h``.  On
+    machines without Visual Studio Build Tools every ``hip_utils`` compile then
+    fails and every Triton kernel launch raises.  Triton ships its own TinyCC
+    (``triton/runtime/tcc/tcc.exe``) with a bundled libc for exactly this case;
+    selecting it keeps the ROCm Triton backend usable without MSVC.
+
+    The probe below is expected to fail on machines without MSVC (the app then
+    uses bundled TinyCC), so Triton's "Failed to find MSVC" UserWarning is
+    noise here and is suppressed for the probe.
+    """
+    if os.name != "nt" or os.environ.get("CC"):
+        return
+    try:
+        import sysconfig
+
+        from triton.windows_utils import find_msvc
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Failed to find MSVC.*",
+                category=UserWarning,
+                module=r"triton\.windows_utils",
+            )
+            msvc_bin, _, _ = find_msvc(env_only=False)
+        if msvc_bin:
+            return  # real MSVC present; keep Triton's default compiler
+        tcc = os.path.join(
+            sysconfig.get_paths()["platlib"],
+            "triton",
+            "runtime",
+            "tcc",
+            "tcc.exe",
+        )
+        if os.path.exists(tcc):
+            os.environ["CC"] = tcc
+    except Exception:  # pragma: no cover - best-effort environment fix
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +123,7 @@ def probe_triton_runtime(device: Any = None, *, force: bool = False) -> TritonRu
     from a vendor ID or package name.
     """
 
+    _ensure_windows_cc()
     try:
         import torch
     except Exception as exc:

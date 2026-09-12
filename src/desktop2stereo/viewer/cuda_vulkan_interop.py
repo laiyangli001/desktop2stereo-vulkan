@@ -1,4 +1,4 @@
-"""NVIDIA CUDA Runtime interop for exportable Vulkan image slots."""
+"""NVIDIA CUDA Runtime interop for exportable Vulkan image and buffer slots."""
 
 from __future__ import annotations
 
@@ -641,15 +641,21 @@ class CudaVulkanImageImporter:
     def copy_tensor_to_buffer(
         self, tensor: Any, target: Any, *, stream: int | None = None
     ) -> None:
-        """Copy a contiguous CUDA float tensor directly into an imported buffer."""
+        """Copy a contiguous CUDA tensor directly into an imported buffer."""
         self.register_buffer(target)
         if getattr(tensor, "device", None) is None or str(tensor.device.type) != "cuda":
             raise CudaVulkanInteropError("CUDA Vulkan buffer copy requires a CUDA tensor")
-        if str(getattr(tensor, "dtype", "")) != "torch.float32":
-            raise CudaVulkanInteropError("CUDA Vulkan buffer copy requires torch.float32")
+        if str(getattr(tensor, "dtype", "")) not in {
+            "torch.float32",
+            "torch.float16",
+            "torch.uint8",
+        }:
+            raise CudaVulkanInteropError(
+                "CUDA Vulkan buffer copy requires torch.float32, torch.float16, or torch.uint8"
+            )
         if not bool(tensor.is_contiguous()):
             raise CudaVulkanInteropError("CUDA Vulkan buffer copy requires a contiguous tensor")
-        byte_count = int(tensor.numel()) * 4
+        byte_count = int(tensor.numel()) * int(tensor.element_size())
         if byte_count > int(getattr(target, "size", 0)):
             raise CudaVulkanInteropError("CUDA tensor does not fit in the Vulkan buffer")
         if stream is None:

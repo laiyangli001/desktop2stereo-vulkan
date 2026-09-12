@@ -97,15 +97,28 @@ def _depth_backend_hot_reload(settings_dict: dict, config):
     backend_keys = {"Depth Backend", "MIGraphX", "TensorRT", "ONNX"}
     if not backend_keys.intersection(settings_dict):
         return None
+    import torch
+
+    # Mirror adapter.runtime_config_from_d2s_settings: TensorRT is NVIDIA-only,
+    # so on AMD ROCm the stale "TensorRT" flag must not select tensorrt_native
+    # (that would diverge from the runtime's migraphx_rocm and request a
+    # pipeline rebuild on every hot reload).
+    is_rocm = bool(getattr(torch.version, "hip", None))
     if to_bool_hot_reload(settings_dict.get("MIGraphX", False)):
         return "migraphx_rocm"
-    if to_bool_hot_reload(settings_dict.get("TensorRT", False)):
+    if to_bool_hot_reload(settings_dict.get("TensorRT", False)) and not is_rocm:
         return "tensorrt_native"
     if to_bool_hot_reload(settings_dict.get("ONNX", False)):
         return "onnx_cuda"
     if settings_dict.get("Depth Backend"):
         return _normalize_depth_backend(settings_dict["Depth Backend"])
-    return "pytorch_cuda"
+    # No backend explicitly selected: "TensorRT: null" etc. are saved
+    # placeholders, not user choices. The runtime config defaults to "auto"
+    # (resolved per-platform, e.g. PyTorch MPS on macOS), so forcing the old
+    # "pytorch_cuda" fallback here would diverge from the runtime default and
+    # request a pipeline rebuild on every hot reload -- which kills the
+    # pipeline thread on the first frame. Return None (no change) instead.
+    return None
 
 
 def _add_runtime_quality_mode_if_changed(values: dict, settings_dict: dict, config) -> None:
@@ -255,6 +268,9 @@ def hot_reload_value_snapshot(settings_dict: dict, config) -> dict:
             min(10.0, float(settings_dict.get("Audio Delay", -0.1))),
         ),
     }
+    language = str(settings_dict.get("Language", "") or "").strip()
+    if language:
+        values["language"] = language
     _add_runtime_quality_mode_if_changed(values, settings_dict, config)
     _add_rebuild_fields_if_changed(values, settings_dict, config)
     if _is_fast_quality(settings_dict, config):

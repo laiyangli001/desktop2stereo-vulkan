@@ -194,6 +194,22 @@ def test_presenter_owned_vulkan_compute_declares_cuda_external_input_path():
     assert '"vulkan_zero_cpu_readback": True' in source
 
 
+def test_local_gpu_viewer_uses_common_external_buffer_path_for_cuda_and_rocm():
+    source = (
+        APP_ROOT
+        / "viewer"
+        / "vulkan_local_viewer.py"
+    ).read_text(encoding="utf-8")
+
+    assert "VulkanExportableBuffer" in source
+    assert "copy_tensor_to_buffer" in source
+    assert "vkCmdCopyBufferToImage" in source
+    assert '"ROCm" if is_rocm else "CUDA"' in source
+    assert "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT" in source
+    assert "memory_handle_type=rocm_handle_type" in source
+    assert "single_packed_blit" in source
+
+
 def test_vulkan_output_shader_decodes_srgb_before_unorm_store():
     shader = (
         APP_ROOT
@@ -206,6 +222,19 @@ def test_vulkan_output_shader_decodes_srgb_before_unorm_store():
     assert "output image is an UNORM storage image" in shader
     assert "float mask = screen_edge_suppressed" not in shader
     assert "if (found >= 1.0) return 1.0;" in shader
+
+
+def test_vulkan_stereo_shaders_clamp_displaced_edges_instead_of_reflecting():
+    shader_root = APP_ROOT / "shaders"
+    for name in (
+        "d2s_stereo_fused.comp",
+        "d2s_stereo_layered.comp",
+        "d2s_stereo_layered_output.comp",
+        "d2s_stereo_layered_tiled.comp",
+    ):
+        shader = (shader_root / name).read_text(encoding="utf-8")
+        assert "float clamp_coordinate" in shader
+        assert "reflect_coordinate" not in shader
 
 
 def test_vulkan_msdf_quad_shader_is_a_gpu_atlas_to_storage_image_pass():
@@ -577,4 +606,57 @@ def test_runtime_routes_quality_4k_to_vulkan_layered_backend(monkeypatch):
     assert result.debug_info["stereo_compute_backend"] == "vulkan"
     assert result.debug_info["vulkan_fused_backend"] == "vulkan_stereo_layered"
     assert result.debug_info["sbs_backend"] == "vulkan_layered_stereo"
+    runtime.close()
+
+
+def test_macos_advanced_stream_uses_canonical_stereo_synthesis(monkeypatch):
+    monkeypatch.setattr(runtime_module.sys, "platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_STREAM_CANONICAL_SYNTHESIS", "1")
+    monkeypatch.delenv("D2S_INTEL_VULKAN_SBS", raising=False)
+    monkeypatch.delenv("D2S_RUNTIME_OUTPUT_UINT8", raising=False)
+
+    config = StereoRuntimeConfig(
+        model_id="lc700x/Distill-Any-Depth-Base-hf",
+        stereo_quality="quality_4k",
+        stereo_compute_backend="auto",
+        output_format="half_sbs",
+        temporal=False,
+    )
+    runtime = StereoRuntime(config, depth_provider=_Provider(), collect_memory_stats=False)
+    vulkan_calls = []
+    synthesis_calls = []
+
+    def fake_vulkan(*args, **kwargs):
+        del kwargs
+        vulkan_calls.append(args)
+        rgb = args[0]
+        return (
+            StereoResult(
+                left_eye=rgb,
+                right_eye=rgb,
+                sbs=rgb,
+                debug_info={"sbs_backend": "vulkan_layered_stereo"},
+            ),
+            "used",
+        )
+
+    def fake_synthesize(rgb, depth, synthesis_config, temporal_state=None, sbs_only=False):
+        del depth, temporal_state, sbs_only
+        synthesis_calls.append(synthesis_config)
+        return StereoResult(
+            left_eye=rgb,
+            right_eye=rgb,
+            sbs=rgb,
+            debug_info={"sbs_backend": "canonical_synthesis"},
+        )
+
+    monkeypatch.setattr(runtime, "_try_vulkan_fused_stereo", fake_vulkan)
+    monkeypatch.setattr(runtime_module, "synthesize_stereo", fake_synthesize)
+
+    result = runtime.process_rgb_frame(torch.rand(1, 3, 8, 12))
+
+    assert not vulkan_calls
+    assert len(synthesis_calls) == 1
+    assert result.debug_info["sbs_backend"] == "canonical_synthesis"
+    assert result.debug_info["macos_stream_canonical_synthesis"] == 1
     runtime.close()

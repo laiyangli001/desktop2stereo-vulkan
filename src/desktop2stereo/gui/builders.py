@@ -71,7 +71,7 @@ class GUIBuilderMixin:
         txt = getattr(ctrl, "label", None) or getattr(ctrl, "value", None) or ""
         return sum(13 if ord(ch) > 127 else 7 for ch in str(txt)) + 28
 
-    def _fit_window_to_content(self, update=True, resize_window=False):
+    def _fit_window_to_content(self, update=True, resize_window=False, resize_height=True):
         main_width = self._estimate_main_panel_width()
         if getattr(self, "_main_panel", None) is not None:
             self._main_panel.width = main_width
@@ -89,14 +89,12 @@ class GUIBuilderMixin:
         self.page.window.max_width = None
         if resize_window:
             self.page.window.width = width
-            self.page.window.height = self._estimate_window_height()
+            if resize_height:
+                self.page.window.height = self._estimate_window_height()
             try:
                 self.page.window.update()
             except RuntimeError:
                 pass
-            # Keep the explicit width set: clearing it to None right after the
-            # first render lets the Flet client fall back to its own default /
-            # restored geometry, which drifts from the fitted hide/show widths.
         if update:
             self.page.update()
 
@@ -247,7 +245,7 @@ class GUIBuilderMixin:
         if visible_rows <= 0:
             return 0
         row_height = S(34)
-        row_spacing = getattr(content, "spacing", S(8)) or 0
+        row_spacing = getattr(content, "spacing", S(6)) or 0
         padding_v = S(24)
         border_v = 2
         margin_v = S(8) if include_margin else 0
@@ -256,7 +254,7 @@ class GUIBuilderMixin:
     def _estimate_window_height(self):
         if not getattr(self, "depth_group", None):
             return S(768)
-        scroll_spacing = getattr(getattr(self, "_scroll_area", None), "spacing", S(8)) or 0
+        scroll_spacing = getattr(getattr(self, "_scroll_area", None), "spacing", S(6)) or 0
         visible_sections = []
         for section in [self.lang_group, self.depth_group, self.device_group]:
             if section is not None and getattr(section, "visible", True):
@@ -269,7 +267,8 @@ class GUIBuilderMixin:
         # The footer contains a default-height Flet button row, the status row,
         # their spacing, and the footer's top padding.  S(58) only covered the
         # buttons and clipped the status row after the native window was fitted.
-        footer_height = S(104)
+        # Footer height (status bars + buttons outside scroll area)
+        footer_height = S(40)
         window_chrome = S(42)
         safety_margin = S(0)
         min_height = S(560)
@@ -292,11 +291,13 @@ class GUIBuilderMixin:
             self.acceleration_label, self.computing_device_label, self.capture_tool_label,
             self.target_fps_label, self.render_policy_label, self.render_fixed_label,
             self.render_min_dimension_label, self.run_mode_label, self.xr_headset_label,
+            self.openxr_render_resolution_label,
             self.stereo_output_label, self.controller_label, self.lang_label,
             self.stream_url_label, self.stream_port_label,
             self.stream_proto_label, self.audio_label, self.crf_label,
             self.video_backend_label,
             self.stream_calibration_label,
+            self.stream_display_fit_label,
             self.color_brightness_label, self.color_saturation_label,
             self.color_temperature_label, self.projection_min_lod_label,
             self.projection_mip_lod_bias_label,
@@ -670,6 +671,23 @@ class GUIBuilderMixin:
             value=str(DEFAULTS["Render Align"]), width=S(130))
         self.row6d = ft.Row([self.render_scale_label, self.render_scale_dd,
             ft.Container(width=S(40)), self.render_align_label, self.render_align_dd], spacing=1)
+        self.openxr_render_resolution_label = ft.Text(
+            "XR Render:", size=FONT_SIZE, width=S(130), visible=False
+        )
+        self.openxr_render_resolution_dd = CompactDropdown(
+            options=self._openxr_render_resolution_options(),
+            value=self._openxr_render_resolution_to_display(
+                DEFAULTS["XR Render"]
+            ),
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+        )
+        self.openxr_render_resolution_dd.visible = False
+        self.row6g = ft.Row(
+            [self.openxr_render_resolution_label, self.openxr_render_resolution_dd],
+            spacing=1,
+            visible=False,
+        )
         self.render_fixed_label = ft.Text("Render Fixed Size:", size=FONT_SIZE, width=S(130), visible=False)
         self.render_fixed_dd = CompactDropdown(
             options=["1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160"],
@@ -751,8 +769,14 @@ class GUIBuilderMixin:
             label="NvFRUC 补帧",
             tooltip=UI_MESSAGES[self.locale]["tooltip_nvfruc"],
         )
+        self.lsfg_cb = ft.Checkbox(
+            scale=SCALE,
+            visual_density=ft.VisualDensity.COMPACT,
+            label="LSFG Support",
+            tooltip=UI_MESSAGES[self.locale]["tooltip_lsfg"],
+        )
         self.row7a = ft.Row([
-            self.run_mode_label, self.run_mode_dd, self.lossless_cb,
+            self.run_mode_label, self.run_mode_dd, self.lossless_cb, self.lsfg_cb,
             ft.Container(width=S(40)), self.stream_settings_cb,
         ], spacing=1)
         self.xr_headset_row = ft.Row(
@@ -813,18 +837,18 @@ class GUIBuilderMixin:
             on_click=self.switch_to_gui2,
         )
         self.reset_btn = ft.Button(content=ft.Text("Reset", size=FONT_SIZE),
-            width=S(130), on_click=self.reset_defaults)
+            width=S(110), height=S(32), on_click=self.reset_defaults)
         self.stop_btn = ft.Button(content=ft.Text("Stop", size=FONT_SIZE),
-            width=S(130), on_click=self.stop_process)
+            width=S(110), height=S(32), on_click=self.stop_process)
         self.run_btn = ft.Button(content=ft.Text("Run", size=FONT_SIZE),
-            width=S(130), on_click=self.save_and_run, disabled=True)
+            width=S(110), height=S(32), on_click=self.save_and_run, disabled=True)
         lang_row = ft.Row([self.lang_label, self.lang_dd, ft.Container(width=S(40)),
             self.theme_label, self._theme_toggle_spacer, self.theme_dd], spacing=1)
 
-        self.status_text = ft.Text("", italic=True, size=FONT_SIZE)
+        self.status_text = ft.Text("", size=max(10, FONT_SIZE - 2))
         self.backend_status_text = ft.Text(
-            "", size=max(10, FONT_SIZE - 1), color=ft.Colors.GREY,
-            visible=False, no_wrap=True, overflow=ft.TextOverflow.VISIBLE,
+            "", size=10, color=ft.Colors.GREY,
+            visible=True, overflow=ft.TextOverflow.VISIBLE,
         )
         self.log_visibility_link = ft.Text(
             UI_MESSAGES[self.locale].get("Hide log panel link", "Hide log window ->"),
@@ -833,7 +857,7 @@ class GUIBuilderMixin:
         )
         self.log_visibility_link_box = ft.Container(
             content=self.log_visibility_link,
-            padding=ft.Padding(S(8), S(4), S(8), S(4)),
+            padding=ft.Padding(S(6), S(2), S(6), S(2)),
             on_click=self.on_log_visibility_link,
         )
 
@@ -841,32 +865,43 @@ class GUIBuilderMixin:
         depth_group = ft.Container(
             ft.Column([row0, row1, stereo_row0, hole_fill_row, advanced_stereo_row,
                        convergence_depth_row, depth_strength_row, row2b, stereo_row1, stereo_row3,
-                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4c], spacing=S(8)),
-            margin=ft.Margin(0, 0, 0, S(8)),
+                       stereo_row3b, stereo_row3c, stereo_row4, self.row4a, self.row4b, self.row4c], spacing=S(6)),
+            margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
+            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)))
+        self._build_streamer_rows()
+        # Device group is OUTSIDE the scroll area so it can stretch to fill the
+        # leftover height (like the log panel). Its own content scrolls when the
+        # window is shorter than the rows.
+        device_content = ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6g, self.row6e, self.row6f,
+                       self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9,
+                       self.stream_url_row], spacing=S(6), scroll=ft.ScrollMode.AUTO,
+                       tight=True)
         device_group = ft.Container(
-            ft.Column([row5, row6, color_row1, color_row2, color_row3, projection_lod_row, projection_sharpen_row, self.row6b, self.row6d, self.row6e, self.row6f,
-                       self.row7a, self.xr_headset_row, self.row7b, row8, self.row6c, self.row9], spacing=S(8)),
-            margin=ft.Margin(0, 0, 0, S(8)),
+            device_content,
+            margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
+            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)),
+            expand=True,
+        )
+        self.device_group = device_group
+
         lang_group = ft.Container(
-            ft.Column([lang_row], spacing=S(8)),
-            margin=ft.Margin(0, 0, 0, S(8)),
+            ft.Column([lang_row], spacing=S(6)),
+            margin=ft.Margin(0, 0, 0, S(6)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
-            border_radius=6, padding=ft.Padding(S(16), S(10), S(16), S(10)))
+            border_radius=6, padding=ft.Padding(S(14), S(8), S(14), S(8)))
         self.lang_group = lang_group
         self.depth_group = depth_group
-        self.device_group = device_group
-        self._build_streamer_rows()
 
-        scroll_area = ft.Column([
-            self.lang_group, self.depth_group, self.device_group, self.stream_container,
-        ], scroll=ft.ScrollMode.AUTO, expand=True, tight=True, spacing=S(8))
+        # Scrollable top section (small groups); device fills leftover below.
+        self._scroll_area = ft.Column([
+            self.lang_group, self.depth_group,
+        ], scroll=ft.ScrollMode.AUTO, tight=True, spacing=S(6),
+          alignment=ft.CrossAxisAlignment.START)
         self.log_level_dd = CompactDropdown(
             options=["ALL", "STATUS", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
             value="ALL",
@@ -892,8 +927,8 @@ class GUIBuilderMixin:
                 ft.Row([self.download_progress_title, ft.Container(expand=True), self.download_progress_percent]),
                 self.download_progress_bar,
                 self.download_progress_detail,
-            ], spacing=S(4)),
-            padding=ft.Padding(S(8), S(6), S(8), S(6)),
+            ], spacing=S(2)),
+            padding=ft.Padding(S(6), S(4), S(6), S(4)),
             bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
             border_radius=6,
             visible=False,
@@ -935,10 +970,13 @@ class GUIBuilderMixin:
                 ], spacing=S(6), vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 self.download_progress_panel,
                 self.log_body,
-            ], spacing=S(6), expand=True),
+            ], spacing=S(4), expand=True),
             visible=False,
             expand=True,
-            padding=ft.Padding(S(10), S(10), S(10), S(10)),
+            # Match the Computing Device group's bottom inset so both panel
+            # borders end on the same horizontal line in the stretched row.
+            margin=ft.Margin(0, 0, 0, S(6)),
+            padding=ft.Padding(S(8), S(6), S(8), S(6)),
             bgcolor=ft.Colors.SURFACE_CONTAINER,
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
@@ -952,32 +990,55 @@ class GUIBuilderMixin:
         self._btn_bar = ft.Container(content=btn_row)
         self._status_bar = ft.Row([
             ft.Container(content=self.status_text, bgcolor=ft.Colors.SURFACE_CONTAINER,
-                         border_radius=0, padding=ft.Padding(S(8), S(4), S(8), S(4)), expand=True),
+                         border_radius=0, padding=ft.Padding(S(6), S(2), S(6), S(2)), expand=True),
             self.log_visibility_link_box])
         self._backend_status_bar = ft.Container(
             content=self.backend_status_text,
-            bgcolor=ft.Colors.SURFACE_CONTAINER,
-            padding=ft.Padding(S(8), S(3), S(8), S(3)),
-            visible=False,
+            padding=ft.Padding(S(6), S(2), S(6), S(2)),
+            visible=True,
+            expand=True,
         )
-        footer = ft.Container(
-            ft.Column([self._btn_bar, self._status_bar, self._backend_status_bar], spacing=S(6)),
-            padding=ft.Padding(0, S(6), 0, 0))
-        scroll_area.controls.append(footer)
-        self._scroll_area = scroll_area
-        self._footer = footer
+        # Footer: status bar and backend status only (buttons moved outside scroll)
+        # Main column: scrollable top (lang/depth) + filling device group +
+        # conditional streamer box — device expands into leftover height.
+        main_col = ft.Column([
+            self._scroll_area,
+            self.device_group,
+            self.stream_container,
+        ], spacing=0, tight=False, expand=True)
         self._main_panel = ft.Container(
-            content=scroll_area,
-            expand=False,
+            content=main_col,
+            expand=True,
         )
+        # Create a Column with main content and fixed buttons at bottom (floated)
         self._root_row = ft.Row(
             [self._main_panel, self.log_panel],
             expand=True,
-            tight=True,
-            spacing=S(10),
+            tight=False,
+            spacing=S(8),
             vertical_alignment=ft.CrossAxisAlignment.STRETCH,
         )
-        page.add(self._root_row)
+        # Status bars outside scrollable region
+        self._status_bar_contain = ft.Container(
+            ft.Column([self._status_bar, self._backend_status_bar], spacing=0),
+            padding=0,
+        )
+        # Buttons fixed at bottom, outside scroll area - right aligned with log panel
+        self._btn_container = ft.Container(
+            content=self._btn_bar,
+            padding=ft.Padding(S(4), S(1), S(4), S(1)),
+            alignment=ft.alignment.Alignment(1, 0),  # right-center
+        )
+        # Gap between log panel and status
+        self._log_status_gap = ft.Container(height=S(4))
+        # Content with status bars and buttons outside scroll area
+        self._content_with_buttons = ft.Column(
+            [self._root_row, self._log_status_gap, self._status_bar_contain, self._btn_container],
+            spacing=0,
+            expand=True,
+            tight=False,
+        )
+        page.add(self._content_with_buttons)
 
     # ── streamer rows ──
 
@@ -1011,7 +1072,8 @@ class GUIBuilderMixin:
         self.stream_proto_row = ft.Row([self.stream_proto_label, self.stream_proto_dd,
             ft.Container(width=S(40)), self.stream_key_label, self.stream_key_tf], spacing=1)
         self.audio_label = ft.Text("Stereo Mix:", size=FONT_SIZE, width=S(150))
-        self.audio_dd = CompactDropdown(options=[], min_width=S(130))
+        self.audio_dd = CompactDropdown(options=[], min_width=S(130),
+            on_select=self.on_audio_device_change)
         self.audio_row = ft.Row([self.audio_label, self.audio_dd], spacing=1)
         self.video_backend_label = ft.Text(
             UI_MESSAGES[self.locale]["Video Encoder:"], size=FONT_SIZE, width=S(150)
@@ -1033,7 +1095,7 @@ class GUIBuilderMixin:
             width=S(130),
         )
         self.stream_calibration_btn = ft.Button(
-            content=ft.Text("Start Calibration", size=FONT_SIZE),
+            content=ft.Text("Calibrate", size=FONT_SIZE),
             width=S(130),
             on_click=self.start_stream_calibration,
         )
@@ -1081,17 +1143,28 @@ class GUIBuilderMixin:
             on_change=self.on_audio_delay_change, filter=r"[0-9\-\.]", max_length=6)
         self.crf_row = ft.Row([self.crf_label, self.crf_tf, ft.Container(width=S(40)),
             self.audio_delay_label, self.audio_delay_tf], spacing=1)
+        fit_tooltip = UI_MESSAGES[self.locale]["tooltip_display_fit"]
+        self.stream_display_fit_label = ft.Text("Stream Fit:", size=FONT_SIZE, width=S(150), tooltip=fit_tooltip)
+        self.stream_display_fit_dd = CompactDropdown(
+            options=self._display_fit_options(),
+            value=self._display_fit_to_display("contain"),
+            width=S(130),
+            on_select=self.on_stereo_hot_param_change,
+            tooltip=fit_tooltip,
+        )
+        self.stream_fit_row = ft.Row([self.stream_display_fit_label, self.stream_display_fit_dd], spacing=1)
         self._streamer_rows = [
-            self.stream_url_row, self.stream_port_quality_row, self.stream_proto_row,
+            self.stream_port_quality_row, self.stream_proto_row,
             self.crf_row, self.audio_row, self.video_backend_row,
+            self.stream_fit_row,
             self.stream_calibration_row,
             self.stream_calibration_warning_row,
             self.stream_calibration_result_row,
             self.stream_calibration_recalibrate_hint_row,
         ]
         self.stream_container = ft.Container(
-            ft.Column([], spacing=S(8)), visible=False,
-            padding=ft.Padding(S(16), S(10), S(16), S(10)),
+            ft.Column([], spacing=S(6)), visible=False,
+            padding=ft.Padding(S(14), S(8), S(14), S(8)),
             border=ft.Border(ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE),
                              ft.BorderSide(1, ft.Colors.OUTLINE), ft.BorderSide(1, ft.Colors.OUTLINE)),
             border_radius=6)
@@ -1133,7 +1206,7 @@ class GUIBuilderMixin:
             display_number = mon["display_number"]
             is_primary = capture_index == primary_index
             suffix = PRIMARY_MONITOR_SUFFIX if is_primary else ""
-            display_name = mon.get("model") or mon.get("name")
+            display_name = mon.get("model") or mon.get("name") or ""
             if display_name:
                 label = f"{display_number}: {display_name} {mon['width']}x{mon['height']}{suffix}"
             else:

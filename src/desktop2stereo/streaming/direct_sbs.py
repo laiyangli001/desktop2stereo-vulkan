@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Tuple
 from urllib.parse import quote
 from urllib.request import urlopen
 
@@ -30,6 +30,12 @@ from streaming.wasapi_audio import SoundcardLoopbackSender
 from streaming.vulkan_capabilities import probe_vulkan_video
 from streaming.vulkan_bridge import VulkanNativeBridge
 from streaming.opengl_stream_backend import OpenGLFallbackBackend
+from streaming.aspect import (
+    apply_aspect_on_cpu,
+    apply_aspect_on_gpu,
+    normalize_display_fit_mode,
+    transport_canvas_size,
+)
 
 
 _PYNVVIDEO_CODEC = None
@@ -66,13 +72,262 @@ def _load_pynvvideo_codec() -> Any | None:
         return None
 
 
+def _kill_process_on_port(port: int, proto: str = "tcp") -> None:
+    """Kill process occupying given port (best-effort, Windows)."""
+    try:
+        # Use netstat to find PID
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
+        proto_flag = "-p tcp" if proto == "tcp" else "-p udp"
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=3.0, creationflags=creationflags,
+        )
+        target = f":{port}"
+        for line in result.stdout.splitlines():
+            if target not in line:
+                continue
+            # Filter by proto
+            if proto == "tcp" and "TCP" not in line:
+                continue
+            if proto == "udp" and "UDP" not in line:
+                continue
+            parts = line.strip().split()
+            if not parts:
+                continue
+            pid = parts[-1]
+            if not pid.isdigit():
+                continue
+            if int(pid) <= 4:
+                continue
+            # The MJPEG server binds its port in the streamer constructor, so
+            # netstat may list OUR OWN pid on this port. Never kill self.
+            if int(pid) == os.getpid():
+                continue
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0, creationflags=creationflags)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _kill_orphan_mediamtx_processes(ports: list[int] | None = None) -> None:
+    """Kill orphan MediaMTX / FFmpeg processes that hold streaming ports."""
+    if ports is None:
+        ports = [9998, 9997, 9999, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890]
+    # 1) Kill by image name (fast path) - only mediamtx/ffmpeg under streaming rtmp
+    for img in ["mediamtx.exe", "ffmpeg.exe"]:
+        try:
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
+            # Use tasklist to check existence first to reduce noise
+            subprocess.run(["taskkill", "/F", "/IM", img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3.0, creationflags=creationflags)
+        except Exception:
+            pass
+    # 2) Kill by port for cases where exe renamed or multiple versions
+    for p in ports:
+        # try tcp and udp both for 8000/8189 which use udp
+        for proto in ("tcp", "udp"):
+            _kill_process_on_port(p, proto)
+    # give OS time to release
+    time.sleep(0.15)
+
+
+def _darwin_safe_mediamtx_config(config_path: Path) -> Path:
+    """Return a runtime-generated MediaMTX config that runs on macOS.
+
+    MediaMTX sets udpReadBufferSize via a socket option that is unimplemented
+    on macOS; any non-zero value makes it abort at startup ("read buffer size
+    is unimplemented on the current operating system") and close every
+    listener. Rewrite it to the OS default (0) in a sibling file and point the
+    launch at that copy. Windows/Linux configs are untouched.
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return config_path
+    if re.search(r"(?m)^udpReadBufferSize:\s*[1-9]", text) is None:
+        return config_path  # already at the OS default
+    patched = re.sub(
+        r"(?m)^(udpReadBufferSize:\s*)[0-9]+",
+        r"\g<1>0",
+        text,
+    )
+    target = config_path.with_name("mediamtx.macos.yml")
+    try:
+        target.write_text(patched, encoding="utf-8")
+    except OSError:
+        return config_path
+    return target
+
+
+def _list_darwin_audio_devices(ffmpeg_path: Path) -> list[tuple[int, str]]:
+    """Return ``(index, name)`` pairs for every AVFoundation audio device.
+
+    Runs ``ffmpeg -f avfoundation -list_devices true -i ""`` (the reference
+    v2.5.0 macOS discovery command) and parses the stderr device listing.
+    macOS only; returns [] on any error.
+    """
+    try:
+        result = subprocess.run(
+            [
+                str(ffmpeg_path),
+                "-f",
+                "avfoundation",
+                "-list_devices",
+                "true",
+                "-i",
+                "",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    output = result.stderr or ""
+    in_audio = False
+    devices: list[tuple[int, str]] = []
+    for line in output.splitlines():
+        if "AVFoundation audio devices:" in line:
+            in_audio = True
+            continue
+        if "AVFoundation video devices:" in line:
+            in_audio = False
+            continue
+        if in_audio:
+            match = re.search(r"\[(\d+)\]\s*(.+)", line)
+            if match:
+                devices.append((int(match.group(1)), match.group(2).strip()))
+    return devices
+
+
+def _windows_lan_ipv4s() -> list[str]:
+    """Return this PC's connected, non-virtual IPv4 addresses.
+
+    Used to restrict MediaMTX WebRTC ICE candidates to real NICs. MediaMTX
+    advertises every interface IP by default; WSL/Hyper-V vEthernet adapters
+    (e.g. 192.168.64.x) then appear as candidates that remote LAN clients
+    cannot reach, causing connections to drop every few seconds and audio to
+    never arrive. Querying Get-NetAdapter (Status=Up, Virtual=False) yields
+    exactly the reachable LAN addresses. Windows only; returns [] on failure
+    so callers keep the default (advertise all interfaces).
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and "
+                "$_.Virtual -eq $false } | ForEach-Object { "
+                "(Get-NetIPAddress -InterfaceIndex $_.ifIndex "
+                "-AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress }",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=4,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ips = []
+    for line in (result.stdout or "").splitlines():
+        ip = line.strip()
+        if not ip or ip.startswith(("127.", "169.254.")):
+            continue
+        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+            continue
+        ips.append(ip)
+    return ips
+
+
+def _darwin_loopback_routing_hint(device: str) -> str:
+    """Return macOS loopback routing guidance for a virtual capture device.
+
+    macOS has no ffmpeg-native system-audio loopback (unlike Windows WASAPI
+    "Stereo Mix" or Linux PulseAudio monitors): system sound only reaches a
+    virtual input device (BlackHole, Soundflower, app loopbacks such as
+    Virtual Desktop Speakers) when the Mac's output is routed to it. Returns
+    "" for devices that are not loopback-style.
+    """
+    lowered = device.casefold()
+    if not any(
+        token in lowered
+        for token in ("blackhole", "loopback", "soundflower", "virtual")
+    ):
+        return ""
+    return (
+        "macOS has no native system-audio loopback: this virtual device only "
+        "captures what is routed to it. Set the Mac's output to BlackHole (or "
+        "a Multi-Output device of speakers + BlackHole) in System Settings > "
+        "Sound > Output, then start this stream again."
+    )
+
+
+def _auto_select_darwin_audio(ffmpeg_path: Path) -> str:
+    """Pick an AVFoundation audio device for loopback capture on macOS.
+
+    Returns the index of the first audio device, preferring loopback-style
+    names (BlackHole / Loopback / Virtual / Stereo Mix) so the stream always
+    carries sound even when no Stereo Mix device was configured. Returns ""
+    when no audio device exists.
+    """
+    devices = _list_darwin_audio_devices(ffmpeg_path)
+    for index, name in devices:
+        lowered = name.lower()
+        if any(
+            token in lowered
+            for token in ("blackhole", "loopback", "virtual", "stereo mix")
+        ):
+            return str(index)
+    return str(devices[0][0]) if devices else ""
+
+
+def _required_h264_level(width: int, height: int, fps: int) -> float:
+    """Return the smallest H.264 level supporting width x height @ fps.
+
+    The encoder's auto-selected level only accounts for resolution, not the
+    frame rate: AMF picks level 5.1 for 4K, but level 5.1 caps 4K at ~30 fps
+    (MaxMBPS 983,040 / 32,400 MB per frame). At 4K@40 that SPS is invalid, so
+    browser WebRTC decoders reject the stream (black frame) even though RTP
+    flows. Compute the level from the actual MB/s load instead:
+    MaxMBPS per level (H.264 Table A-1) -> smallest level whose budget fits.
+    """
+    macroblocks_per_frame = max(1, math.ceil(width / 16)) * max(
+        1, math.ceil(height / 16)
+    )
+    required_mbps = macroblocks_per_frame * max(1, int(fps))
+    # (level, MaxMBPS) pairs from the H.264 spec.
+    level_budgets = [
+        (1.0, 1485), (1.1, 3000), (1.2, 6000), (1.3, 11880),
+        (2.0, 11880), (2.1, 19800), (2.2, 20250),
+        (3.0, 40500), (3.1, 108000), (3.2, 216000),
+        (4.0, 245760), (4.1, 245760), (4.2, 522240),
+        (5.0, 589824), (5.1, 983040), (5.2, 2073600),
+        (6.0, 4177920), (6.1, 8355840), (6.2, 16711680),
+    ]
+    for level, budget in level_budgets:
+        if required_mbps <= budget:
+            return level
+    return 6.2
+
+
+def _format_h264_level(level: float) -> str:
+    """Format a numeric H.264 level (e.g. 5.2) as FFmpeg expects ("5.2")."""
+    return f"{level:g}"
+
+
 def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
     """Convert a packed SBS runtime tensor/array to contiguous RGB8 HWC."""
     frame = getattr(frame_or_result, "sbs", frame_or_result)
     if frame is None:
         raise ValueError("runtime result does not contain an SBS frame")
     image = frame.detach() if hasattr(frame, "detach") else frame
-    if bool(getattr(image, "is_cuda", False)):
+    # Accelerator tensors (CUDA, MPS, ...) must be copied to host memory
+    # before numpy conversion; an is_cuda-only check lets MPS frames through
+    # and numpy raises "can't convert mps:0 device type tensor to numpy".
+    if hasattr(image, "device") and getattr(image.device, "type", "cpu") != "cpu":
         image = image.cpu()
     if hasattr(image, "numpy"):
         image = image.numpy()
@@ -97,8 +352,18 @@ def runtime_sbs_to_rgb(frame_or_result: Any) -> np.ndarray:
 class RuntimeSbsRgbConverter:
     """Convert runtime SBS frames with a reusable pinned CUDA download buffer."""
 
-    def __init__(self, *, copy_output: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        copy_output: bool = False,
+        display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
+    ) -> None:
         self.copy_output = bool(copy_output)
+        self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
         self._host_rgb = None
 
     def convert(self, frame_or_result: Any) -> np.ndarray:
@@ -106,9 +371,82 @@ class RuntimeSbsRgbConverter:
         if frame is None:
             raise ValueError("runtime result does not contain an SBS frame")
         image = frame.detach() if hasattr(frame, "detach") else frame
-        if not bool(getattr(image, "is_cuda", False)):
-            return runtime_sbs_to_rgb(image)
-        return self._cuda_to_rgb(image)
+        is_cuda = bool(getattr(image, "is_cuda", False))
+        # Determine source size before any conversion for aspect handling
+        # image may be [1,3,H,W] or [H,W,3] or [3,H,W]
+        def _hw_of(t):
+            if t.ndim == 4:
+                if int(t.shape[1]) in (1, 3, 4):
+                    return int(t.shape[-2]), int(t.shape[-1])  # B,C,H,W
+                return int(t.shape[-3]), int(t.shape[-2])  # B,H,W,C
+            if t.ndim == 3:
+                if int(t.shape[0]) in (1, 3, 4):
+                    return int(t.shape[-2]), int(t.shape[-1])  # C,H,W
+                return int(t.shape[0]), int(t.shape[1])  # H,W,C
+            return 0, 0
+        h, w = _hw_of(image)
+        # Transport canvas mirrors local viewer presentation / legacy
+        # fill_16_9: contain pads each eye to a 16:9 canvas before packing;
+        # cover/stretch keep the original input aspect.
+        tw, th = transport_canvas_size(
+            (w, h),
+            self.fit_mode,
+            input_size=self.input_size,
+            display_mode=self.display_mode,
+        )
+        process_aspect = normalize_display_fit_mode(self.fit_mode) == "contain"
+        # For GPU path, keep on GPU and apply per-eye aspect before download.
+        # The 16:9 canvas processing is GPU-mandatory for CUDA frames: a
+        # failure must surface, never silently degrade to a CPU download that
+        # is both slower and skips the aspect requirement.
+        if is_cuda:
+            if process_aspect:
+                # Keep aspect on GPU: convert to HWC uint8 CUDA first, apply, then download
+                import torch
+                gpu_img = image
+                # Normalize to HWC uint8 CUDA for aspect func
+                if gpu_img.ndim == 4:
+                    gpu_img = gpu_img[0]
+                if gpu_img.ndim == 3 and int(gpu_img.shape[0]) in (1, 3, 4):
+                    gpu_img = gpu_img.permute(1, 2, 0)
+                if gpu_img.shape[-1] == 4:
+                    gpu_img = gpu_img[..., :3]
+                if gpu_img.shape[-1] == 1:
+                    gpu_img = gpu_img.expand(-1, -1, 3)
+                if gpu_img.dtype != torch.uint8:
+                    gpu_img = gpu_img.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+                gpu_img = gpu_img.contiguous()
+                processed = apply_aspect_on_gpu(
+                    gpu_img,
+                    source_size=(w, h),
+                    target_size=(tw, th),
+                    fit_mode=self.fit_mode,
+                    display_mode=self.display_mode,
+                    input_size=self.input_size,
+                )
+                # download processed
+                if self._host_rgb is None or tuple(self._host_rgb.shape) != tuple(processed.shape):
+                    self._host_rgb = torch.empty(tuple(processed.shape), dtype=torch.uint8, device="cpu", pin_memory=True)
+                self._host_rgb.copy_(processed, non_blocking=True)
+                torch.cuda.current_stream(device=processed.device).synchronize()
+                result = self._host_rgb.numpy()
+                return result.copy() if self.copy_output else result
+            # No aspect required (cover/stretch): plain CUDA -> RGB download.
+            return self._cuda_to_rgb(image)
+        # CPU path: use aspect module for consistent letterbox/crop/stretch (mirrors local viewer)
+        rgb = runtime_sbs_to_rgb(image)
+        h2, w2 = rgb.shape[0], rgb.shape[1]
+        if not process_aspect:
+            return rgb
+        # Use same aspect logic as local viewer: input_size is tex_w,tex_h
+        return apply_aspect_on_cpu(
+            rgb,
+            source_size=(w2, h2),
+            target_size=(tw, th),
+            fit_mode=self.fit_mode,
+            display_mode=self.display_mode,
+            input_size=self.input_size,
+        )
 
     def _cuda_to_rgb(self, image) -> np.ndarray:
         import torch
@@ -187,9 +525,102 @@ class DirectSbsOutputConsumer:
         self._fps_submitted_frames = 0
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
+        self._fps_native_pack_seconds = 0.0
+        # Pass aspect config to converter for CPU fallback path
         self._frame_converter = RuntimeSbsRgbConverter(
-            copy_output=not bool(getattr(output, "synchronous_submit", False))
+            copy_output=not bool(getattr(output, "synchronous_submit", False)),
+            display_mode=getattr(output, "display_mode", "Half-SBS"),
+            fit_mode=getattr(output, "fit_mode", "contain"),
+            input_size=getattr(output, "input_size", None),
         )
+
+    def _apply_cuda_aspect(self, frame: Any) -> Any:
+        """Pad a CUDA frame into the 16:9 transport canvas (contain only).
+
+        The letterboxing runs entirely on the GPU (torch resize + blit into a
+        device canvas), so CUDA paths stay zero-copy with respect to the host:
+        the padded tensor is handed straight to the GPU encoder.
+        """
+        from streaming.aspect import apply_aspect_on_gpu, transport_canvas_size
+
+        if frame.ndim == 4:
+            h, w = int(frame.shape[-2]), int(frame.shape[-1])
+        elif frame.ndim == 3 and int(frame.shape[0]) in (1, 3, 4) and int(frame.shape[-1]) not in (1, 3, 4):
+            h, w = int(frame.shape[-2]), int(frame.shape[-1])
+        else:
+            h, w = int(frame.shape[0]), int(frame.shape[1])
+        tw, th = transport_canvas_size(
+            (w, h),
+            "contain",
+            input_size=getattr(self.output, "input_size", None),
+            display_mode=getattr(self.output, "display_mode", "Half-SBS"),
+        )
+        if (tw, th) == (w, h):
+            return frame
+        return apply_aspect_on_gpu(
+            frame,
+            source_size=(w, h),
+            target_size=(tw, th),
+            fit_mode="contain",
+            display_mode=getattr(self.output, "display_mode", "Half-SBS"),
+            input_size=getattr(self.output, "input_size", None),
+        )
+
+    def _frame_letterbox_required(self, runtime_result: Any) -> bool:
+        """Return whether this frame must be padded into the 16:9 canvas.
+
+        Only the contain ("keep ratio complete") fit mode pads each eye to
+        16:9, and only when the input aspect ratio is not already 16:9 (legacy
+        ``fill_16_9`` semantics). Native GPU surface paths (Intel D3D11/oneVPL
+        final-SBS and the deferred Vulkan compose) present the packed SBS at
+        its native aspect and cannot letterbox, so the consumer must bypass
+        them when this is required. The per-eye size is always taken from the
+        actual frame (eyes, native surface, or packed sbs) so the gate can
+        never disagree with the frame-derived transport canvas; the configured
+        ``input_size`` is only a last resort.
+        """
+        if normalize_display_fit_mode(getattr(self.output, "fit_mode", "contain")) != "contain":
+            return False
+        from streaming.aspect import _input_eye_size, input_needs_16_9_canvas
+
+        left_eye = getattr(runtime_result, "left_eye", None)
+        if left_eye is not None and getattr(left_eye, "width", 0) and getattr(left_eye, "height", 0):
+            return input_needs_16_9_canvas(
+                (int(left_eye.width), int(left_eye.height))
+            )
+        native_surface = getattr(runtime_result, "native_final_sbs_surface", None)
+        if native_surface is not None and getattr(native_surface, "width", 0) and getattr(native_surface, "height", 0):
+            # The surface is the actual packed SBS this frame would send; derive
+            # the per-eye size from it directly so the gate reflects the frame.
+            sw, sh = int(native_surface.width), int(native_surface.height)
+            eye_size = _input_eye_size(
+                (sw, sh),
+                getattr(self.output, "display_mode", "Half-SBS"),
+                None,
+            )
+            return input_needs_16_9_canvas(eye_size)
+        sbs = getattr(runtime_result, "sbs", None)
+        if sbs is not None and getattr(sbs, "shape", None):
+            from streaming.aspect import frame_hw
+
+            h, w = frame_hw(sbs)
+            if h > 0 and w > 0:
+                eye_size = _input_eye_size(
+                    (w, h),
+                    getattr(self.output, "display_mode", "Half-SBS"),
+                    None,
+                )
+                return input_needs_16_9_canvas(eye_size)
+        input_size = getattr(self.output, "input_size", None)
+        if input_size is None:
+            return False
+        try:
+            eye_size = (int(input_size[0]), int(input_size[1]))
+        except (TypeError, ValueError):
+            return False
+        if eye_size[0] <= 0 or eye_size[1] <= 0:
+            return False
+        return input_needs_16_9_canvas(eye_size)
 
     def _take_latest(self):
         try:
@@ -222,6 +653,11 @@ class DirectSbsOutputConsumer:
             if self._fps_submitted_frames
             else 0.0
         )
+        native_pack_ms = (
+            self._fps_native_pack_seconds * 1000.0 / self._fps_sbs_frames
+            if self._fps_sbs_frames
+            else 0.0
+        )
         if self.on_sbs_fps is not None:
             self.on_sbs_fps(sbs_fps, frame_count=self._fps_sbs_frames)
         observe_calibration = getattr(self.output, "observe_calibration_window", None)
@@ -245,13 +681,15 @@ class DirectSbsOutputConsumer:
                 f"[DirectSbsStream] SBS FPS: {sbs_fps:.1f} "
                 f"network_bitrate={network_bitrate:.1f} Mbps "
                 f"submitted={submitted_fps:.1f} "
-                f"convert_ms={convert_ms:.1f} submit_ms={submit_ms:.1f}",
+                f"convert_ms={convert_ms:.1f} submit_ms={submit_ms:.1f} "
+                f"native_pack_ms={native_pack_ms:.1f}",
                 flush=True,
             )
         self._fps_sbs_frames = 0
         self._fps_submitted_frames = 0
         self._fps_convert_seconds = 0.0
         self._fps_submit_seconds = 0.0
+        self._fps_native_pack_seconds = 0.0
         self._fps_started = now
 
     def run(self) -> None:
@@ -259,13 +697,17 @@ class DirectSbsOutputConsumer:
             item = self._take_latest()
             if item is None:
                 continue
+            native_stream_frame = None
             try:
                 runtime_result, _capture_timestamp = item
                 self._fps_sbs_frames += 1
+                native_stream_frame = getattr(runtime_result, "native_stream_frame", None)
                 prepare_calibration = getattr(
                     self.output, "prepare_calibration_source", None
                 )
                 if callable(prepare_calibration) and prepare_calibration(runtime_result):
+                    if native_stream_frame is not None:
+                        native_stream_frame.release()
                     self._fps_submitted_frames += 1
                     self.source_stat_inc("runtime_output_frames")
                     self.source_stat_inc("network_stream_frames")
@@ -273,11 +715,87 @@ class DirectSbsOutputConsumer:
                     continue
                 should_submit = getattr(self.output, "should_submit_frame", None)
                 if callable(should_submit) and not should_submit(self._clock()):
+                    if native_stream_frame is not None:
+                        native_stream_frame.release()
                     self._report_fps_if_due()
                     continue
+                if native_stream_frame is not None:
+                    # Native CoreML prediction runs on the pipeline thread;
+                    # keep the expensive Metal warp on this independent output
+                    # thread so the next depth prediction can use another
+                    # native ring slot concurrently.
+                    import numpy as np
+
+                    target_size = getattr(runtime_result, "output_display_size", None)
+                    if not isinstance(target_size, (tuple, list)) or len(target_size) != 2:
+                        raise RuntimeError("native stream result has no output size")
+                    target_width, target_height = (
+                        int(target_size[0]),
+                        int(target_size[1]),
+                    )
+                    if target_width <= 0 or target_height <= 0:
+                        raise RuntimeError("native stream result has an invalid output size")
+                    output_format = str(
+                        getattr(runtime_result, "output_format", "half_sbs")
+                        or "half_sbs"
+                    )
+                    output = bytearray(target_width * target_height * 3)
+                    pack_started = self._clock()
+                    try:
+                        native_stream_frame.pack(
+                            output,
+                            (target_width, target_height),
+                            output_format,
+                            rgb=True,
+                        )
+                        packed = np.frombuffer(output, dtype=np.uint8).reshape(
+                            target_height, target_width, 3
+                        )
+                    except Exception:
+                        native_stream_frame.release()
+                        native_stream_frame = None
+                        self.source_stat_inc("native_stream_pack_error")
+                        fallback = getattr(runtime_result, "native_stream_fallback", None)
+                        if not callable(fallback):
+                            raise
+                        self.source_stat_inc("native_stream_fallback")
+                        runtime_result = fallback()
+                    else:
+                        self._fps_native_pack_seconds += self._clock() - pack_started
+                        native_stream_frame.release()
+                        native_stream_frame = None
+                        object.__setattr__(runtime_result, "native_stream_frame", None)
+                        object.__setattr__(runtime_result, "sbs", packed)
+                        object.__setattr__(runtime_result, "output_dtype", "uint8")
+                        timing = getattr(runtime_result, "timing", None)
+                        if isinstance(timing, dict):
+                            timing["native_coreml_stream_pack_ms"] = (
+                                self._clock() - pack_started
+                            ) * 1000.0
+                            timing["pack_ms"] = timing["native_coreml_stream_pack_ms"]
+                # Native GPU surface paths (Intel D3D11/oneVPL final-SBS and the
+                # deferred Vulkan compose) present the packed SBS at its native
+                # aspect and cannot letterbox into the 16:9 transport canvas.
+                # When the input aspect ratio is not 16:9 (contain fit mode),
+                # bypass them so this frame goes through the aspect-aware
+                # CUDA/CPU paths below. The CUDA path keeps the letterboxing on
+                # the GPU (zero host round trip) as the first priority.
+                letterbox_required = self._frame_letterbox_required(runtime_result)
+                if letterbox_required and not getattr(self, "_letterbox_notice", False):
+                    self._letterbox_notice = True
+                    print(
+                        "[DirectSbsStream] Non-16:9 input: native GPU surface "
+                        "paths bypassed; frames are padded into a 16:9 "
+                        "transport canvas (legacy fill_16_9)",
+                        flush=True,
+                    )
                 submit_vulkan_stereo = getattr(
-                    self.output, "submit_vulkan_stereo_frame", None
+                    self.output,
+                    "submit_vulkan_stereo_frame",
+                    None,
                 )
+                if letterbox_required:
+                    submit_vulkan_stereo = None
                 left_eye = getattr(runtime_result, "left_eye", None)
                 right_eye = getattr(runtime_result, "right_eye", None)
                 if callable(submit_vulkan_stereo) and getattr(
@@ -310,6 +828,8 @@ class DirectSbsOutputConsumer:
                 submit_native_surface = getattr(
                     self.output, "submit_native_d3d11_surface", None
                 )
+                if letterbox_required:
+                    submit_native_surface = None
                 if native_surface is not None and callable(submit_native_surface):
                     handled = submit_native_surface(native_surface)
                     if handled is False:
@@ -332,6 +852,20 @@ class DirectSbsOutputConsumer:
                 if callable(submit_cuda_frame) and bool(
                     getattr(cuda_frame, "is_cuda", False)
                 ):
+                    # GPU zerocopy paths skip RuntimeSbsRgbConverter, so apply the
+                    # same aspect rule here: contain letterboxes into a 16:9
+                    # transport canvas, cover/stretch pass the frame through.
+                    if (
+                        normalize_display_fit_mode(
+                            getattr(self.output, "fit_mode", "contain")
+                        )
+                        == "contain"
+                        # MJPEG applies aspect inside its encoder loop.
+                        and not isinstance(self.output, MjpegDirectSbsOutput)
+                    ):
+                        # GPU letterboxing is mandatory for CUDA frames (never a
+                        # silent CPU fallback); a failure must surface.
+                        cuda_frame = self._apply_cuda_aspect(cuda_frame)
                     convert_started = self._clock()
                     submit_cuda_frame(cuda_frame)
                     self._fps_submit_seconds += self._clock() - convert_started
@@ -347,6 +881,11 @@ class DirectSbsOutputConsumer:
                 self.source_stat_inc("network_stream_frames")
                 self._report_fps_if_due()
             except Exception as exc:
+                if native_stream_frame is not None:
+                    try:
+                        native_stream_frame.release()
+                    except Exception:
+                        pass
                 self.source_stat_inc(
                     "network_stream_errors",
                     last_error=f"{type(exc).__name__}: {exc}",
@@ -604,21 +1143,99 @@ class _PyNvDirectSbsOutputMixin:
 
 
 class MjpegDirectSbsOutput:
-    def __init__(self, *, port: int, fps: int, quality: int) -> None:
+    """
+    MJPEG streaming output with probe-first rate selection and GPU zerocopy aspect processing.
+    Mirrors FfmpegDirectSbsOutput rate calibration logic for consistent behavior.
+    """
+    synchronous_submit = False
+
+    def __init__(
+        self,
+        *,
+        port: int,
+        fps: int,
+        quality: int,
+        display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
+        on_stream_fps_selected: Callable[[int], Any] | None = None,
+    ) -> None:
+        self.port = max(1, int(port))
+        self.requested_fps = max(1, int(fps))
+        self.fps = self.requested_fps
+        self.quality = max(1, min(100, int(quality)))
+        self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
+        self._on_stream_fps_selected = on_stream_fps_selected
+
         profile = EncoderProfile(
             codec="mjpeg",
-            quality=quality,
-            target_fps=fps,
+            quality=self.quality,
+            target_fps=self.requested_fps,
             pixel_format="rgb",
         )
-        self.streamer = MJPEGStreamer(port=int(port), profile=profile)
+        self.streamer = MJPEGStreamer(
+            port=self.port,
+            profile=profile,
+            display_mode=self.display_mode,
+            fit_mode=self.fit_mode,
+            input_size=self.input_size,
+        )
 
     def start(self) -> None:
+        # Kill orphan MediaMTX / streaming ports from previous run (esp. when switching modes)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189])
+        except Exception:
+            pass
         self.streamer.start()
         print("[DirectSbsStream] MJPEG consumes packed SBS frames directly", flush=True)
 
     def submit_frame(self, frame: np.ndarray) -> None:
         self.streamer.set_frame(frame)
+
+    def submit_cuda_frame(self, frame: Any) -> None:
+        """
+        Submit CUDA frame for zerocopy processing (aspect/resize on GPU, JPEG on CPU).
+        frame: torch.Tensor on CUDA
+        """
+        import torch
+        if not (hasattr(frame, "is_cuda") and frame.is_cuda):
+            # Fallback to CPU path
+            self.submit_frame(runtime_sbs_to_rgb(frame))
+            return
+        # Create CUDA event for synchronization
+        cuda_event = torch.cuda.Event()
+        cuda_event.record(torch.cuda.current_stream(frame.device))
+        self.streamer.set_cuda_frame(frame, cuda_event)
+
+    @property
+    def current_network_bitrate_mbps(self) -> float:
+        """MJPEG has no MediaMTX bitrate tracking."""
+        return 0.0
+
+    def should_submit_frame(self, now: float | None = None) -> bool:
+        """MJPEG streams every runtime frame immediately.
+
+        There is no network-rate probe for MJPEG: dropping frames for a
+        multi-second calibration window froze the stream at startup and the
+        0.9x sustainable-rate cap needlessly throttled it below the runtime
+        rate. The encoder loop keeps only the newest frame and _generate paces
+        the HTTP output at ``delay``, so rate control is already handled.
+        """
+        return True
+
+    def observe_calibration_window(
+        self,
+        *,
+        sbs_fps: float,
+        submitted_fps: float,
+        convert_ms: float,
+        submit_ms: float,
+    ) -> None:
+        # MJPEG has no calibration controller, but keep interface for consumer
+        pass
 
     def close(self) -> None:
         self.streamer.stop()
@@ -643,6 +1260,8 @@ class FfmpegDirectSbsOutput:
         os_name: str | None = None,
         prefer_nvenc: bool = False,
         display_mode: str = "Half-SBS",
+        fit_mode: str = "contain",
+        input_size: Tuple[int, int] | None = None,
         target_bitrate_mbps: int = 0,
         peak_bitrate_mbps: int = 0,
         auto_calibration: bool = False,
@@ -664,6 +1283,13 @@ class FfmpegDirectSbsOutput:
         self.os_name = str(os_name or platform.system())
         self.prefer_nvenc = bool(prefer_nvenc)
         self.display_mode = str(display_mode or "Half-SBS").strip()
+        self.fit_mode = str(fit_mode or "contain").strip()
+        self.input_size = input_size
+        if self.input_size is not None:
+            try:
+                self.input_size = (int(self.input_size[0]), int(self.input_size[1]))
+            except Exception:
+                self.input_size = None
         self.use_hevc = self.display_mode.casefold() == "full-sbs"
         self.target_bitrate_mbps = max(0, int(target_bitrate_mbps))
         self.peak_bitrate_mbps = max(0, int(peak_bitrate_mbps))
@@ -704,6 +1330,13 @@ class FfmpegDirectSbsOutput:
         )
         if not self.mediamtx_config.is_file():
             raise FileNotFoundError(f"MediaMTX config not found: {self.mediamtx_config}")
+        if sys.platform == "darwin":
+            # MediaMTX cannot apply udpReadBufferSize on macOS ("read buffer
+            # size is unimplemented on the current operating system") and
+            # aborts at startup, killing every listener. Drop it to the OS
+            # default in a runtime-generated copy; Windows/Linux keep the
+            # enlarged buffer.
+            self.mediamtx_config = _darwin_safe_mediamtx_config(self.mediamtx_config)
         self.server_process: subprocess.Popen | None = None
         self.ffmpeg_process: subprocess.Popen | None = None
         self._ffmpeg_log_thread: threading.Thread | None = None
@@ -726,6 +1359,21 @@ class FfmpegDirectSbsOutput:
         self._pending_audio_delay: float | None = None
         self._audio_delay_lock = threading.Lock()
         self._packet_loss_warning_emitted = False
+        self._darwin_audio_device: str | None = None
+        self._darwin_audio_probe_started = False
+        self._audio_startup_retried = False
+        # AVFoundation audio and the RTSP muxer can briefly apply backpressure
+        # to the rawvideo pipe. Keep that stall off the runtime consumer on
+        # macOS; the one-slot queue deliberately drops stale video frames.
+        self._darwin_async_submit = self.os_name == "Darwin"
+        self._async_frame_queue: queue.Queue[np.ndarray | None] | None = (
+            queue.Queue(maxsize=1) if self._darwin_async_submit else None
+        )
+        self._async_frame_stop = threading.Event()
+        self._async_frame_thread: threading.Thread | None = None
+        self._async_frame_error: Exception | None = None
+        self._async_frame_lock = threading.Lock()
+        self._async_frame_drops = 0
         if self.auto_calibration:
             logs_dir = self.base_dir / "logs"
             self._calibration_controller = StreamCalibrationController(
@@ -812,6 +1460,29 @@ class FfmpegDirectSbsOutput:
             env["MTX_HLSADDRESS"] = f":{self.port}"
         elif self.protocol == "WEBRTC":
             env["MTX_WEBRTCADDRESS"] = f":{self.port}"
+            if self.os_name == "Windows":
+                # MediaMTX advertises every interface IP as a WebRTC ICE
+                # candidate by default. On machines with a WSL/Hyper-V
+                # vEthernet (e.g. 192.168.64.x) that unreachable adapter is
+                # advertised too: remote LAN clients pick it, the connection
+                # drops every few seconds and audio never arrives. Restrict
+                # the advertised candidates to real NICs (Status=Up,
+                # Virtual=False) so clients negotiate a reachable path.
+                lan_ips = _windows_lan_ipv4s()
+                if lan_ips:
+                    env["MTX_WEBRTCIPSFROMINTERFACES"] = "no"
+                    env["MTX_WEBRTCADDITIONALHOSTS"] = ",".join(lan_ips)
+                    print(
+                        f"[DirectSbsStream] WebRTC ICE candidates restricted "
+                        f"to LAN IPs: {lan_ips}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[DirectSbsStream] WARNING: could not enumerate LAN "
+                        "IPs; WebRTC will advertise all interfaces",
+                        flush=True,
+                    )
         return env
 
     @staticmethod
@@ -1174,6 +1845,11 @@ class FfmpegDirectSbsOutput:
                 )
 
     def start(self) -> None:
+        # Kill orphan MediaMTX from previous run (port already in use -> ERR listen udp :8000)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890])
+        except Exception:
+            pass
         if self.protocol != "WEBRTC":
             print(
                 f"[DirectSbsStream] WARNING: {self.protocol} selected; "
@@ -1232,35 +1908,75 @@ class FfmpegDirectSbsOutput:
             flush=True,
         )
 
+    def _audio_filter_graph(self) -> str:
+        """Audio timeline filter for every FFmpeg/native muxer.
+
+        The Windows WASAPI loopback input (s16le over UDP) must NOT use
+        ``-use_wallclock_as_timestamps``: on this FFmpeg build that demuxer
+        option makes the audio chain emit zero packets (the stream then
+        declares an Opus track that never carries audio, so WebRTC clients
+        get video with no sound). Instead the raw s16le/UDP timeline is
+        re-anchored to the same wall-clock base as the video input with
+        ``asetpts=RTCTIME``. The order matters: asetpts must run BEFORE
+        aresample (measured: ``aresample,asetpts`` and plain ``asetpts``
+        both produce an empty audio stream on this build). The v2.5.0
+        ``-itsoffset`` audio delay is folded into the RTCTIME offset
+        because asetpts overwrites the demuxer PTS that the offset shifted.
+
+        macOS AVFoundation exposes an absolute microsecond timestamp. Normalize
+        it to the input start and the audio time base before applying the
+        configured delay. Passing RTCTIME directly as PTS makes FFmpeg treat
+        the microsecond value as stream ticks; the muxer then duplicates video
+        for minutes to catch up, eventually blocking the rawvideo pipe.
+        """
+        graph = "aresample=async=1"
+        if self.os_name == "Darwin":
+            delay_us = int(round(float(self.audio_delay) * 1e6))
+            graph = (
+                "asetpts=(RTCTIME-STARTT"
+                f"{delay_us:+d})/(1000000*TB),{graph}"
+            )
+        elif self._soundcard_audio is not None:
+            delay_us = int(round(float(self.audio_delay) * 1e6))
+            graph = f"asetpts=RTCTIME{delay_us:+d},{graph}"
+        return graph
+
     def _audio_input_args(self) -> list[str]:
         device = self.stereo_mix_device
+        if self.os_name == "Darwin":
+            # An unconfigured audio source must not open a live AVFoundation
+            # input: its clock can block the video muxer for hundreds of ms.
+            # Audio remains available when the user explicitly selects a
+            # device (for example ``soundcard:BlackHole 2ch``).
+            normalized = device.casefold().strip()
+            if (
+                not normalized
+                or normalized in {"soundcard:", "wasapi:", ":"}
+                or normalized.startswith(("no ", "none", "null"))
+            ):
+                return []
         if not device or device.lower().startswith(("no ", "none", "null")):
             return []
         if self.os_name == "Windows":
             if device.casefold().startswith("soundcard:"):
-                if self._soundcard_audio is None:
-                    return []
-                return [
-                    "-itsoffset",
-                    str(self.audio_delay),
-                    "-f",
-                    "s16le",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                    "-i",
-                    self._soundcard_audio.ffmpeg_url,
-                ]
+                # The "soundcard:" prefix means a WASAPI loopback speaker from
+                # the soundcard library (the GUI Stereo Mix dropdown lists
+                # these). It must be captured through the Python WASAPI
+                # loopback sender - NOT dshow: dshow cannot see render-side
+                # devices, and a dshow audio input throttles the AMF video
+                # pipeline (measured ~10 FPS in-app with -usage webcam, and
+                # the standalone encode rate halves) because the muxer waits
+                # on the audio stream. WASAPI loopback keeps 60 FPS and
+                # carries real system audio.
+                device_name = device.split(":", 1)[1].strip()
+                return self._start_wasapi_loopback_audio(device_name or None)
             if device.casefold().startswith("wasapi:"):
-                return [
-                    "-itsoffset",
-                    str(self.audio_delay),
-                    "-f",
-                    "wasapi",
-                    "-i",
-                    device.split(":", 1)[1].strip(),
-                ]
+                # FFmpeg's bundled build has no native wasapi input, so a
+                # "wasapi:" label cannot be captured by FFmpeg directly;
+                # capture that speaker through the soundcard WASAPI loopback
+                # instead (same fast path as "soundcard:").
+                wasapi_name = device.split(":", 1)[1].strip()
+                return self._start_wasapi_loopback_audio(wasapi_name or None)
             return [
                 "-itsoffset",
                 str(self.audio_delay),
@@ -1280,19 +1996,127 @@ class FfmpegDirectSbsOutput:
             ]
         if self.os_name == "Darwin":
             audio_device = device
-            if audio_device.isdigit():
-                audio_device = f":{audio_device}"
-            elif not audio_device.startswith(":"):
-                audio_device = f":{audio_device}"
-            return [
+            # Device labels from the GUI carry a backend prefix
+            # ("soundcard:BlackHole 2ch", "wasapi:..."); AVFoundation matches
+            # on the bare device name and rejects ":soundcard:BlackHole 2ch".
+            for prefix in ("soundcard:", "wasapi:"):
+                if audio_device.casefold().startswith(prefix):
+                    audio_device = audio_device.split(":", 1)[1].strip()
+                    break
+            auto_selected = False
+            if not audio_device or audio_device == ":":
+                # No usable device (empty, bare "soundcard:" prefix, or a lone
+                # ":"): skip audio entirely instead of handing FFmpeg "-i :"
+                # which fails with "Error opening input file :." and kills the
+                # stream.
+                auto = _auto_select_darwin_audio(self.ffmpeg_path)
+                if not auto:
+                    return []
+                auto_selected = True
+                audio_device = auto
+            if not audio_device.isdigit():
+                # A configured device NAME (v2.5.0 settings parity) is
+                # resolved to its AVFoundation index so the persisted "Stereo
+                # Mix" device is captured even if the GUI list changes; a
+                # stale/unplugged name falls back to auto-selection instead
+                # of failing FFmpeg at startup.
+                resolved_index = None
+                for index, name in _list_darwin_audio_devices(self.ffmpeg_path):
+                    if name.casefold() == audio_device.casefold():
+                        resolved_index = str(index)
+                        break
+                if resolved_index is None:
+                    print(
+                        "[DirectSbsStream] WARNING: configured macOS Stereo Mix "
+                        f"device {audio_device!r} is not available; auto-selecting",
+                        flush=True,
+                    )
+                    resolved_index = _auto_select_darwin_audio(self.ffmpeg_path)
+                    auto_selected = True
+                if not resolved_index:
+                    return []
+                audio_device = resolved_index
+            audio_device = f":{audio_device}"
+            self._darwin_audio_device = audio_device
+            # v2.5.0 macOS parity: the AVFoundation audio input carries the
+            # same 256 MB ring buffer (rtbufsize) as the reference build.
+            args = [
                 "-itsoffset",
                 str(self.audio_delay),
                 "-f",
                 "avfoundation",
+                "-rtbufsize",
+                "256M",
                 "-i",
                 audio_device,
             ]
+            if auto_selected:
+                hint = _darwin_loopback_routing_hint(audio_device)
+                print(
+                    "[DirectSbsStream] WARNING: no Stereo Mix device configured; "
+                    f"auto-selected macOS audio device {audio_device!r}. "
+                    + (hint if hint else "Pick a Stereo Mix device in the GUI."),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[DirectSbsStream] macOS audio device: {device!r} -> "
+                    f"avfoundation {audio_device}",
+                    flush=True,
+                )
+            return args
         return []
+
+    def _start_wasapi_loopback_audio(self, device_name: str | None = None) -> list[str]:
+        """Grab a Windows speaker via WASAPI loopback into FFmpeg.
+
+        Used for every Windows GUI audio source: the soundcard library opens
+        the requested speaker (or the default speaker when ``device_name`` is
+        None) in loopback mode and streams its PCM to FFmpeg over localhost
+        UDP. This is the only reliable way to carry system audio - dshow
+        cannot see render-side devices, the bundled FFmpeg has no native
+        wasapi input, and a dshow audio input throttles the AMF video
+        pipeline (~10 FPS in-app). Returns the FFmpeg input args, or [] when
+        no speaker / loopback is available (stream then runs video-only,
+        matching previous behavior).
+        """
+        if self._soundcard_audio is not None:
+            return [
+                "-itsoffset",
+                str(self.audio_delay),
+                "-f",
+                "s16le",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-i",
+                self._soundcard_audio.ffmpeg_url,
+            ]
+        try:
+            sender = SoundcardLoopbackSender(device_name)
+            sender.start()
+        except Exception as exc:
+            print(
+                f"[DirectSbsStream] WASAPI loopback unavailable "
+                f"(speaker={device_name!r}, {type(exc).__name__}: {exc}); "
+                "streaming video-only",
+                flush=True,
+            )
+            return []
+        self._soundcard_audio = sender
+        return [
+            "-itsoffset",
+            str(self.audio_delay),
+            "-f",
+            "s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-i",
+            sender.ffmpeg_url,
+        ]
 
     def _qsv_d3d11_surface_upload_enabled(self) -> bool:
         """Opt into FFmpeg's Windows D3D11/QSV surface upload boundary.
@@ -1337,9 +2161,48 @@ class FfmpegDirectSbsOutput:
                 f"{width}x{height}",
                 "-framerate",
                 str(self.fps),
+                # Wall-clock timestamps: the app-paced pipe producer advances
+                # video PTS by 1/fps per frame regardless of delivery time,
+                # so every stall permanently shifts video PTS behind the
+                # real-time audio clock -> growing A/V offset -> the client
+                # constantly re-syncs (choppy sound). Timestamping at read
+                # time keeps video PTS on the same av_gettime() clock as the
+                # audio input (same pattern as the NVIDIA SRT path).
+                "-use_wallclock_as_timestamps",
+                "1",
+                # Threaded demux: the pipe read runs on a worker thread so a
+                # stalled/slow app producer can never block the demux loop
+                # and starve the real-time audio input (audio dropouts).
+                "-thread_queue_size",
+                "16",
                 "-i",
                 "pipe:0",
             ]
+        )
+        audio_input_args = (
+            [
+                # Same clock base as the video input (see above), so the
+                # muxer sees both streams on one timeline and never has to
+                # drop audio that runs ahead of a delayed video PTS.
+                # The WASAPI soundcard input must NOT use
+                # -use_wallclock_as_timestamps (measured: that demuxer
+                # option silences the whole audio chain on this FFmpeg
+                # build); its wall-clock re-anchoring happens in the audio
+                # filter graph instead (normalized asetpts, see
+                # _audio_filter_graph). macOS drops it too: AVFoundation
+                # timestamps are absolute microseconds and are normalized in
+                # the filter graph before the async resampler.
+                "-thread_queue_size",
+                "512",
+                *(
+                    []
+                    if self._soundcard_audio is not None or self.os_name == "Darwin"
+                    else ["-use_wallclock_as_timestamps", "1"]
+                ),
+                *audio_args,
+            ]
+            if audio_args
+            else []
         )
         command = [
             str(self.ffmpeg_path),
@@ -1355,7 +2218,7 @@ class FfmpegDirectSbsOutput:
             "-analyzeduration",
             "0",
             *input_args,
-            *audio_args,
+            *audio_input_args,
             "-map",
             "0:v:0",
         ]
@@ -1514,11 +2377,60 @@ class FfmpegDirectSbsOutput:
             else:
                 self._qsv_surface_mode = "host_upload"
         elif self.video_encoder.endswith("_amf"):
-            for option in ("-tune", "-rc", "-cq", "-zerolatency", "-forced-idr", "-strict_gop", "-spatial-aq", "-temporal-aq", "-aq-strength"):
+            # h264_amf/hevc_amf have no FFmpeg "preset" option (that is
+            # NVENC/QSV); the shared hardware branch adds "-preset fast" so it
+            # must be stripped here or AMF rejects it at option-apply time
+            # ("Error setting option preset to value fast" -> the stream dies
+            # right at encoder init). Only the AMF branch is touched; NVENC,
+            # QSV, VAAPI, VideoToolbox and libx264/265 keep their presets.
+            for option in ("-preset", "-tune", "-rc", "-cq", "-zerolatency", "-forced-idr", "-strict_gop", "-spatial-aq", "-temporal-aq", "-aq-strength"):
                 while option in command:
                     index = command.index(option)
                     del command[index:index + 2]
-            command.extend(["-usage", "ultralowlatency", "-quality", "speed", "-rc", "vbr_peak"])
+            # AMF's "ultralowlatency" usage only emits ONE real IDR at stream
+            # start: -g / -force_key_frames turn into non-IDR I-slices, so a
+            # browser WebRTC H.264 depacketizer joining mid-stream never sees
+            # a keyframe and shows black forever (framesReceived stays 0 even
+            # though all RTP flows - verified via MediaMTX WHEP getStats).
+            # "webcam" usage keeps low latency but honors the GOP with true
+            # IDR frames, which is what WebRTC browsers require. Only the
+            # WebRTC+H.264 AMF path switches; SRT/RTSP headset paths keep
+            # ultralowlatency, and NVIDIA/macOS never select "_amf".
+            amf_usage = (
+                os.environ.get("D2S_AMF_USAGE", "webcam")
+                if self.protocol == "WEBRTC" and not self.use_hevc
+                else "ultralowlatency"
+            )
+            command.extend(["-usage", amf_usage, "-quality", "speed", "-rc", "vbr_peak"])
+            amf_extra = os.environ.get("D2S_AMF_EXTRA", "").strip()
+            if amf_extra:
+                command.extend(amf_extra.split())
+            if (
+                self.protocol == "WEBRTC"
+                and not self.use_hevc
+                and self.os_name == "Windows"
+            ):
+                # Browser WebRTC H.264 decoders (Chrome/Edge/Firefox) reject
+                # Main-profile streams and enforce the SPS level against the
+                # frame rate. AMF auto-selects level 5.1 for 4K, which only
+                # supports 4K@~30 fps, so a 4K@40 stream carries an invalid
+                # SPS and the browser shows a black frame even though RTP
+                # flows (verified: MediaMTX answered the WHEP offer with
+                # profile-level-id 42e01f Constrained Baseline while AMF
+                # emitted Main 4D0433). Force Constrained Baseline + the
+                # level actually required by resolution/fps (e.g. 5.2 for
+                # 4K@40) so the SPS matches the negotiated profile and the
+                # decoder accepts the stream. H.264 only; HEVC AMF keeps its
+                # defaults. NVIDIA/macOS paths never select "_amf".
+                required_level = _required_h264_level(width, height, self.fps)
+                command.extend(
+                    [
+                        "-profile:v",
+                        "constrained_baseline",
+                        "-level:v",
+                        _format_h264_level(required_level),
+                    ]
+                )
 
         if calibration_stream:
             # Normal playback remains quality-oriented VBR. Calibration uses
@@ -1552,11 +2464,19 @@ class FfmpegDirectSbsOutput:
                 ]
             )
         if audio_args:
-            if self.protocol == "WEBRTC":
+            # Both inputs share the av_gettime() wall-clock base, so the
+            # audio and video timelines are aligned by construction. async=1
+            # (the v2.5.0 magnitude) absorbs residual device-clock drift by
+            # inserting/dropping samples without letting the filter make
+            # large, audible adjustments. The WASAPI soundcard path
+            # additionally re-anchors the raw s16le/UDP timeline to the wall
+            # clock (normalized asetpts on macOS) because
+            # -use_wallclock_as_timestamps on the audio demuxer would silence
+            # the stream entirely.
+            command.extend(["-af", self._audio_filter_graph()])
+            if self.protocol == "WEBRTC" or self.os_name == "Darwin":
                 command.extend(
                     [
-                        "-af",
-                        "aresample=async=1000:first_pts=0",
                         "-c:a",
                         "libopus",
                         "-ar",
@@ -1568,6 +2488,8 @@ class FfmpegDirectSbsOutput:
                     ]
                 )
             else:
+                # Windows/Linux SRT/RTMP paths (NVIDIA/ROCm) keep AAC; the
+                # resample above still normalizes their audio timeline.
                 command.extend(["-c:a", "aac", "-ar", "48000", "-b:a", "128k"])
         if getattr(self, "_calibration_controller", None) is not None:
             # FFmpeg reports the actual encoded/muxed output rate, which is
@@ -1577,7 +2499,17 @@ class FfmpegDirectSbsOutput:
             command.extend(
                 [
                     "-force_key_frames",
-                    "expr:gte(t,n_forced*1)",
+                    # Frame-based (not t-based): the video input now carries
+                    # wall-clock PTS, so a time expression like
+                    # expr:gte(t,n_forced*1) would force every frame to be a
+                    # keyframe. n is the frame index, independent of the PTS
+                    # base; one keyframe per fps frames (1/s cadence). Use
+                    # mod() (not the % operator, which the bundled FFmpeg's
+                    # force_key_frames evaluator rejects as "Missing ')' or
+                    # too many args") and no backslash-escaping (the command
+                    # is spawned as an argv list, so FFmpeg receives the
+                    # expression verbatim).
+                    f"expr:eq(mod(n,{self.fps}),0)",
                     "-muxdelay",
                     "0",
                     "-muxpreload",
@@ -1623,6 +2555,27 @@ class FfmpegDirectSbsOutput:
                     # Bound sparse-stream interleaving to 100 ms.
                     "-max_interleave_delta",
                     "100000",
+                ]
+            )
+            if self.os_name == "Darwin":
+                # Flush every muxed packet immediately instead of batching:
+                # with an app-paced video source and a real-time audio input,
+                # buffered writes deliver audio to MediaMTX in bursts, which
+                # shows up as jitter in the client's audio buffer. Same
+                # options the Windows path uses; macOS/Linux keep their
+                # existing behavior otherwise (Linux/ROCm untouched).
+                command.extend(
+                    [
+                        "-muxdelay",
+                        "0",
+                        "-muxpreload",
+                        "0",
+                        "-flush_packets",
+                        "1",
+                    ]
+                )
+            command.extend(
+                [
                     "-f",
                     "rtsp",
                     "-rtsp_transport",
@@ -1635,8 +2588,65 @@ class FfmpegDirectSbsOutput:
             )
         return command
 
+    def _probe_darwin_audio_silence(self) -> None:
+        """Warn once when the macOS audio device captures digital silence.
+
+        Runs a short volumedetect capture on the same AVFoundation device the
+        stream uses (CoreAudio allows concurrent capture clients). Purely
+        advisory: a silent result never fails or delays the stream. macOS
+        only; other platforms are no-ops.
+        """
+        if getattr(self, "os_name", None) != "Darwin":
+            return
+        device = getattr(self, "_darwin_audio_device", None)
+        if not device:
+            return
+        ffmpeg_path = getattr(self, "ffmpeg_path", None)
+        if not ffmpeg_path:
+            return
+        try:
+            result = subprocess.run(
+                [
+                    str(ffmpeg_path),
+                    "-hide_banner",
+                    "-f",
+                    "avfoundation",
+                    "-rtbufsize",
+                    "256M",
+                    "-i",
+                    device,
+                    "-t",
+                    "1",
+                    "-af",
+                    "volumedetect",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        match = re.search(r"mean_volume:\s*(-?[0-9.]+)\s*dB", result.stderr or "")
+        if match is None:
+            return
+        mean_db = float(match.group(1))
+        if mean_db < -55.0:
+            hint = _darwin_loopback_routing_hint(device)
+            print(
+                "[DirectSbsStream] WARNING: macOS audio device "
+                f"{device!r} appears silent (mean_volume={mean_db:.1f} dB). "
+                + (hint if hint else "Select a different Stereo Mix device in the GUI."),
+                flush=True,
+            )
+
     def _start_ffmpeg(self, width: int, height: int) -> None:
-        if (
+        # Audio: old main.py used dshow directly (ffmpeg -f dshow -i audio={device}) with no broken sound.
+        # Previous wasapi UDP loopback (SoundcardLoopbackSender) caused fragmentation/discontinuity -> broken audio.
+        # Kept dshow path in _audio_input_args, so disable python loopback start here.
+        if False and (
             self._calibration_controller is None
             and self.os_name == "Windows"
             and self.stereo_mix_device.casefold().startswith("soundcard:")
@@ -1657,6 +2667,8 @@ class FfmpegDirectSbsOutput:
             self.video_encoder = self._select_video_encoder(width, height)
             self._encoder_selected = True
         command = self._ffmpeg_command(width, height)
+        if str(os.environ.get("D2S_FFMPEG_ECHO", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            print("[DirectSbsStream] FFmpeg cmd: " + " ".join(command), flush=True)
         creationflags = (
             getattr(subprocess, "CREATE_NO_WINDOW", 0)
             if self.os_name == "Windows"
@@ -1680,10 +2692,62 @@ class FfmpegDirectSbsOutput:
         time.sleep(0.05)
         if self.ffmpeg_process.poll() is not None:
             detail = "; ".join(self._ffmpeg_stderr_tail[-3:]) or "no FFmpeg diagnostic"
+            if (
+                self.os_name == "Windows"
+                and self.stereo_mix_device
+                and not self._audio_startup_retried
+                and re.search(
+                    r"\[in#[0-9]+\].*error opening input|"
+                    r"(dshow|wasapi).*(i/o error|no such device|device not found)|"
+                    r"i/o error.*(dshow|wasapi|audio)",
+                    detail,
+                    re.IGNORECASE,
+                )
+            ):
+                # The configured audio capture device cannot be opened (missing
+                # "Stereo Mix" loopback, unplugged device, wrong name). FFmpeg
+                # dies at startup, so retry once with audio disabled instead of
+                # failing the whole stream; the video-only stream still starts.
+                print(
+                    f"[DirectSbsStream] audio input failed to open ({detail}); "
+                    "retrying without audio",
+                    flush=True,
+                )
+                self._audio_startup_retried = True
+                self.stereo_mix_device = ""
+                if self._soundcard_audio is not None:
+                    self._soundcard_audio.close()
+                    self._soundcard_audio = None
+                self._stop_ffmpeg_publisher()
+                self.ffmpeg_process = None
+                self._frame_size = None
+                self._start_ffmpeg(width, height)
+                return
             raise RuntimeError(
                 f"FFmpeg exited during startup with code {self.ffmpeg_process.returncode}: {detail}"
             )
         self._frame_size = (width, height)
+        if self._darwin_async_submit and self._calibration_controller is None:
+            self._start_async_frame_writer()
+        if (
+            self.os_name == "Darwin"
+            and not getattr(self, "_darwin_audio_probe_started", False)
+            and getattr(self, "_darwin_audio_device", None)
+        ):
+            # Advisory silence check on the captured device, once per stream
+            # lifecycle; runs off the pipeline thread so it never blocks
+            # frame submission.
+            self._darwin_audio_probe_started = True
+
+            def _delayed_probe() -> None:
+                time.sleep(0.5)
+                self._probe_darwin_audio_silence()
+
+            threading.Thread(
+                target=_delayed_probe,
+                name="DarwinAudioSilenceProbe",
+                daemon=True,
+            ).start()
         if self._active_rate_budget is not None:
             target_mbps, peak_mbps, buffer_mbps = self._active_rate_budget
             print(
@@ -1709,6 +2773,118 @@ class FfmpegDirectSbsOutput:
                 flush=True,
             )
 
+    def _start_async_frame_writer(self) -> None:
+        if not self._darwin_async_submit:
+            return
+        frame_queue = self._async_frame_queue
+        process = self.ffmpeg_process
+        if (
+            frame_queue is None
+            or process is None
+            or process.stdin is None
+            or (
+                self._async_frame_thread is not None
+                and self._async_frame_thread.is_alive()
+            )
+        ):
+            return
+        self._async_frame_stop.clear()
+        with self._async_frame_lock:
+            self._async_frame_error = None
+        self._async_frame_thread = threading.Thread(
+            target=self._run_async_frame_writer,
+            name="DarwinDirectSbsFrameWriter",
+            daemon=True,
+        )
+        self._async_frame_thread.start()
+
+    def _run_async_frame_writer(self) -> None:
+        frame_queue = self._async_frame_queue
+        if frame_queue is None:
+            return
+        while not self._async_frame_stop.is_set():
+            try:
+                frame = frame_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if frame is None:
+                return
+            if self._async_frame_stop.is_set():
+                return
+            try:
+                self._write_frame(frame)
+            except Exception as exc:
+                with self._async_frame_lock:
+                    self._async_frame_error = exc
+                self._async_frame_stop.set()
+                return
+
+    def _raise_async_frame_error(self) -> None:
+        with self._async_frame_lock:
+            error = self._async_frame_error
+        if error is not None:
+            raise RuntimeError(f"macOS FFmpeg frame writer failed: {error}") from error
+
+    def _enqueue_async_frame(self, frame: np.ndarray) -> None:
+        frame_queue = self._async_frame_queue
+        if frame_queue is None:
+            raise RuntimeError("macOS frame queue is unavailable")
+        # The converter may reuse its backing array after submit_frame returns.
+        # Own exactly one contiguous copy for the writer thread.
+        owned_frame = np.array(frame, dtype=np.uint8, copy=True, order="C")
+        try:
+            frame_queue.put_nowait(owned_frame)
+            return
+        except queue.Full:
+            pass
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            with self._async_frame_lock:
+                self._async_frame_drops += 1
+        try:
+            frame_queue.put_nowait(owned_frame)
+        except queue.Full:
+            with self._async_frame_lock:
+                self._async_frame_drops += 1
+
+    def _stop_async_frame_writer(self) -> None:
+        thread = self._async_frame_thread
+        if thread is None:
+            return
+        self._async_frame_stop.set()
+        frame_queue = self._async_frame_queue
+        if frame_queue is not None:
+            try:
+                frame_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    frame_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        # Closing stdin first releases a writer blocked in the kernel pipe.
+        self._stop_process(self.ffmpeg_process)
+        if thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        self._async_frame_thread = None
+        self._async_frame_stop.clear()
+        if frame_queue is not None:
+            while True:
+                try:
+                    frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    def _stop_ffmpeg_publisher(self) -> None:
+        self._stop_async_frame_writer()
+        self._stop_process(self.ffmpeg_process)
+
     def _write_frame(self, frame: np.ndarray) -> None:
         process = self.ffmpeg_process
         if process is None or process.stdin is None:
@@ -1722,7 +2898,7 @@ class FfmpegDirectSbsOutput:
         process.stdin.flush()
 
     def _drain_ffmpeg_stderr(self, process: subprocess.Popen) -> None:
-        stream = process.stderr
+        stream = getattr(process, "stderr", None)
         if stream is None:
             return
         try:
@@ -1749,6 +2925,10 @@ class FfmpegDirectSbsOutput:
                     self._ffmpeg_bitrate_mbps = value * multiplier
                 self._ffmpeg_stderr_tail.append(line)
                 del self._ffmpeg_stderr_tail[:-20]
+                if str(os.environ.get("D2S_FFMPEG_STATS", "0")).strip().lower() in {"1", "true", "yes", "on"} and re.search(
+                    r"frame=\s*\d+|fps=\s*[\d.]+", line
+                ):
+                    print(f"[DirectSbsStream] FFmpeg: {line}", flush=True)
                 if any(token in line.casefold() for token in ("error", "failed", "invalid", "cannot")):
                     print(f"[DirectSbsStream] FFmpeg: {line}", flush=True)
         except (OSError, ValueError):
@@ -1782,7 +2962,7 @@ class FfmpegDirectSbsOutput:
             f"{delay:.3f}s; restarting FFmpeg publisher",
             flush=True,
         )
-        self._stop_process(self.ffmpeg_process)
+        self._stop_ffmpeg_publisher()
         self.ffmpeg_process = None
         self._frame_size = None
 
@@ -1802,8 +2982,48 @@ class FfmpegDirectSbsOutput:
             # speed cannot throttle the bandwidth probe.
             return
         try:
-            self._write_frame(frame)
-        except (BrokenPipeError, OSError, RuntimeError):
+            if self._darwin_async_submit:
+                self._raise_async_frame_error()
+                self._enqueue_async_frame(frame)
+            else:
+                self._write_frame(frame)
+        except (BrokenPipeError, OSError, RuntimeError) as exc:
+            # A dead FFmpeg whose last diagnostics point at the audio input
+            # (dshow/wasapi open failure) is restarted once without audio so
+            # the stream still starts video-only. This guards the case where
+            # the audio open fails after the short startup probe window.
+            if (
+                self.os_name == "Windows"
+                and self.stereo_mix_device
+                and not self._audio_startup_retried
+                and re.search(
+                    r"\[in#[0-9]+\].*error opening input|"
+                    r"(dshow|wasapi).*(i/o error|no such device|device not found)|"
+                    r"i/o error.*(dshow|wasapi|audio)",
+                    str(exc),
+                    re.IGNORECASE,
+                )
+            ):
+                print(
+                    f"[DirectSbsStream] audio input failed during startup "
+                    f"({exc}); retrying without audio",
+                    flush=True,
+                )
+                self._audio_startup_retried = True
+                self.stereo_mix_device = ""
+                if self._soundcard_audio is not None:
+                    self._soundcard_audio.close()
+                    self._soundcard_audio = None
+                self._stop_ffmpeg_publisher()
+                self.ffmpeg_process = None
+                self._frame_size = None
+                self._start_ffmpeg(*size)
+                if self._darwin_async_submit:
+                    self._raise_async_frame_error()
+                    self._enqueue_async_frame(frame)
+                else:
+                    self._write_frame(frame)
+                return
             if self.video_encoder not in {"h264_nvenc", "hevc_nvenc"}:
                 raise
             software_encoder = "libx265" if self.use_hevc else "libx264"
@@ -1812,12 +3032,16 @@ class FfmpegDirectSbsOutput:
                 f"{software_encoder}",
                 flush=True,
             )
-            self._stop_process(self.ffmpeg_process)
+            self._stop_ffmpeg_publisher()
             self.ffmpeg_process = None
             self._frame_size = None
             self.video_encoder = software_encoder
             self._start_ffmpeg(*size)
-            self._write_frame(frame)
+            if self._darwin_async_submit:
+                self._raise_async_frame_error()
+                self._enqueue_async_frame(frame)
+            else:
+                self._write_frame(frame)
 
     @staticmethod
     def _stop_process(process: subprocess.Popen | None) -> None:
@@ -1847,7 +3071,7 @@ class FfmpegDirectSbsOutput:
         if self._soundcard_audio is not None:
             self._soundcard_audio.close()
             self._soundcard_audio = None
-        self._stop_process(self.ffmpeg_process)
+        self._stop_ffmpeg_publisher()
         self._stop_process(self.server_process)
         if self._server_log_thread is not None:
             self._server_log_thread.join(timeout=0.5)
@@ -1856,6 +3080,11 @@ class FfmpegDirectSbsOutput:
         self._server_log_thread = None
         self._ffmpeg_log_thread = None
         self._ffmpeg_stderr_tail = []
+        # Ensure orphan MediaMTX/FFmpeg ports are freed on stop (previous run left :8000/:9998 occupied)
+        try:
+            _kill_orphan_mediamtx_processes(ports=[self.port, 9998, 8000, 8001, 8189, 8554, 1935, 8888, 8889, 8890])
+        except Exception:
+            pass
 
 
 class IntelQsvDirectSbsOutput(FfmpegDirectSbsOutput):
@@ -1958,7 +3187,17 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             os_name=self.os_name,
         )
         if not report.available:
-            raise RuntimeError(report.detail)
+            # The native Vulkan encoder (h264_vulkan/hevc_vulkan) is not usable
+            # on this device (e.g. AMD LLPC). Fall back through the normal
+            # vendor -> software chain instead of crashing the stream with the
+            # raw FFmpeg probe error. Working NVIDIA/macOS paths are untouched:
+            # they succeed this probe and never reach the fallback.
+            print(
+                f"[VulkanStream] Vulkan encoder unavailable ({report.detail}); "
+                "falling back to the vendor/FFmpeg encoder chain",
+                flush=True,
+            )
+            return super()._select_video_encoder(width, height)
         print(
             f"[VulkanStream] Vulkan capability probe: encoder={report.encoder} "
             f"input={report.input_format} {width}x{height}",
@@ -2020,6 +3259,28 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
 
     def _start_native_mux(self) -> None:
         audio_args = self._audio_input_args()
+        audio_input_args = (
+            [
+                # Same clock base and demux decoupling as the FFmpeg path:
+                # wall-clock timestamps keep the muxed video PTS on the
+                # real-time audio clock, and the audio demux thread can never
+                # be starved by a stalled video pipe producer. The WASAPI
+                # soundcard input skips the demuxer wall-clock option (it
+                # silences the chain on this FFmpeg build) and is re-anchored
+                # in the filter graph instead. macOS skips it too (see
+                # _audio_filter_graph).
+                "-thread_queue_size",
+                "512",
+                *(
+                    []
+                    if self._soundcard_audio is not None or self.os_name == "Darwin"
+                    else ["-use_wallclock_as_timestamps", "1"]
+                ),
+                *audio_args,
+            ]
+            if audio_args
+            else []
+        )
         command = [
             str(self.ffmpeg_path),
             "-hide_banner",
@@ -2039,9 +3300,13 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
             "h264",
             "-r",
             str(self.fps),
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-thread_queue_size",
+            "16",
             "-i",
             "pipe:0",
-            *audio_args,
+            *audio_input_args,
             "-map",
             "0:v:0",
             "-c:v",
@@ -2049,11 +3314,14 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         ]
         if audio_args:
             command.extend(["-map", "1:a:0"])
+            # Same normalized audio timeline as the FFmpeg path (async=1,
+            # the v2.5.0 magnitude) for every client protocol; the WASAPI
+            # soundcard path adds the asetpts wall-clock re-anchor (see
+            # _audio_filter_graph).
+            command.extend(["-af", self._audio_filter_graph()])
             if self.protocol == "WEBRTC":
                 command.extend(
                     [
-                        "-af",
-                        "aresample=async=1000:first_pts=0",
                         "-c:a",
                         "libopus",
                         "-ar",
@@ -2160,7 +3428,8 @@ class VulkanDirectSbsOutput(FfmpegDirectSbsOutput):
         self._load_native_vulkan_bridge()
         if self._native_vulkan_bridge is None:
             raise RuntimeError("native Vulkan FFmpeg bridge is unavailable")
-        if (
+        # See _start_ffmpeg above: disable python wasapi loopback for same broken-audio reason; use dshow
+        if False and (
             self._calibration_controller is None
             and self.os_name == "Windows"
             and self.stereo_mix_device.casefold().startswith("soundcard:")

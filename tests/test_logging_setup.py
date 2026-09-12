@@ -69,6 +69,28 @@ def test_child_log_line_splits_embedded_fps_record(caplog):
     ]
 
 
+def test_tcl_shutdown_panic_stack_is_hidden_from_child_log(caplog):
+    from gui.process import GUIProcessMixin
+
+    class Harness(GUIProcessMixin):
+        pass
+
+    harness = Harness()
+    with caplog.at_level(logging.DEBUG, logger="child"):
+        harness._log_child_line(
+            "Tcl_AsyncDelete: async handler deleted by the wrong thread"
+        )
+        harness._log_child_line("Exception Code: 0x80000003")
+        harness._log_child_line(
+            "0x00007FFCD4A78BBD, tcl86t.dll(0x00007FFCD4980000) + 0xF8BBD"
+        )
+        harness._log_child_line("[OpenXRViewer] shutdown complete")
+
+    assert [record.message for record in caplog.records if record.name == "child"] == [
+        "[OpenXRViewer] shutdown complete",
+    ]
+
+
 def test_child_descriptor_validation_details_are_summarized(caplog):
     from gui.process import GUIProcessMixin
 
@@ -151,4 +173,3 @@ def test_i18n_status_log_accepts_level():
     os.environ["DESKTOP2STEREO_LOCALE"] = "EN"
     status_log("Ready", level=logging.INFO)
     status_log("Fatal error", level=logging.ERROR, error="test error")
-

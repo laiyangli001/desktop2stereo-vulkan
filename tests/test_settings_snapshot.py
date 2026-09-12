@@ -34,6 +34,7 @@ class FakeDepthProvider:
 def test_settings_snapshot_classifies_change_levels():
     assert RuntimeSettingsSnapshot(version=1, timestamp=1.0).classify() is SnapshotChangeClass.NO_CHANGE
     assert RuntimeSettingsSnapshot(version=2, timestamp=1.0, temporal_strength=0.5).classify() is SnapshotChangeClass.HOT_RELOAD
+    assert RuntimeSettingsSnapshot(version=2, timestamp=1.0, language="CN").classify() is SnapshotChangeClass.HOT_RELOAD
     assert RuntimeSettingsSnapshot(version=3, timestamp=1.0, depth_backend="pytorch_cuda").classify() is SnapshotChangeClass.PIPELINE_REBUILD
     assert RuntimeSettingsSnapshot(version=4, timestamp=1.0, profile_sync=True).classify() is SnapshotChangeClass.PIPELINE_REBUILD
     assert RuntimeSettingsSnapshot(version=4, timestamp=1.0, device="cuda:1").classify() is SnapshotChangeClass.SESSION_RESTART

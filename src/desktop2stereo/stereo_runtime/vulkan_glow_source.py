@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 import struct
+import threading
 import time
 from typing import Any
 
@@ -17,6 +19,21 @@ from viewer.vulkan_resources import (
 from viewer.vulkan_descriptors import VulkanStorageBuffer
 
 from .vulkan_glow_source_pass import VulkanGlowSourcePass
+
+
+def _create_interop_importer():
+    """Pick the CUDA or ROCm/HIP external-memory importer for the glow source."""
+    try:
+        import torch
+
+        is_rocm = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        is_rocm = False
+    if is_rocm:
+        from viewer.rocm_vulkan_interop import RocmVulkanImageImporter
+
+        return RocmVulkanImageImporter()
+    return CudaVulkanImageImporter()
 
 
 class VulkanGlowSourceUnavailable(RuntimeError):
@@ -34,11 +51,13 @@ class _GlowSlot:
     graphics_fence: Any
     screen_light_buffer: VulkanStorageBuffer
     edge_light_buffer: VulkanStorageBuffer
+    crop_detection_buffer: VulkanStorageBuffer
     input_buffer: VulkanExportableBuffer | None = None
     input_ready: VulkanExportableSemaphore | None = None
     state: str = "free"
     generation: int = 0
     lease_count: int = 0
+    crop_detection_requested: bool = False
 
 
 class VulkanGlowSourceComputeBackend:
@@ -51,6 +70,8 @@ class VulkanGlowSourceComputeBackend:
 
     TARGET_WIDTH = 320
     TARGET_HEIGHT = 180
+    MAX_INPUT_SIDE = 512
+    INPUT_BUFFER_CAPACITY = MAX_INPUT_SIDE * MAX_INPUT_SIDE * 3 * 4
 
     def __init__(self, context: Any, *, slot_count: int = 3) -> None:
         self.context = context
@@ -66,7 +87,14 @@ class VulkanGlowSourceComputeBackend:
             )
         self.compute_queue = context.compute_queue
         self.graphics_queue = context.graphics_queue
-        self.importer = CudaVulkanImageImporter()
+        self.importer = _create_interop_importer()
+        # ROCm's stable path synchronizes HIP before Vulkan submission and
+        # intentionally does not consume the HIP external semaphore here.
+        # CUDA still needs the producer-ready semaphore: the CUDA copy is
+        # asynchronous and the compute queue must not read the imported buffer
+        # before that copy completes.
+        self._rocm_interop = "rocm_vulkan_interop" in type(self.importer).__module__
+        self._input_memory_handle_type = self._rocm_input_memory_handle_type()
         capabilities = self.importer.capabilities
         if not capabilities.external_memory or not capabilities.external_semaphore:
             self.importer.close()
@@ -109,6 +137,7 @@ class VulkanGlowSourceComputeBackend:
                         graphics_fence=self._create_fence(signaled=True),
                         screen_light_buffer=VulkanStorageBuffer(context, 16),
                         edge_light_buffer=VulkanStorageBuffer(context, 24 * 16),
+                        crop_detection_buffer=VulkanStorageBuffer(context, 16),
                     )
                 )
         except Exception:
@@ -124,9 +153,31 @@ class VulkanGlowSourceComputeBackend:
         self._budget_skip_count = 0
         self._screen_light_rgb = (0.18, 0.18, 0.18)
         self._edge_light_rgb = tuple((0.0, 0.0, 0.0) for _ in range(24))
+        self._crop_detection_uv: tuple[float, float, float, float] | None = None
+        self._crop_detection_serial = -1
         self._history_key: tuple[object, ...] | None = None
         self._history_last_submit = 0.0
         self._closed = False
+        # Glow compute submits happen on the dedicated compute queue and must
+        # NOT wait on the device-wide context._lock used by the graphics-queue
+        # compositor. Contending on that lock serialized the glow compute with
+        # the compositor and stalled OpenXR (compositor present dropped to ~9
+        # FPS / headset idled). A per-glow lock keeps the glow submissions
+        # mutually exclusive with themselves while the compositor runs free.
+        self._submit_lock = threading.Lock()
+
+    def _rocm_input_memory_handle_type(self) -> int | None:
+        """Use AMD's KMT handle for HIP-imported Windows input buffers."""
+        if os.name != "nt" or "rocm_vulkan_interop" not in type(self.importer).__module__:
+            return None
+        value = os.environ.get("D2S_ROCM_KMT_EXTERNAL_MEMORY", "auto")
+        if value.strip().lower() in {"0", "false", "off", "no", "disabled"}:
+            return None
+        return getattr(
+            self.vk,
+            "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT",
+            None,
+        )
 
     def _create_command_pool(self):
         return self.vk.vkCreateCommandPool(
@@ -190,9 +241,25 @@ class VulkanGlowSourceComputeBackend:
         )
 
     def _submit_queue(self, *args) -> None:
-        # ponytail: device-wide lock; split by VkQueue handle if contention matters.
-        with self.context._lock:
+        # Use a dedicated lock (not the device-wide context._lock, which the
+        # graphics-queue compositor contends on). Swapchains/queues are
+        # submitted from distinct queues, so exclusivity against the compositor
+        # is unnecessary and only introduced stalls.
+        with self._submit_lock:
             self.vk.vkQueueSubmit(*args)
+
+    def _input_ready_wait(self, semaphore: Any) -> tuple[tuple[Any, ...], tuple[int, ...]]:
+        """Return the producer wait required by this interop backend."""
+        if bool(getattr(self, "_rocm_interop", False)):
+            # HIP is synchronized before this submission on the stable ROCm
+            # path. Do not reintroduce the AMD external-semaphore wait.
+            return (), ()
+        # CUDA copy_tensor_to_buffer() and signal_semaphore() are asynchronous;
+        # Vulkan compute must consume the CUDA-produced ready point.
+        return (
+            (semaphore,),
+            (self.vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,),
+        )
 
     def _ensure_inputs(self, required_size: int) -> None:
         required = int(required_size)
@@ -213,13 +280,20 @@ class VulkanGlowSourceComputeBackend:
                 slot.input_buffer.close()
             slot.input_ready = None
             slot.input_buffer = None
-        self.importer = CudaVulkanImageImporter()
-        self._input_capacity = required
+        self.importer = _create_interop_importer()
+        self._rocm_interop = "rocm_vulkan_interop" in type(self.importer).__module__
+        # Monitor switching can change the source aspect ratio while previous
+        # glow slots are still leased by the compositor. Reserve the complete
+        # capped source envelope once, so that a 16:9 -> 16:10 change does not
+        # tear down/import buffers mid-flight and permanently lose glow.
+        allocation_size = max(required, self.INPUT_BUFFER_CAPACITY)
+        self._input_capacity = allocation_size
         for slot in self.slots:
             slot.input_buffer = VulkanExportableBuffer(
                 self.context,
-                required,
+                allocation_size,
                 label=f"glow-source-input-{slot.index}",
+                memory_handle_type=self._input_memory_handle_type,
             )
             slot.input_ready = VulkanExportableSemaphore(
                 self.context, label=f"glow-source-ready-{slot.index}"
@@ -255,7 +329,39 @@ class VulkanGlowSourceComputeBackend:
             value = value.to(dtype=torch.float32).div_(255.0)
         elif value.dtype != torch.float32:
             value = value.to(dtype=torch.float32)
+        # Downsample so the HIP buffer copy + glow compute are cheap. The glow
+        # target is only 320x180, so a ~512px source is ample; copying the full
+        # 4K source every sample saturated the GPU and dropped the OpenXR
+        # compositor to ~8 FPS on AMD. Capping the longest side keeps the glow
+        # visually identical on NVIDIA and ROCm.
+        hist, wid = int(value.shape[-2]), int(value.shape[-1])
+        longest = max(hist, wid)
+        max_side = self.MAX_INPUT_SIDE
+        if longest > max_side:
+            scale = max_side / float(longest)
+            nh = max(1, int(round(hist * scale)))
+            nw = max(1, int(round(wid * scale)))
+            import torch.nn.functional as _F
+
+            value = _F.interpolate(
+                value, size=(nh, nw), mode="bilinear", align_corners=False
+            )
         return value.contiguous()
+
+    @staticmethod
+    def _normalize_source_crop_uv(value: Any) -> tuple[float, float, float, float]:
+        """Return a finite, in-bounds source crop rectangle in top-left UVs."""
+        try:
+            x, y, width, height = (float(item) for item in value)
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 1.0, 1.0)
+        if not all(math.isfinite(item) for item in (x, y, width, height)):
+            return (0.0, 0.0, 1.0, 1.0)
+        x = max(0.0, min(0.9, x))
+        y = max(0.0, min(0.9, y))
+        width = max(0.1, min(1.0 - x, width))
+        height = max(0.1, min(1.0 - y, height))
+        return (x, y, width, height)
 
     def submit(
         self,
@@ -264,6 +370,8 @@ class VulkanGlowSourceComputeBackend:
         mode: str,
         screen_light_only: bool = False,
         temporal_smoothing_seconds: float = 0.10,
+        source_crop_uv: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+        detect_crop: bool = False,
     ) -> bool:
         if self._closed:
             return False
@@ -282,9 +390,11 @@ class VulkanGlowSourceComputeBackend:
         start = time.perf_counter()
         prefilter_scale = self.prefilter_scale(mode)
         surround_region_average = str(mode or "").strip().lower() == "surround"
+        source_crop_uv = self._normalize_source_crop_uv(source_crop_uv)
         history_key = (
             str(mode or "").strip().lower(), source_width, source_height,
             round(prefilter_scale, 4), surround_region_average,
+            *(round(float(value), 5) for value in source_crop_uv),
         )
         temporal_alpha = 1.0
         if not screen_light_only and history_key == self._history_key:
@@ -304,6 +414,7 @@ class VulkanGlowSourceComputeBackend:
             output_image=slot.image.resource,
             screen_light_buffer=slot.screen_light_buffer,
             edge_light_buffer=slot.edge_light_buffer,
+            crop_detection_buffer=slot.crop_detection_buffer,
             history_buffer=self.history_buffer,
             source_width=source_width,
             source_height=source_height,
@@ -311,6 +422,8 @@ class VulkanGlowSourceComputeBackend:
             surround_region_average=surround_region_average,
             screen_light_only=screen_light_only,
             temporal_alpha=temporal_alpha,
+            source_crop_uv=source_crop_uv,
+            detect_crop=detect_crop,
         )
         self._record_screen_light_host_barrier(
             slot.compute_command, slot.screen_light_buffer
@@ -319,16 +432,21 @@ class VulkanGlowSourceComputeBackend:
             slot.compute_command, slot.edge_light_buffer,
             size=slot.edge_light_buffer.size,
         )
+        if detect_crop:
+            self._record_screen_light_host_barrier(
+                slot.compute_command, slot.crop_detection_buffer,
+            )
         self.vk.vkEndCommandBuffer(slot.compute_command)
+        wait_semaphores, wait_stages = self._input_ready_wait(slot.input_ready.semaphore)
         self._submit_queue(
             self.compute_queue,
             1,
             [
                 self.vk.VkSubmitInfo(
                     sType=self.vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    waitSemaphoreCount=1,
-                    pWaitSemaphores=[slot.input_ready.semaphore],
-                    pWaitDstStageMask=[self.vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT],
+                    waitSemaphoreCount=len(wait_semaphores),
+                    pWaitSemaphores=list(wait_semaphores),
+                    pWaitDstStageMask=list(wait_stages),
                     commandBufferCount=1,
                     pCommandBuffers=[slot.compute_command],
                     signalSemaphoreCount=1,
@@ -339,6 +457,7 @@ class VulkanGlowSourceComputeBackend:
         )
         self._generation += 1
         slot.generation = self._generation
+        slot.crop_detection_requested = bool(detect_crop)
         slot.state = "computing"
         if not screen_light_only:
             self._history_key = history_key
@@ -406,6 +525,14 @@ class VulkanGlowSourceComputeBackend:
                   for channel in range(3))
             for index in range(24)
         )
+        if slot.crop_detection_requested:
+            values = struct.unpack("<4f", slot.crop_detection_buffer.read_bytes(16))
+            if all(value == value and abs(value) != float("inf") for value in values):
+                self._crop_detection_uv = tuple(
+                    max(0.0, min(1.0, float(value))) for value in values
+                )
+                self._crop_detection_serial = int(slot.generation)
+            slot.crop_detection_requested = False
 
     def _record_image_barrier(
         self, command: Any, slot: _GlowSlot, *, to_sampling: bool
@@ -574,6 +701,8 @@ class VulkanGlowSourceComputeBackend:
             "screen_light_linear_rgb": self._screen_light_rgb,
             "screen_light_sample_path": "vulkan_compute_reduction",
             "screen_edge_light_linear_rgb": self._edge_light_rgb,
+            "crop_detection_uv": getattr(self, "_crop_detection_uv", None),
+            "crop_detection_serial": getattr(self, "_crop_detection_serial", -1),
             "_vulkan_glow_release": self.release_frame,
         }
 
@@ -605,6 +734,7 @@ class VulkanGlowSourceComputeBackend:
                     slot.input_buffer.close()
                 slot.screen_light_buffer.close()
                 slot.edge_light_buffer.close()
+                slot.crop_detection_buffer.close()
                 slot.compute_done.close()
                 slot.image.close()
                 self.vk.vkDestroyFence(self.context.device, slot.compute_fence, None)

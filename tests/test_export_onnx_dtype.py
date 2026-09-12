@@ -9,7 +9,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
 
 from stereo_runtime.model_artifacts import artifact_paths_for_model
-from stereo_runtime.onnx_export import _quiet_onnx_export_warnings, choose_export_dtype, export_depth_model_onnx, probe_model_dtype
+from stereo_runtime.onnx_export import (
+    _da3_preset,
+    _is_da3_model,
+    _load_da3_checkpoint,
+    _quiet_onnx_export_warnings,
+    choose_export_dtype,
+    export_depth_model_onnx,
+    probe_model_dtype,
+)
 
 
 def test_choose_export_dtype_auto_cuda_defaults_fp16():
@@ -34,6 +42,38 @@ def test_choose_export_dtype_force_fp32_keyword():
     assert dtype == torch.float32
     assert name == "fp32"
     assert "requires fp32" in reason
+
+
+def test_da3_models_use_bundled_preset_mapping():
+    assert _is_da3_model("depth-anything/DA3-BASE") is True
+    assert _da3_preset("depth-anything/DA3-BASE") == "da3-base"
+    assert _da3_preset("depth-anything/DA3NESTED-GIANT-LARGE-1.1") == "da3nested-giant-large"
+    assert _da3_preset("depth-anything/DA3METRIC-LARGE") == "da3metric-large"
+    assert _da3_preset("depth-anything/DA3MONO-LARGE") == "da3mono-large"
+
+
+def test_da3_safetensors_loader_handles_shared_layernorm_aliases(tmp_path):
+    class TiedLayerNormModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            shared = torch.nn.LayerNorm(4)
+            self.left = shared
+            self.right = shared
+
+    from safetensors.torch import save_model
+
+    source = TiedLayerNormModel()
+    with torch.no_grad():
+        source.left.weight.fill_(2.0)
+        source.left.bias.fill_(3.0)
+    path = tmp_path / "tied.safetensors"
+    save_model(source, str(path))
+
+    target = TiedLayerNormModel()
+    _load_da3_checkpoint(target, path, torch)
+
+    assert torch.equal(target.left.weight, source.left.weight)
+    assert torch.equal(target.right.bias, source.right.bias)
 
 
 def test_default_output_path_uses_actual_dtype_name():

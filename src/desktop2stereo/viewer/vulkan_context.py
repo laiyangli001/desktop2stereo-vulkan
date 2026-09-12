@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
-from threading import RLock
+from threading import Condition, RLock
 from time import perf_counter
 from typing import Any, Callable, Iterable
 
@@ -14,10 +15,21 @@ class VulkanCapabilityError(RuntimeError):
     pass
 
 
+class VulkanTimelineTimeout(VulkanCapabilityError):
+    """A bounded GPU wait expired without proving that the device is lost."""
+
+
 def is_vulkan_device_lost_error(exc: BaseException) -> bool:
     """Return whether a Vulkan binding exception reports a lost device."""
     marker = f"{type(exc).__name__} {exc}".lower().replace("_", " ")
     return "devicelost" in "".join(marker.split())
+
+
+def is_vulkan_timeout_error(exc: BaseException) -> bool:
+    """Return whether *exc* represents a bounded Vulkan synchronization timeout."""
+    marker = f"{type(exc).__name__} {exc}".lower().replace("_", " ")
+    compact = "".join(marker.split())
+    return "timeout" in compact or "timedout" in compact or "notready" in compact
 
 
 def make_vulkan_version(major: int, minor: int, patch: int = 0) -> int:
@@ -49,6 +61,7 @@ class VulkanDeviceInfo:
     transfer_queue_family_index: int = -1
     timeline_semaphore_enabled: bool = False
     synchronization2_enabled: bool = False
+    sampler_anisotropy_enabled: bool = False
     # Vulkan does not expose a portable DXGI LUID in the base properties
     # query. Keep it explicit so cross-API consumers never infer identity
     # from a name or PCI vendor alone.
@@ -265,6 +278,8 @@ class VulkanContext:
             default_queue_family_index=self.queue_family_index
         )
         self._lock = RLock()
+        self._wait_condition = Condition(self._lock)
+        self._active_blocking_waits = 0
         self._closed = False
         self._device_lost = False
         self._device_lost_error: str | None = None
@@ -308,6 +323,18 @@ class VulkanContext:
             cfg.required_instance_extensions,
             available_extensions,
         )
+        # Through a Vulkan loader, MoltenVK physical devices are only listed
+        # when portability enumeration is explicitly enabled.
+        instance_flags = 0
+        if (
+            sys.platform == "darwin"
+            and "VK_KHR_portability_enumeration" in available_extensions
+        ):
+            required_instance_extensions = (
+                *required_instance_extensions,
+                "VK_KHR_portability_enumeration",
+            )
+            instance_flags = 0x00000001  # VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
         layers: tuple[str, ...] = ()
         if cfg.enable_validation:
             validation_layer = "VK_LAYER_KHRONOS_validation"
@@ -329,6 +356,7 @@ class VulkanContext:
         )
         create_info = vk.VkInstanceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            flags=instance_flags,
             pApplicationInfo=app_info,
             enabledLayerCount=len(layers),
             ppEnabledLayerNames=list(layers) or None,
@@ -350,7 +378,7 @@ class VulkanContext:
                 cfg.required_device_extensions,
                 available_device_extensions,
             )
-            device, synchronization2_enabled = _create_device(
+            device, synchronization2_enabled, sampler_anisotropy_enabled = _create_device(
                 vk,
                 physical_device,
                 queue_families,
@@ -365,6 +393,7 @@ class VulkanContext:
                 queue_families,
                 timeline_semaphore_enabled=True,
                 synchronization2_enabled=synchronization2_enabled,
+                sampler_anisotropy_enabled=sampler_anisotropy_enabled,
             )
             return cls(
                 vk=vk,
@@ -401,6 +430,7 @@ class VulkanContext:
         owns_device: bool = True,
         timeline_semaphore_enabled: bool = False,
         synchronization2_enabled: bool = False,
+        sampler_anisotropy_enabled: bool = False,
         compute_queue_index: int = 0,
         transfer_queue_index: int = 0,
         frame_context_count: int = 3,
@@ -430,6 +460,7 @@ class VulkanContext:
                 ),
                 timeline_semaphore_enabled=timeline_semaphore_enabled,
                 synchronization2_enabled=synchronization2_enabled,
+                sampler_anisotropy_enabled=sampler_anisotropy_enabled,
             ),
             owns_instance=owns_instance,
             owns_device=owns_device,
@@ -990,8 +1021,21 @@ class VulkanContext:
             )
         return int(timeline)
 
-    def prepare_external_image_for_cuda(self, resource: Any) -> int:
-        """Establish a persistent GENERAL layout before CUDA writes external memory."""
+    def prepare_external_image_for_cuda(
+        self, resource: Any, *, wait: bool = True, defer: bool = False
+    ) -> int:
+        """Establish a persistent GENERAL layout before CUDA writes external memory.
+
+        ``wait=False`` records the layout transition but does not call
+        ``vkDeviceWaitIdle``; callers that register producer images while the
+        compositor is actively rendering use it to avoid stalling the whole
+        device mid-stream.
+
+        ``defer=True`` skips the GPU barrier submission entirely and only marks
+        the image GENERAL in the state tracker. Use it for storage-image sources
+        whose first producer access is a HIP copy + compute-read with its own
+        barrier.
+        """
 
         self._ensure_open()
         if getattr(resource, "context", self) is not self:
@@ -1008,6 +1052,17 @@ class VulkanContext:
                 "CUDA external image must be UNDEFINED or GENERAL during slot registration"
             )
         vk = self.vk
+        if defer:
+            self._image_states.update(
+                image_key,
+                ImageState(
+                    layout=vk.VK_IMAGE_LAYOUT_GENERAL,
+                    access_mask=vk.VK_ACCESS_MEMORY_WRITE_BIT,
+                    stage_mask=vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    queue_family_index=self.queue_family_index,
+                ),
+            )
+            return self._timeline_value
 
         def record(command_buffer: Any) -> None:
             barrier = vk.VkImageMemoryBarrier(
@@ -1046,12 +1101,15 @@ class VulkanContext:
         )
         # This is slot initialization only. Runtime frames synchronize through
         # the CUDA stream and never call vkDeviceWaitIdle.
-        self.wait_idle()
+        if wait:
+            self.wait_idle()
         return timeline_value
 
-    def prepare_external_image_for_producer(self, resource: Any) -> int:
+    def prepare_external_image_for_producer(
+        self, resource: Any, *, wait: bool = True, defer: bool = False
+    ) -> int:
         """Prepare an exportable image for any GPU producer backend."""
-        return self.prepare_external_image_for_cuda(resource)
+        return self.prepare_external_image_for_cuda(resource, wait=wait, defer=defer)
 
     def prepare_external_image_for_sampling(
         self,
@@ -1238,13 +1296,7 @@ class VulkanContext:
                 raise VulkanCapabilityError("Vulkan image belongs to a different context")
         if source.image is destination.image:
             raise VulkanCapabilityError("source and destination Vulkan images must differ")
-        dimensions_match = (
-            int(source.width) == int(destination.width)
-            and int(source.height) == int(destination.height)
-        )
-        if not dimensions_match and not resize:
-            raise ValueError("Vulkan image copy dimensions must match")
-        if int(source_array_layer) < 0 or int(destination_array_layer) < 0:
+        if source_array_layer < 0 or destination_array_layer < 0:
             raise ValueError("image array layers must not be negative")
         if destination_rect is None:
             destination_x0, destination_y0 = 0, 0
@@ -1260,6 +1312,16 @@ class VulkanContext:
                 and 0 <= destination_y0 < destination_y1 <= int(destination.height)
             ):
                 raise ValueError("destination_rect must be inside the destination image")
+        dimensions_match = (
+            int(source.width) == int(destination.width)
+            and int(source.height) == int(destination.height)
+        )
+        # An explicit destination rect converts the copy into a blit and is
+        # allowed to differ from both image extents (the rect is validated
+        # against the destination above; the source side is checked in the
+        # blit path below).
+        if not dimensions_match and not resize and destination_rect is None:
+            raise ValueError("Vulkan image copy dimensions must match")
         if source_rect is None:
             source_x0, source_y0 = 0, 0
             source_x1, source_y1 = int(source.width), int(source.height)
@@ -1625,6 +1687,177 @@ class VulkanContext:
             wait_semaphore=wait_semaphore,
         )
 
+    def _prepare_buffer_to_image_copy(
+        self, source: Any, destination: Any
+    ) -> tuple[Any, ImageState, Callable[[Any], None]]:
+        """Validate and record one tightly packed RGBA buffer-to-image copy."""
+        self._ensure_open()
+        if getattr(source, "context", self) is not self:
+            raise VulkanCapabilityError("Vulkan buffer belongs to a different context")
+        if getattr(destination, "context", self) is not self:
+            raise VulkanCapabilityError("Vulkan image belongs to a different context")
+        if int(source.size) < int(destination.width) * int(destination.height) * 4:
+            raise VulkanCapabilityError(
+                "Vulkan buffer is too small for the destination image"
+            )
+        vk = self.vk
+        destination_key = _cffi_handle_address(vk, destination.image)
+        destination_state = self._image_states.get(
+            destination_key, undefined_layout=vk.VK_IMAGE_LAYOUT_UNDEFINED
+        )
+        self._image_states.require_owner(destination_key, self.queue_family_index)
+        if destination_state.layout not in (
+            vk.VK_IMAGE_LAYOUT_GENERAL,
+            vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        ):
+            raise VulkanCapabilityError(
+                "buffer copy destination must be GENERAL or UNDEFINED"
+            )
+
+        def record(command_buffer: Any) -> None:
+            vk.vkCmdPipelineBarrier(
+                command_buffer,
+                vk.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        srcAccessMask=destination_state.access_mask
+                        or vk.VK_ACCESS_MEMORY_READ_BIT,
+                        dstAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        oldLayout=destination_state.layout,
+                        newLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=destination.image,
+                        subresourceRange=_color_subresource_range(vk),
+                    )
+                ],
+            )
+            vk.vkCmdCopyBufferToImage(
+                command_buffer,
+                source.buffer,
+                destination.image,
+                vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                [
+                    vk.VkBufferImageCopy(
+                        bufferOffset=0,
+                        bufferRowLength=0,
+                        bufferImageHeight=0,
+                        imageSubresource=vk.VkImageSubresourceLayers(
+                            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+                            mipLevel=0,
+                            baseArrayLayer=0,
+                            layerCount=1,
+                        ),
+                        imageOffset=vk.VkOffset3D(x=0, y=0, z=0),
+                        imageExtent=vk.VkExtent3D(
+                            width=int(destination.width),
+                            height=int(destination.height),
+                            depth=1,
+                        ),
+                    )
+                ],
+            )
+            vk.vkCmdPipelineBarrier(
+                command_buffer,
+                vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0,
+                None,
+                0,
+                None,
+                1,
+                [
+                    vk.VkImageMemoryBarrier(
+                        sType=vk.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                        srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+                        oldLayout=vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        newLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        srcQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        dstQueueFamilyIndex=vk.VK_QUEUE_FAMILY_IGNORED,
+                        image=destination.image,
+                        subresourceRange=_color_subresource_range(vk),
+                    )
+                ],
+            )
+
+        next_state = ImageState(
+            layout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            access_mask=vk.VK_ACCESS_SHADER_READ_BIT,
+            stage_mask=(
+                vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                | vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+            ),
+            queue_family_index=self.queue_family_index,
+        )
+        return destination_key, next_state, record
+
+    def copy_buffer_to_image(
+        self,
+        source: Any,
+        destination: Any,
+        *,
+        wait_for_timeline: int | None = None,
+        wait_semaphore: Any | None = None,
+        wait_semaphore_value: int | None = None,
+        signal_semaphore: Any | None = None,
+        signal_semaphore_value: int | None = None,
+    ) -> int:
+        """Copy a tightly packed RGBA buffer into a Vulkan image."""
+        destination_key, next_state, record = self._prepare_buffer_to_image_copy(
+            source, destination
+        )
+        timeline_value = self.submit_on(
+            "graphics",
+            record,
+            wait_for_timeline=wait_for_timeline,
+            wait_semaphore=wait_semaphore,
+            wait_semaphore_value=wait_semaphore_value,
+            signal_semaphore=signal_semaphore,
+            signal_semaphore_value=signal_semaphore_value,
+        )
+        self._image_states.update(destination_key, next_state)
+        return timeline_value
+
+    def copy_buffer_to_image_pair(
+        self,
+        copies: Iterable[tuple[Any, Any]],
+        *,
+        wait_for_timeline: int | None = None,
+    ) -> int:
+        """Copy a pair of RGBA buffers in one graphics-queue submission."""
+        prepared = [
+            self._prepare_buffer_to_image_copy(source, destination)
+            for source, destination in copies
+        ]
+        if len(prepared) != 2:
+            raise ValueError("copy_buffer_to_image_pair requires exactly two copies")
+        destination_keys = [item[0] for item in prepared]
+        if destination_keys[0] == destination_keys[1]:
+            raise VulkanCapabilityError("buffer copy destinations must be distinct")
+
+        def record(command_buffer: Any) -> None:
+            for _destination_key, _next_state, copy_record in prepared:
+                copy_record(command_buffer)
+
+        timeline_value = self.submit_on(
+            "graphics", record, wait_for_timeline=wait_for_timeline
+        )
+        for destination_key, next_state, _record in prepared:
+            self._image_states.update(destination_key, next_state)
+        return timeline_value
+
     def submit(self, record: Callable[[Any], None]) -> None:
         self.submit_on("graphics", record)
 
@@ -1762,50 +1995,98 @@ class VulkanContext:
             return
         with self._lock:
             self._ensure_open()
-            if self._timeline_semaphore is None:
-                self.vk.vkDeviceWaitIdle(self.device)
+            self._active_blocking_waits += 1
+            vk = self.vk
+            device = self.device
+            timeline_semaphore = self._timeline_semaphore
+        try:
+            if timeline_semaphore is None:
+                vk.vkDeviceWaitIdle(device)
                 return
-            wait_fn = getattr(self.vk, "vkWaitSemaphores", None)
-            wait_info_type = getattr(self.vk, "VkSemaphoreWaitInfo", None)
-            wait_info_structure = getattr(self.vk, "VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO", None)
+            wait_fn = getattr(vk, "vkWaitSemaphores", None)
+            wait_info_type = getattr(vk, "VkSemaphoreWaitInfo", None)
+            wait_info_structure = getattr(vk, "VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO", None)
             if wait_fn is None or wait_info_type is None or wait_info_structure is None:
-                self.vk.vkDeviceWaitIdle(self.device)
+                vk.vkDeviceWaitIdle(device)
                 return
             try:
                 result = wait_fn(
-                    self.device,
+                    device,
                     wait_info_type(
                         sType=wait_info_structure,
                         semaphoreCount=1,
-                        pSemaphores=[self._timeline_semaphore],
+                        pSemaphores=[timeline_semaphore],
                         pValues=[target],
                     ),
                     int(timeout_ns),
                 )
             except Exception as exc:
-                self.mark_device_lost(exc)
+                if is_vulkan_timeout_error(exc):
+                    raise VulkanTimelineTimeout(
+                        f"timed out waiting for Vulkan timeline value {target}"
+                    ) from exc
+                with self._lock:
+                    self.mark_device_lost(exc)
                 raise
-            if result is not None and int(result) != int(self.vk.VK_SUCCESS):
-                raise VulkanCapabilityError(
-                    f"timed out waiting for Vulkan timeline value {target}: {result}"
+            if result is not None and int(result) != int(vk.VK_SUCCESS):
+                result_code = int(result)
+                timeout_codes = {
+                    int(code)
+                    for code in (
+                        getattr(vk, "VK_TIMEOUT", None),
+                        getattr(vk, "VK_NOT_READY", None),
+                    )
+                    if code is not None
+                }
+                if result_code in timeout_codes:
+                    raise VulkanTimelineTimeout(
+                        f"timed out waiting for Vulkan timeline value {target}: {result}"
+                    )
+                device_lost_code = getattr(vk, "VK_ERROR_DEVICE_LOST", None)
+                result_text = (
+                    f"VK_ERROR_DEVICE_LOST ({result})"
+                    if device_lost_code is not None
+                    and result_code == int(device_lost_code)
+                    else str(result)
                 )
+                error = VulkanCapabilityError(
+                    f"Vulkan timeline wait for value {target} failed: {result_text}"
+                )
+                with self._lock:
+                    self.mark_device_lost(error)
+                raise error
+        finally:
+            with self._lock:
+                self._active_blocking_waits = max(0, self._active_blocking_waits - 1)
+                self._wait_condition.notify_all()
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
+            wait_condition = getattr(self, "_wait_condition", None)
+            while getattr(self, "_active_blocking_waits", 0):
+                if wait_condition is None:
+                    break
+                wait_condition.wait()
             vk = self.vk
+            # After VK_ERROR_DEVICE_LOST some Windows drivers/VDXR builds
+            # crash while destroying child Vulkan objects. The process is
+            # already abandoning this context; let the OS reclaim the dead
+            # device instead of calling into a driver with invalid state.
+            device_lost = bool(self._device_lost)
             try:
-                if self.device is not None and not self._device_lost:
+                if self.device is not None and not device_lost:
                     try:
                         vk.vkDeviceWaitIdle(self.device)
                     except Exception as exc:
                         self.mark_device_lost(exc)
-                        if not self._device_lost:
+                        device_lost = bool(self._device_lost)
+                        if not device_lost:
                             raise
                 registry = getattr(self, "_external_image_registry", None)
                 if registry is not None:
-                    if self._device_lost:
+                    if device_lost:
                         registry.discard()
                     else:
                         try:
@@ -1813,7 +2094,7 @@ class VulkanContext:
                         except Exception:
                             registry.discard()
             finally:
-                if self.device is not None:
+                if self.device is not None and not device_lost:
                     if self._timeline_semaphore is not None:
                         vk.vkDestroySemaphore(self.device, self._timeline_semaphore, None)
                     for frame in self._frame_contexts:
@@ -1822,7 +2103,7 @@ class VulkanContext:
                             vk.vkDestroyCommandPool(self.device, resources.command_pool, None)
                     if self._owns_device:
                         vk.vkDestroyDevice(self.device, None)
-                if self.instance is not None and self._owns_instance:
+                if self.instance is not None and self._owns_instance and not device_lost:
                     vk.vkDestroyInstance(self.instance, None)
                 self._image_states.clear()
                 self._external_image_registry = None
@@ -2057,9 +2338,13 @@ def _import_vulkan() -> Any:
     try:
         import vulkan as vk
     except (ImportError, OSError) as exc:
-        raise VulkanUnavailableError(
-            "Python Vulkan bindings or the Vulkan loader are unavailable"
-        ) from exc
+        message = "Python Vulkan bindings or the Vulkan loader are unavailable"
+        if sys.platform == "darwin":
+            message += (
+                ". On macOS install MoltenVK with `brew install molten-vk` "
+                "(or the LunarG Vulkan SDK), then restart."
+            )
+        raise VulkanUnavailableError(message) from exc
     return vk
 
 
@@ -2164,7 +2449,11 @@ def _find_graphics_queue_family(vk: Any, physical_device: Any) -> int | None:
 
 
 def _find_queue_families(vk: Any, physical_device: Any) -> QueueFamilySelection | None:
-    families = list(vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device))
+    # Do NOT wrap in list(): the python-vulkan binding returns an owning
+    # cffi array whose per-element structs are only valid while iterating it
+    # directly -- list() materializes fresh structs with zeroed fields, so
+    # every family looks empty and no graphics queue is ever found.
+    families = vk.vkGetPhysicalDeviceQueueFamilyProperties(physical_device)
     graphics = next(
         (
             index
@@ -2209,6 +2498,7 @@ def _device_info(
     *,
     timeline_semaphore_enabled: bool = False,
     synchronization2_enabled: bool = False,
+    sampler_anisotropy_enabled: bool = False,
 ) -> VulkanDeviceInfo:
     properties = vk.vkGetPhysicalDeviceProperties(physical_device)
     adapter_luid = _query_adapter_luid(vk, physical_device)
@@ -2224,6 +2514,7 @@ def _device_info(
         transfer_queue_family_index=int(queue_families.transfer),
         timeline_semaphore_enabled=bool(timeline_semaphore_enabled),
         synchronization2_enabled=bool(synchronization2_enabled),
+        sampler_anisotropy_enabled=bool(sampler_anisotropy_enabled),
         adapter_luid=adapter_luid,
     )
 
@@ -2336,9 +2627,18 @@ def _create_device(
     timeline_features, synchronization2_enabled = _require_timeline_semaphore_features(
         vk, physical_device
     )
+    sampler_anisotropy_enabled = physical_device_supports_sampler_anisotropy(
+        vk, physical_device
+    )
+    enabled_core_features = None
+    if sampler_anisotropy_enabled:
+        enabled_core_features = vk.VkPhysicalDeviceFeatures(
+            samplerAnisotropy=vk.VK_TRUE
+        )
     device_info = vk.VkDeviceCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         pNext=timeline_features,
+        pEnabledFeatures=enabled_core_features,
         queueCreateInfoCount=len(queue_infos),
         pQueueCreateInfos=queue_infos,
         enabledExtensionCount=len(extension_names),
@@ -2347,7 +2647,21 @@ def _create_device(
     return (
         vk.vkCreateDevice(physical_device, device_info, None),
         synchronization2_enabled,
+        sampler_anisotropy_enabled,
     )
+
+
+def physical_device_supports_sampler_anisotropy(vk: Any, physical_device: Any) -> bool:
+    """Return core sampler-anisotropy support without requiring the feature."""
+    query = getattr(vk, "vkGetPhysicalDeviceFeatures", None)
+    feature_type = getattr(vk, "VkPhysicalDeviceFeatures", None)
+    if query is None or feature_type is None:
+        return False
+    try:
+        features = query(physical_device)
+        return bool(getattr(features, "samplerAnisotropy", False))
+    except Exception:
+        return False
 
 
 def _color_subresource_range(

@@ -20,12 +20,13 @@ CONFIG_MGR_SOURCE = APP_ROOT / "gui" / "config_mgr.py"
 
 def test_left_settings_area_uses_a_bounded_scroll_viewport() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
-    scroll_start = source.index("scroll_area = ft.Column([")
+    scroll_start = source.index("self._scroll_area = ft.Column([")
     scroll_end = source.index("self.log_level_dd", scroll_start)
     scroll_source = source[scroll_start:scroll_end]
 
     assert "scroll=ft.ScrollMode.AUTO" in scroll_source
-    assert "expand=True" in scroll_source
+    assert "tight=True" in scroll_source
+    assert "alignment=ft.CrossAxisAlignment.START" in scroll_source
 
 
 def test_compact_dropdown_setters_tolerate_unattached_flet_controls() -> None:
@@ -100,11 +101,15 @@ def test_torch_device_detection_is_deferred_until_after_window_show() -> None:
     assert "async def populate_devices_after_startup" in builders
 
 
-def test_left_scroll_area_contains_the_action_footer() -> None:
+def test_action_footer_is_fixed_below_the_scrollable_content() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
 
-    assert "scroll_area.controls.append(footer)" in source
-    assert "content=scroll_area" in source
+    content_start = source.index("self._content_with_buttons = ft.Column(")
+    content_end = source.index("page.add(self._content_with_buttons)", content_start)
+    content_source = source[content_start:content_end]
+    assert "self._root_row" in content_source
+    assert "self._status_bar_contain" in content_source
+    assert "self._btn_container" in content_source
 
 
 def test_stop_and_run_buttons_are_inset_from_the_right_edge() -> None:
@@ -123,13 +128,14 @@ def test_stop_and_run_buttons_have_matching_widths() -> None:
     controls_end = source.index("lang_row =", controls_start)
     controls_source = source[controls_start:controls_end]
 
-    assert controls_source.count("width=S(130)") == 2
+    assert controls_source.count("width=S(110)") == 2
+    assert controls_source.count("height=S(32)") == 2
 
 
 def test_main_panels_stretch_to_the_page_height() -> None:
     source = BUILDERS_SOURCE.read_text(encoding="utf-8")
     root_start = source.index("self._root_row = ft.Row(")
-    root_end = source.index("page.add(self._root_row)", root_start)
+    root_end = source.index("self._status_bar_contain", root_start)
     root_source = source[root_start:root_end]
 
     assert "vertical_alignment=ft.CrossAxisAlignment.STRETCH" in root_source
@@ -275,7 +281,7 @@ def test_window_height_reserves_the_complete_action_footer() -> None:
     estimator_end = source.index("# ── label alignment", estimator_start)
     estimator_source = source[estimator_start:estimator_end]
 
-    assert "footer_height = S(104)" in estimator_source
+    assert "footer_height = S(40)" in estimator_source
     assert "safety_margin = S(0)" in estimator_source
     assert "max_height = S(1040)" in estimator_source
 
@@ -471,8 +477,8 @@ def test_display_mode_is_to_the_right_of_headset_model() -> None:
     run_row_start = source.index("self.row7a = ft.Row(")
     headset_row_start = source.index("self.xr_headset_row = ft.Row(")
     headset_row_end = source.index("self.row7b = ft.Row(", headset_row_start)
-    assembly_start = source.index("device_group = ft.Container(")
-    assembly_end = source.index("lang_group = ft.Container(", assembly_start)
+    assembly_start = source.index("device_content = ft.Column(")
+    assembly_end = source.index("device_group = ft.Container(", assembly_start)
     assembly = source[assembly_start:assembly_end]
 
     run_row = source[run_row_start:headset_row_start]

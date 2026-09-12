@@ -6,10 +6,11 @@ from ctypes import windll
 
 from wincam import DXCamera
 
-try:
-    windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
-    windll.user32.SetProcessDPIAware()
+from windows_dpi import set_per_monitor_dpi_v2
+
+# Prefer per-monitor v2 so the SBS viewer window is not rescaled to the
+# primary/system DPI on a multi-monitor setup with differing scales.
+set_per_monitor_dpi_v2()
 
 
 def get_window_client_bounds(hwnd):
@@ -244,4 +245,3 @@ class DesktopGrabber:
             except AttributeError:
                 pass
             self.camera = None
-

@@ -2,6 +2,8 @@ import ast
 import json
 from pathlib import Path
 
+import pytest
+
 
 from path_config import APP_ROOT, PROJECT_ROOT
 
@@ -90,7 +92,7 @@ def test_legacy_gpu_streamer_normalizes_to_advanced_stream_mode() -> None:
     assert resolved.fix_viewer_aspect
 
 
-def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> None:
+def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode(monkeypatch) -> None:
     from streaming.stream_session import (
         NetworkStreamSessionConfig,
         is_network_stream_mode,
@@ -112,6 +114,9 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> N
 
     # Advanced Auto keeps a distinct lazy chain so vendor-native GPU encoding
     # is attempted before Vulkan. Explicit Vulkan remains unchanged.
+    # The vendor chain is a Windows/CUDA/ROCm concept; pin the platform so
+    # the assertions hold regardless of the host running the suite.
+    monkeypatch.setattr("streaming.stream_session.sys.platform", "win32")
     nvidia_auto = resolve_network_video_backend(
         "RTMP Streamer", "auto", device_info="NVIDIA RTX 3090"
     )
@@ -129,6 +134,14 @@ def test_network_stream_session_policy_uses_gpu_backends_in_advanced_mode() -> N
     assert resolve_network_video_backend(
         "RTMP Streamer", "vulkan", device_info="NVIDIA RTX 3090"
     ).backend == "vulkan"
+    # macOS has no vendor/Vulkan encoder: Auto must land on the FFmpeg
+    # backend (VideoToolbox/libx264) instead of h264_vulkan.
+    monkeypatch.setattr("streaming.stream_session.sys.platform", "darwin")
+    mac_auto = resolve_network_video_backend(
+        "RTMP Streamer", "auto", device_info="Apple Silicon (MPS)"
+    )
+    assert mac_auto.backend == "ffmpeg"
+    assert "VideoToolbox" in mac_auto.reason
 
 
 def test_only_windows_3d_display_is_excluded_from_capture() -> None:
@@ -174,6 +187,41 @@ def test_direct_stream_output_uses_uint8_nvenc_and_fps_provider() -> None:
     assert '"NVIDIA" in str(DEVICE_INFO).upper()' in stream_branch
     assert "show_fps_provider=callbacks.show_fps" in stream_branch
     assert "observe_sbs_fps if adaptive_capture_rate.enabled else None" in stream_branch
+
+
+def test_local_viewer_uses_v25_source_size_without_changing_4k_io(monkeypatch) -> None:
+    import app_runtime.runtime_entry as runtime_entry
+
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(runtime_entry, "OUTPUT_RESOLUTION", (3840, 2160))
+    config = runtime_entry._resolve_local_viewer_render_size_config(
+        {
+            "Processing Resolution": "Auto",
+            "Display Mode": "Half-SBS",
+        },
+        "Viewer",
+        type("CudaDevice", (), {"type": "cuda"})(),
+    )
+
+    assert config.policy.value == "fixed"
+    assert (config.fixed_width, config.fixed_height) == (1920, 1080)
+    assert runtime_entry.OUTPUT_RESOLUTION == (3840, 2160)
+
+
+def test_local_viewer_native_4k_escape_hatch_and_macos_are_unchanged(monkeypatch) -> None:
+    import app_runtime.runtime_entry as runtime_entry
+
+    settings = {"Processing Resolution": "Auto", "Display Mode": "Half-SBS"}
+    device = type("CudaDevice", (), {"type": "cuda"})()
+    monkeypatch.setenv("D2S_LOCAL_VIEWER_NATIVE_4K", "1")
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ) is runtime_entry.RENDER_SIZE_CONFIG
+    monkeypatch.delenv("D2S_LOCAL_VIEWER_NATIVE_4K")
+    monkeypatch.setattr(runtime_entry.platform, "system", lambda: "Darwin")
+    assert runtime_entry._resolve_local_viewer_render_size_config(
+        settings, "Viewer", device
+    ) is runtime_entry.RENDER_SIZE_CONFIG
 
 
 def test_openxr_starts_after_inference_load_and_first_ready_output() -> None:
@@ -246,7 +294,41 @@ def test_openxr_render_scale_uses_dedicated_persisted_setting(monkeypatch):
     monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
     assert _resolve_openxr_render_scale({"OpenXR Render Scale": 0.5}) == 0.5
     assert _resolve_openxr_render_scale({"OpenXR Render Scale": 2.0}) == 2.0
-    assert _resolve_openxr_render_scale({"OpenXR Render Scale": 8.0}) == 2.0
+    assert _resolve_openxr_render_scale({"OpenXR Render Scale": 8.0}) == 4.0
+
+
+def test_openxr_render_resolution_is_canonical_and_accepts_percent(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.delenv("D2S_OPENXR_RENDER_RESOLUTION", raising=False)
+    monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
+    assert _resolve_openxr_render_scale({"XR Render": "125%"}) == 1.25
+    assert _resolve_openxr_render_scale({"XR Render": 0.5}) == 0.5
+    assert _resolve_openxr_render_scale({"XR Render": "400%"}) == 4.0
+
+
+def test_openxr_render_resolution_alias_is_supported():
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    assert _resolve_openxr_render_scale({"OpenXR Render Resolution": "400%"}) == 4.0
+
+
+def test_openxr_render_resolution_environment_override_has_priority(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.setenv("D2S_OPENXR_RENDER_RESOLUTION", "150%")
+    monkeypatch.setenv("D2S_OPENXR_RENDER_SCALE", "50%")
+    assert _resolve_openxr_render_scale({"XR Render": 0.75}) == 1.5
+
+
+def test_openxr_headset_auto_uses_quest2_optimized_scale(monkeypatch):
+    from app_runtime.runtime_entry import _resolve_openxr_render_scale
+
+    monkeypatch.delenv("D2S_OPENXR_RENDER_RESOLUTION", raising=False)
+    monkeypatch.delenv("D2S_OPENXR_RENDER_SCALE", raising=False)
+    assert _resolve_openxr_render_scale(
+        {"XR Render Mode": "auto", "XR Headset Model": "Meta Quest 2"}
+    ) == pytest.approx(1.24)
 
 def test_openxr_filament_color_defaults_come_from_common_json() -> None:
     from app_runtime.runtime_entry import _openxr_filament_config
@@ -268,6 +350,30 @@ def test_openxr_filament_color_defaults_come_from_common_json() -> None:
     assert config["filament_environment_screen_light_sample_hz"] == 12.0
     assert config["filament_glow_sample_hz"] == 30.0
     assert config["filament_glow_smoothing_seconds"] == 0.10
+
+
+def test_openxr_glow_transparency_settings_are_loaded_and_legacy_opacity_migrates() -> None:
+    from app_runtime.runtime_entry import _openxr_filament_config
+
+    config = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Transparency": {"Default": 0.35}}
+    )
+    assert config["filament_glow_transparencies"] == {"Default": 0.35}
+
+    legacy = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Opacity": {"Default": 0.65}}
+    )
+    assert legacy["filament_glow_transparencies"] == {"Default": 0.35}
+
+
+def test_openxr_glow_off_yaml_boolean_is_loaded_as_explicit_off_mode() -> None:
+    from app_runtime.runtime_entry import _openxr_filament_config
+
+    config = _openxr_filament_config(
+        {"Environment Model": "Default", "OpenXR Glow Modes": {"Default": False}}
+    )
+
+    assert config["filament_glow_modes"] == {"Default": "off"}
 
 
 def test_openxr_environment_uses_selected_folder_and_profile_glb(tmp_path: Path) -> None:

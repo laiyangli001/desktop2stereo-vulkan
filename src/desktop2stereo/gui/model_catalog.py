@@ -1,6 +1,42 @@
 """Lightweight depth-model metadata for GUI startup."""
 
-from stereo_runtime.model_registry import ModelRegistry
+V25_GUI_MODEL_NAMES = (
+    "Distill-Any-Depth-Small",
+    "Distill-Any-Depth-Base",
+    "Distill-Any-Depth-Large",
+    "InfiniDepth-Small",
+    "InfiniDepth-SmallPlus",
+    "InfiniDepth-Base",
+    "InfiniDepth-Large",
+    "Depth-Anything-V2-Small",
+    "Depth-Anything-V2-Base",
+    "Depth-Anything-V2-Large",
+    "Video-Depth-Anything-Small",
+    "Video-Depth-Anything-Base",
+    "Video-Depth-Anything-Large",
+    "DA3-SMALL",
+    "DA3-BASE",
+    "DA3-LARGE",
+    "DA3-GIANT",
+    "DA3NESTED-GIANT-LARGE",
+    "DA3MONO-LARGE",
+    "DA3METRIC-LARGE",
+    "Depth-Anything-V2-Metric-Outdoor-Small",
+    "Depth-Anything-V2-Metric-Outdoor-Base",
+    "Depth-Anything-V2-Metric-Outdoor-Large",
+    "Depth-Anything-V2-Metric-Indoor-Small",
+    "Depth-Anything-V2-Metric-Indoor-Base",
+    "Depth-Anything-V2-Metric-Indoor-Large",
+    "Metric-Video-Depth-Anything-Small",
+    "Metric-Video-Depth-Anything-Base",
+    "Metric-Video-Depth-Anything-Large",
+    "depth-anything-small",
+    "depth-anything-base",
+    "depth-anything-large",
+    "depth-anything-indoor-large",
+    "depth-anything-outdoor-large",
+    "DepthPro-Large",
+)
 
 
 def _resolutions_for_model(name):
@@ -14,6 +50,6 @@ def _resolutions_for_model(name):
 
 
 GUI_MODEL_CATALOG = {
-    spec.name: {"resolutions": _resolutions_for_model(spec.name)}
-    for spec in ModelRegistry.default().list()
+    name: {"resolutions": _resolutions_for_model(name)}
+    for name in V25_GUI_MODEL_NAMES
 }

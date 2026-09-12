@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 
 import os
@@ -40,8 +41,17 @@ LATEST_KEYS = {
     "rt_parallax_preset",
     "rt_parallax_budget_preset",
     "rt_depth_total_ms",
+    "rt_depth_nonfinite_count",
     "rt_depth_model_ms",
     "rt_depth_slot_wait_ms",
+    "rt_native_io",
+    "rt_native_input_shared",
+    "rt_native_output_backing",
+    "rt_native_output_zero_copy",
+    "rt_native_nonfinite_count",
+    "rt_metal_vulkan_alias",
+    "rt_metal_vulkan_host_handoff_copy_count",
+    "rt_metal_vulkan_gpu_copy_count",
     "rt_synthesis_ms",
     "rt_total_ms",
     "openxr_async_effects_enabled",
@@ -54,6 +64,7 @@ LATEST_KEYS = {
     "parallel_inference_pending",
     "parallel_inference_dropped",
     "openxr_vulkan_projection_quality_chain_requested",
+    "openxr_vulkan_projection_quality_chain_active",
 }
 
 
@@ -71,6 +82,33 @@ def _breakdown_log_limit() -> int:
         return 5
 
 
+_TIMING_SAMPLE_LIMIT = 512
+_TIMING_SAMPLE_NAMES = {
+    "openxr_frame_total",
+    "openxr_projection_total",
+    "openxr_vulkan_composer_queue_submit",
+    "openxr_vulkan_composer_fence_wait",
+    "openxr_vulkan_output_convert",
+    "rt_total",
+    "rt_depth_total",
+    "rt_depth_model",
+    "rt_slot_wait",
+    "local_present_interval",
+}
+
+
+def _percentile(values: tuple[float, ...], quantile: float) -> float:
+    """Return a deterministic interpolated percentile without NumPy."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 class FPSBreakdown:
     def __init__(self, *, enabled: bool, target_fps: int | float):
         self.enabled = enabled
@@ -83,6 +121,10 @@ class FPSBreakdown:
             "viewer_get": 0,
             "viewer_drop": 0,
             "local_presented_frame": 0,
+            "local_depth_presented_frame": 0,
+            "local_reused_presented": 0,
+            "local_direct_presented": 0,
+            "local_host_presented": 0,
             "loops": 0,
             "update_ms": 0.0,
             "render_ms": 0.0,
@@ -101,6 +143,7 @@ class FPSBreakdown:
         self.log_count = 0
         self.log_limit = _breakdown_log_limit()
         self.log_delay = _breakdown_log_interval()
+        self._timing_samples: dict[str, deque[float]] = {}
 
     def inc(self, name: str, amount: int | float = 1) -> None:
         if not self.enabled:
@@ -112,8 +155,11 @@ class FPSBreakdown:
         if not self.enabled:
             return
         with self.lock:
-            self.stats[f"{name}_ms"] = self.stats.get(f"{name}_ms", 0.0) + seconds * 1000.0
+            value_ms = seconds * 1000.0
+            self.stats[f"{name}_ms"] = self.stats.get(f"{name}_ms", 0.0) + value_ms
             self.stats[f"{name}_count"] = self.stats.get(f"{name}_count", 0) + 1
+            if name in _TIMING_SAMPLE_NAMES:
+                self._timing_samples.setdefault(name, deque(maxlen=_TIMING_SAMPLE_LIMIT)).append(value_ms)
 
     def add_value(self, name: str, value: float) -> None:
         if not self.enabled:
@@ -162,12 +208,53 @@ class FPSBreakdown:
         timing = getattr(runtime_result, "timing", None) or {}
         debug = getattr(runtime_result, "debug_info", None) or {}
         with self.lock:
-            for key in ("depth_total_ms", "depth_model_ms", "depth_slot_wait_ms", "synthesis_ms", "pack_ms", "total_ms"):
+            for key in ("depth_total_ms", "depth_preprocess_ms", "depth_model_ms", "depth_slot_wait_ms", "depth_postprocess_ms", "synthesis_ms", "pack_ms", "total_ms",
+                        "sbs_host_ms", "sbs_host_device_ms", "sbs_host_copy_ms", "sbs_host_numpy_ms",
+                        "packer_ms", "rt_fused_pack_ms"):
                 value = timing.get(key)
                 if value is not None:
-                    self.stats[f"rt_{key}"] = float(value)
+                    stat_key = key if key.startswith("rt_") else f"rt_{key}"
+                    self.stats[stat_key] = float(value)
+                    sample_name = {
+                        "depth_total_ms": "rt_depth_total",
+                        "depth_preprocess_ms": "rt_depth_preprocess",
+                        "depth_model_ms": "rt_depth_model",
+                        "depth_postprocess_ms": "rt_depth_postprocess",
+                        "rt_fused_pack_ms": "rt_fused_pack",
+                        "depth_slot_wait_ms": "rt_slot_wait",
+                        "total_ms": "rt_total",
+                    }.get(key)
+                    if sample_name:
+                        self._timing_samples.setdefault(
+                            sample_name, deque(maxlen=_TIMING_SAMPLE_LIMIT)
+                        ).append(float(value))
             self.stats["rt_backend"] = str(debug.get("backend", "unknown"))
             self.stats["rt_depth_backend"] = str(debug.get("runtime_depth_backend", "unknown"))
+            self.stats["rt_depth_nonfinite_count"] = int(
+                timing.get("depth_nonfinite_count", 0) or 0
+            )
+            self.stats["rt_native_io"] = int(bool(debug.get("native_coreml_io", False)))
+            self.stats["rt_native_input_shared"] = int(
+                bool(debug.get("native_coreml_input_shared", False))
+            )
+            self.stats["rt_native_output_backing"] = int(
+                bool(debug.get("native_coreml_output_backing", False))
+            )
+            self.stats["rt_native_output_zero_copy"] = int(
+                bool(debug.get("native_coreml_output_zero_copy", False))
+            )
+            self.stats["rt_native_nonfinite_count"] = int(
+                debug.get("native_coreml_nonfinite_count", 0) or 0
+            )
+            self.stats["rt_metal_vulkan_alias"] = int(
+                bool(debug.get("native_coreml_metal_vulkan_alias", False))
+            )
+            self.stats["rt_metal_vulkan_host_handoff_copy_count"] = int(
+                debug.get("native_coreml_host_handoff_copy_count", 0) or 0
+            )
+            self.stats["rt_metal_vulkan_gpu_copy_count"] = int(
+                debug.get("native_coreml_gpu_copy_count", 0) or 0
+            )
             self.stats["rt_depth_slot"] = (
                 debug.get("runtime_depth_execution_slot")
                 if debug.get("runtime_depth_execution_slot") is not None
@@ -228,6 +315,10 @@ class FPSBreakdown:
                 self.stats["openxr_vulkan_projection_quality_chain_requested"] = int(
                     bool(debug.get("openxr_vulkan_projection_quality_chain_requested", 0))
                 )
+            if "openxr_vulkan_projection_quality_chain_active" in debug:
+                self.stats["openxr_vulkan_projection_quality_chain_active"] = int(
+                    bool(debug.get("openxr_vulkan_projection_quality_chain_active", 0))
+                )
             if "fast_plus_fused_backend" in debug:
                 self.stats["rt_fast_plus_fused_backend"] = str(debug.get("fast_plus_fused_backend"))
             if "fast_plus_fused_skip" in debug:
@@ -257,6 +348,10 @@ class FPSBreakdown:
         with self.lock:
             self.log_count += 1
             stats = dict(self.stats)
+            timing_samples = {
+                name: tuple(values) for name, values in self._timing_samples.items()
+            }
+            self._timing_samples.clear()
             for key in list(self.stats.keys()):
                 if key in LATEST_KEYS:
                     continue
@@ -274,6 +369,13 @@ class FPSBreakdown:
             count = stats.get(f"{name}_count", 0)
             return stats.get(f"{name}_total", 0.0) / count if count else 0.0
 
+        def timing_stat(name: str, quantile: float) -> float:
+            return _percentile(timing_samples.get(name, ()), quantile)
+
+        def timing_max(name: str) -> float:
+            values = timing_samples.get(name, ())
+            return max(values) if values else 0.0
+
         quad_unavailable = ",".join(
             f"{key[len('openxr_quad_unavailable_'):]}:{value / elapsed:.1f}"
             for key, value in sorted(stats.items())
@@ -283,6 +385,12 @@ class FPSBreakdown:
         async_validation = self._validate_openxr_async_stats(stats)
         async_missing = ",".join(async_validation.missing) or "none"
         async_failed = ",".join(async_validation.failed) or "none"
+        quality_chain_active = bool(
+            stats.get(
+                "openxr_vulkan_projection_quality_chain_active",
+                stats.get("openxr_vulkan_projection_quality_chain_requested", False),
+            )
+        )
 
         print(
             "[FPSBreakdown] "
@@ -310,7 +418,23 @@ class FPSBreakdown:
             f"viewer_get={rate('viewer_get'):.1f} "
             f"viewer_drop={rate('viewer_drop'):.1f} "
             f"local_present={rate('local_presented_frame'):.1f} "
+            f"depth_present={rate('local_depth_presented_frame'):.1f} "
+            f"reused_present={rate('local_reused_presented'):.1f} "
+            f"direct_present={rate('local_direct_presented'):.1f} "
+            f"native_present={rate('local_native_presented'):.1f} "
+            f"host_present={rate('local_host_presented'):.1f} "
+            f"direct_claim={rate('direct_staging_claim'):.1f} "
+            f"direct_fallback={rate('direct_staging_fallback'):.1f} "
+            f"direct_error={rate('direct_staging_error'):.1f} "
+            f"direct_pack_error={rate('direct_staging_pack_error'):.1f} "
+            f"native_present_unavailable={rate('native_present_unavailable'):.1f} "
+            f"native_io_busy={rate('native_io_busy'):.1f} "
+            f"packer_drop={rate('packer_drop'):.1f} "
             f"local_present_ms={avg_ms('local_present'):.2f}ms "
+            f"present_interval_p50={timing_stat('local_present_interval', 0.50):.2f}ms "
+            f"present_interval_p95={timing_stat('local_present_interval', 0.95):.2f}ms "
+            f"present_interval_max={timing_max('local_present_interval'):.2f}ms "
+            f"local_present_pack_ms={avg_ms('local_present_pack'):.2f}ms "
             f"screen_new={rate('openxr_new_screen_frame'):.1f} "
             f"screen_reuse={rate('openxr_reused_screen_frame'):.1f} "
             f"screen_proj={rate('openxr_projection_screen_present'):.1f} "
@@ -321,7 +445,8 @@ class FPSBreakdown:
             f"screen_quad_fallback={rate('openxr_screen_quad_fallback'):.1f} "
             f"vk_composer_requested={int(bool(stats.get('openxr_vulkan_projection_composer_requested', False)))} "
             f"vk_composer_active={int(bool(stats.get('openxr_vulkan_projection_composer_active', False)))} "
-            f"vk_quality_chain={int(bool(stats.get('openxr_vulkan_projection_quality_chain_requested', False)))} "
+            "vk_quality_chain="
+            f"{int(quality_chain_active)} "
             f"vk_composer_frame={int(stats.get('openxr_vulkan_projection_composer_frame_id', -1))} "
             f"vk_composer_fallback={rate('openxr_vulkan_projection_composer_fallback'):.1f} "
             f"vk_rcas={rate('openxr_vulkan_composer_rcas'):.1f} "
@@ -488,8 +613,24 @@ class FPSBreakdown:
             f"xr_no_layers={avg_ms('openxr_render_no_layers'):.2f}ms "
             f"xr_end={avg_ms('openxr_end_frame'):.2f}ms "
             f"xr_frame={avg_ms('openxr_frame_total'):.2f}ms "
+            f"xr_frame_p50={timing_stat('openxr_frame_total', 0.50):.2f}ms "
+            f"xr_frame_p95={timing_stat('openxr_frame_total', 0.95):.2f}ms "
+            f"xr_frame_max={timing_max('openxr_frame_total'):.2f}ms "
+            f"xr_projection_p50={timing_stat('openxr_projection_total', 0.50):.2f}ms "
+            f"xr_projection_p95={timing_stat('openxr_projection_total', 0.95):.2f}ms "
+            f"xr_projection_max={timing_max('openxr_projection_total'):.2f}ms "
+            f"vk_submit_p50={timing_stat('openxr_vulkan_composer_queue_submit', 0.50):.2f}ms "
+            f"vk_submit_p95={timing_stat('openxr_vulkan_composer_queue_submit', 0.95):.2f}ms "
+            f"vk_submit_max={timing_max('openxr_vulkan_composer_queue_submit'):.2f}ms "
+            f"vk_fence_p50={timing_stat('openxr_vulkan_composer_fence_wait', 0.50):.2f}ms "
+            f"vk_fence_p95={timing_stat('openxr_vulkan_composer_fence_wait', 0.95):.2f}ms "
+            f"vk_fence_max={timing_max('openxr_vulkan_composer_fence_wait'):.2f}ms "
+            f"vk_convert_p50={timing_stat('openxr_vulkan_output_convert', 0.50):.2f}ms "
+            f"vk_convert_p95={timing_stat('openxr_vulkan_output_convert', 0.95):.2f}ms "
+            f"vk_convert_max={timing_max('openxr_vulkan_output_convert'):.2f}ms "
             f"rt_loop={avg_ms('rt_loop'):.2f}ms "
             f"rt_cap2rgb={avg_ms('rt_cap2rgb'):.2f}ms "
+            f"rt_native_preflight={avg_ms('rt_native_preflight'):.2f}ms "
             f"rt_prepare={avg_ms('rt_prepare'):.2f}ms "
             f"pre={stats.get('rt_preprocess_backend', 'unknown')} "
             f"rt_call={avg_ms('rt_call'):.2f}ms "
@@ -517,10 +658,33 @@ class FPSBreakdown:
             f"rt_gpu_openxr_pack={avg_ms('rt_gpu_openxr_pack'):.2f}ms "
             f"rt_backend={stats.get('rt_backend', 'unknown')} "
             f"rt_depth={stats.get('rt_depth_total_ms', 0.0):.2f}ms "
+            f"rt_pre={stats.get('rt_depth_preprocess_ms', 0.0):.2f}ms "
             f"rt_model={stats.get('rt_depth_model_ms', 0.0):.2f}ms "
+            f"rt_post={stats.get('rt_depth_postprocess_ms', 0.0):.2f}ms "
+            f"depth_nonfinite={int(stats.get('rt_depth_nonfinite_count', 0))} "
+            f"native_io={int(stats.get('rt_native_io', 0))} "
+            f"native_input_shared={int(stats.get('rt_native_input_shared', 0))} "
+            f"native_output_backing={int(stats.get('rt_native_output_backing', 0))} "
+            f"native_output_zero_copy={int(stats.get('rt_native_output_zero_copy', 0))} "
+            f"native_nonfinite={int(stats.get('rt_native_nonfinite_count', 0))} "
+            f"metal_vulkan_alias={int(stats.get('rt_metal_vulkan_alias', 0))} "
+            f"metal_vulkan_handoff_copies={int(stats.get('rt_metal_vulkan_host_handoff_copy_count', 0))} "
+            f"metal_vulkan_gpu_copies={int(stats.get('rt_metal_vulkan_gpu_copy_count', 0))} "
             f"rt_slot_wait={stats.get('rt_depth_slot_wait_ms', 0.0):.2f}ms "
             f"rt_synth={stats.get('rt_synthesis_ms', 0.0):.2f}ms "
             f"rt_total={stats.get('rt_total_ms', 0.0):.2f}ms "
+            f"rt_total_p50={timing_stat('rt_total', 0.50):.2f}ms "
+            f"rt_total_p95={timing_stat('rt_total', 0.95):.2f}ms "
+            f"rt_total_max={timing_max('rt_total'):.2f}ms "
+            f"rt_slot_wait_p50={timing_stat('rt_slot_wait', 0.50):.2f}ms "
+            f"rt_slot_wait_p95={timing_stat('rt_slot_wait', 0.95):.2f}ms "
+            f"rt_slot_wait_max={timing_max('rt_slot_wait'):.2f}ms "
+            f"rt_sbs_host={stats.get('rt_sbs_host_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_copy={stats.get('rt_sbs_host_copy_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_numpy={stats.get('rt_sbs_host_numpy_ms', 0.0):.2f}ms "
+            f"rt_sbs_host_presync={stats.get('rt_sbs_host_presync_ms', 0.0):.2f}ms "
+            f"packer={stats.get('packer_ms', 0.0):.2f}ms "
+            f"fused_pack={stats.get('rt_fused_pack_ms', 0.0):.2f}ms "
             f"rt_depth_backend={stats.get('rt_depth_backend', 'unknown')} "
             f"rt_depth_slot={stats.get('rt_depth_slot', 'n/a')}/{stats.get('rt_depth_slot_count', 1)} "
             f"rt_out={stats.get('rt_output_dtype', 'unknown')} "

@@ -20,6 +20,7 @@ from .depth_provider import (
     _prepare_accelerated_artifacts,
     _is_infinidepth_model,
     _model_input_size,
+    _normalization_tensors_for_model,
     _normalize_depth,
     default_lab_cache_dir,
 )
@@ -82,16 +83,22 @@ class ModelOnnxPreprocessor:
         device: torch.device,
         dtype: torch.dtype,
         fixed_input_size: tuple[int, int] | None = None,
+        target_resolution: int = DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+        patch_size: int | None = None,
     ) -> None:
         self.model_id = model_id
         self.device = device
         self.dtype = dtype
         self.fixed_input_size = fixed_input_size
+        self._target_resolution = max(1, int(target_resolution))
         self._shape_cache: dict[tuple[int, int], tuple[int, int]] = {}
         self._is_infinidepth = _is_infinidepth_model(model_id)
-        self._patch_size = INFINIDEPTH_PATCH_SIZE if self._is_infinidepth else DISTILL_ANY_DEPTH_PATCH_SIZE
-        self._mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
-        self._std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
+        self._patch_size = int(
+            patch_size
+            if patch_size is not None
+            else INFINIDEPTH_PATCH_SIZE if self._is_infinidepth else DISTILL_ANY_DEPTH_PATCH_SIZE
+        )
+        self._mean, self._std = _normalization_tensors_for_model(model_id, device, dtype)
 
     def input_size(self, height: int, width: int) -> tuple[int, int]:
         if self.fixed_input_size is not None:
@@ -103,7 +110,7 @@ class ModelOnnxPreprocessor:
         size = _model_input_size(
             height,
             width,
-            DISTILL_ANY_DEPTH_BASE_RESOLUTION,
+            self._target_resolution,
             self._patch_size,
         )
         self._shape_cache[key] = size
@@ -116,6 +123,26 @@ class ModelOnnxPreprocessor:
         tensor = F.interpolate(
             rgb,
             size=(input_h, input_w),
+            mode="bicubic" if self.device.type == "cuda" else "bilinear",
+            align_corners=False,
+            antialias=True if self.device.type == "cuda" else False,
+        ).to(self.dtype)
+        if self._is_infinidepth:
+            return tensor
+        return (tensor - self._mean) / self._std
+
+    def prepare(self, rgb: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
+        """Resize ``rgb`` to an explicit ``(height, width)`` and normalize.
+
+        Same math as ``__call__``, but with the target size fixed by the caller.
+        Used when an inference engine fixes the input resolution (e.g. a compiled
+        MIGraphX graph), so the resize does not have to follow the model-default
+        input size computation.
+        """
+        rgb = ensure_bchw(rgb, name="rgb").to(self.device).float().clamp(0, 1)
+        tensor = F.interpolate(
+            rgb,
+            size=(height, width),
             mode="bicubic" if self.device.type == "cuda" else "bilinear",
             align_corners=False,
             antialias=True if self.device.type == "cuda" else False,

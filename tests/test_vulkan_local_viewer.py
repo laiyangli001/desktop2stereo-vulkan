@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -12,7 +13,9 @@ from viewer.vulkan_local_viewer import (
     choose_present_mode,
     choose_srgb_surface_format,
     capture_refresh_warning_needed,
+    configure_glfw_taskbar_icon,
     configure_glfw_window_hints,
+    configure_taskbar_window_style,
     direct_display_capability,
     display_refresh_warning_needed,
     full_screen_exclusive_capability,
@@ -148,10 +151,12 @@ def test_display_fit_feature_is_enabled_by_default() -> None:
 
 
 def test_display_fit_contain_adds_only_expected_letterbox_bars() -> None:
+    # Half-SBS contain: eye W/2xH, Full vs Half keep original capture ratio
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "contain", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 120, 3840, 2280)),
+        ((0, 0, 1920, 2160), (0, 120, 1920, 2280)),
+        ((1920, 0, 3840, 2160), (1920, 120, 3840, 2280)),
     )
 
 
@@ -159,7 +164,8 @@ def test_display_fit_contain_uses_single_eye_aspect_for_full_sbs() -> None:
     assert presentation_blit_regions(
         (7680, 2160), (3840, 2400), "contain", "Full-SBS"
     ) == (
-        ((0, 0, 7680, 2160), (0, 660, 3840, 1740)),
+        ((0, 0, 3840, 2160), (0, 660, 1920, 1740)),
+        ((3840, 0, 7680, 2160), (1920, 660, 3840, 1740)),
     )
 
 
@@ -182,11 +188,12 @@ def test_display_fit_cover_reverses_crop_axis_for_taller_input() -> None:
 
 
 def test_display_fit_cover_preserves_full_sbs_eye_boundaries() -> None:
+    # FullSBS WxH per eye, cover short side to half
     assert presentation_blit_regions(
         (7680, 2160), (3840, 2400), "cover", "Full-SBS"
     ) == (
-        ((192, 0, 3648, 2160), (0, 0, 1920, 2400)),
-        ((4032, 0, 7488, 2160), (1920, 0, 3840, 2400)),
+        ((1056, 0, 2784, 2160), (0, 0, 1920, 2400)),
+        ((4896, 0, 6624, 2160), (1920, 0, 3840, 2400)),
     )
 
 
@@ -200,10 +207,12 @@ def test_display_fit_cover_preserves_half_tab_eye_boundaries() -> None:
 
 
 def test_display_fit_stretch_uses_the_complete_source_and_target() -> None:
+    # Stretch for packed SBS is per-eye to avoid cross-eye filtering
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "stretch", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 0, 3840, 2400)),
+        ((0, 0, 1920, 2160), (0, 0, 1920, 2400)),
+        ((1920, 0, 3840, 2160), (1920, 0, 3840, 2400)),
     )
 
 
@@ -211,7 +220,8 @@ def test_display_fit_normalizes_localized_stretch_label() -> None:
     assert presentation_blit_regions(
         (3840, 2160), (3840, 2400), "拉伸铺满", "Half-SBS"
     ) == (
-        ((0, 0, 3840, 2160), (0, 0, 3840, 2400)),
+        ((0, 0, 1920, 2160), (0, 0, 1920, 2400)),
+        ((1920, 0, 3840, 2160), (1920, 0, 3840, 2400)),
     )
 
 
@@ -263,9 +273,13 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     glfw = _WindowHintGlfw()
 
     configure_glfw_window_hints(glfw, fullscreen=True)
-    assert glfw.hints[glfw.VISIBLE] == glfw.FALSE
+    # The hidden start exists only for the Windows taskbar-button trick;
+    # other platforms create fullscreen windows visible.
+    expected_visible = glfw.FALSE if sys.platform == "win32" else glfw.TRUE
+    assert glfw.hints[glfw.VISIBLE] == expected_visible
     assert glfw.hints[glfw.DECORATED] == glfw.TRUE
-    assert glfw.hints[glfw.FLOATING] == glfw.TRUE
+    if sys.platform == "win32":
+        assert glfw.hints[glfw.FLOATING] == glfw.TRUE
 
     configure_glfw_window_hints(glfw, fullscreen=False)
 
@@ -274,6 +288,57 @@ def test_fullscreen_and_debug_preview_reset_independent_window_hints() -> None:
     assert glfw.hints[glfw.DECORATED] == glfw.TRUE
     assert glfw.hints[glfw.FLOATING] == glfw.FALSE
     assert glfw.hints[glfw.FOCUS_ON_SHOW] == glfw.TRUE
+
+
+def test_taskbar_window_style_can_show_or_hide_the_vulkan_viewer() -> None:
+    base_style = 0x00000008 | 0x08000000
+
+    hidden_style = configure_taskbar_window_style(
+        base_style, show_taskbar_button=False
+    )
+    assert hidden_style & 0x00000080
+    assert not hidden_style & 0x00040000
+
+    visible_style = configure_taskbar_window_style(
+        base_style, show_taskbar_button=True
+    )
+    assert not visible_style & 0x00000080
+    assert visible_style & 0x00040000
+
+
+def test_lsfg_taskbar_window_uses_desktop2stereo_icon(monkeypatch) -> None:
+    monkeypatch.setattr(
+        local_viewer_module,
+        "load_glfw_window_icons",
+        lambda: ("icon16", "icon32"),
+    )
+    calls = []
+
+    class FakeGlfw:
+        @staticmethod
+        def set_window_icon(window, count, icons):
+            calls.append((window, count, icons))
+
+    assert configure_glfw_taskbar_icon(
+        FakeGlfw(),
+        "viewer-window",
+        show_taskbar_button=True,
+    )
+    assert calls == [("viewer-window", 2, ("icon16", "icon32"))]
+
+
+def test_hidden_taskbar_window_does_not_apply_an_icon(monkeypatch) -> None:
+    monkeypatch.setattr(
+        local_viewer_module,
+        "load_glfw_window_icons",
+        lambda: (_ for _ in ()).throw(AssertionError("should not load icon")),
+    )
+
+    assert not configure_glfw_taskbar_icon(
+        object(),
+        "viewer-window",
+        show_taskbar_button=False,
+    )
 
 
 def test_local_viewer_reports_unorm_surface_fallback() -> None:
@@ -436,6 +501,82 @@ def test_local_viewer_reports_queue_and_present_breakdown(monkeypatch) -> None:
     assert ("local_presented_frame", 1) in counts
     assert timings[0][0] == "local_present"
     assert timings[0][1] >= 0.0
+
+
+def test_local_viewer_counts_successful_depth_presentations_and_intervals(monkeypatch) -> None:
+    shutdown = threading.Event()
+    runtime_q = queue.Queue()
+    runtime_q._d2s_ordered = True
+    for depth_complete in (True, False, True):
+        runtime_q.put(
+            (SimpleNamespace(sbs=object(), depth_complete=depth_complete), 0.0)
+        )
+    counts = []
+    timings = []
+
+    class FakeViewer:
+        calls = 0
+
+        def __init__(self, _config):
+            pass
+
+        def initialize(self):
+            pass
+
+        def present(self, _frame):
+            self.calls += 1
+            if self.calls == 3:
+                shutdown.set()
+            return self.calls > 1
+
+        def poll_events(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(local_viewer_module, "VulkanLocalViewer", FakeViewer)
+    run_vulkan_local_viewer(
+        runtime_q=runtime_q,
+        shutdown_event=shutdown,
+        config=VulkanLocalViewerConfig(
+            on_breakdown_inc=lambda name, amount: counts.append((name, amount)),
+            on_breakdown_add_time=lambda name, seconds: timings.append((name, seconds)),
+        ),
+    )
+
+    assert counts.count(("local_presented_frame", 1)) == 2
+    assert counts.count(("local_depth_presented_frame", 1)) == 1
+    assert [name for name, _ in timings].count("local_present_interval") == 1
+
+
+def test_local_viewer_passes_direct_source_without_host_payload(monkeypatch) -> None:
+    class FakeSource:
+        size = (4, 2)
+        format = None
+
+        def __init__(self):
+            self.calls = []
+
+        def present(self, pixels, *, direct=False):
+            self.calls.append((pixels, direct))
+            return True
+
+    viewer = VulkanLocalViewer(VulkanLocalViewerConfig())
+    viewer.window = object()
+    viewer.source_format = None
+    viewer._source = FakeSource()
+    monkeypatch.setattr(viewer, "poll_events", lambda: None)
+    frame = SimpleNamespace(
+        viewer_frame_direct=viewer._source,
+        viewer_frame_np=(bytearray(32), 4, 2),
+    )
+    monkeypatch.setattr(local_viewer_module, "frame_to_cuda_rgba", lambda _frame: None)
+    monkeypatch.setattr(local_viewer_module, "pack_frame_to_rgba8", lambda _frame: None)
+    monkeypatch.setattr(local_viewer_module, "frame_to_rgba_bytes", lambda _frame: (_ for _ in ()).throw(AssertionError("host fallback used")))
+
+    viewer.present(frame)
+    assert viewer._source.calls == [(None, True)]
 
 
 def test_window_preview_duplicates_output_without_replacing_fullscreen(monkeypatch) -> None:

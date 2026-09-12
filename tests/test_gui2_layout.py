@@ -361,7 +361,11 @@ def test_gui2_update_entry_is_disabled_without_running_legacy_updater():
     assert app._gui2_update_button.disabled is True
 
 
-def test_gui2_language_and_theme_menu_actions_refresh_shell():
+def test_gui2_language_and_theme_menu_actions_refresh_shell(monkeypatch):
+    monkeypatch.setattr(
+        "gui.handlers.save_yaml",
+        lambda *_args, **_kwargs: (True, ""),
+    )
     page = _Page()
     app = Desktop2StereoGUI2(page)
     app.build_ui()

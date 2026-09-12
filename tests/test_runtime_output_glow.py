@@ -31,11 +31,16 @@ def test_cuda_adapter_keeps_vulkan_screen_light_sampling_in_glb_environment() ->
         def poll(self) -> None:
             return None
 
-        def submit(self, source, *, mode, screen_light_only=False) -> bool:
+        def submit(
+            self, source, *, mode, source_crop_uv, detect_crop,
+            screen_light_only=False,
+        ) -> bool:
             self.submits += 1
             assert source == "cuda-source"
             assert mode == "screen_light"
             assert screen_light_only is True
+            assert source_crop_uv == (0.0, 0.0, 1.0, 1.0)
+            assert detect_crop is False
             return True
 
         def acquire(self, frame_id: int):
@@ -57,7 +62,6 @@ def test_cuda_adapter_keeps_vulkan_screen_light_sampling_in_glb_environment() ->
     assert "glow_vulkan_image" not in metadata
     assert metadata["screen_light_linear_rgb"] == (0.1, 0.2, 0.3)
     assert callable(metadata["_vulkan_glow_release"])
-    assert adapter._glow_cpu_metadata() == {}
 
 
 def test_cuda_adapter_uses_surround_sampling_for_room_edge_reflection() -> None:
@@ -66,13 +70,16 @@ def test_cuda_adapter_uses_surround_sampling_for_room_edge_reflection() -> None:
             return None
 
         def submit(
-            self, source, *, mode, temporal_smoothing_seconds,
+            self, source, *, mode, temporal_smoothing_seconds, source_crop_uv,
+            detect_crop,
             screen_light_only=False,
         ) -> bool:
             assert source == "cuda-source"
             assert mode == "surround"
             assert temporal_smoothing_seconds == 0.18
             assert screen_light_only is False
+            assert source_crop_uv == (0.0, 0.0, 1.0, 1.0)
+            assert detect_crop is False
             return True
 
         def acquire(self, frame_id: int):
@@ -108,11 +115,16 @@ def test_cuda_adapter_reuses_completed_glow_while_new_dispatch_runs() -> None:
         def poll(self) -> None:
             self.polls += 1
 
-        def submit(self, source, *, mode, temporal_smoothing_seconds) -> bool:
+        def submit(
+            self, source, *, mode, temporal_smoothing_seconds, source_crop_uv,
+            detect_crop,
+        ) -> bool:
             self.submits += 1
             assert source == "cuda-source"
             assert mode == "glow"
             assert temporal_smoothing_seconds == 0.10
+            assert source_crop_uv == (0.0, 0.0, 1.0, 1.0)
+            assert detect_crop is False
             return True
 
         def acquire(self, frame_id: int):
@@ -133,6 +145,41 @@ def test_cuda_adapter_reuses_completed_glow_while_new_dispatch_runs() -> None:
     assert metadata["glow_source_size"] == (320, 180)
 
 
+def test_cuda_adapter_sends_crop_to_glow_and_applies_compact_detector_result() -> None:
+    class Backend:
+        def __init__(self) -> None:
+            self.submitted = None
+
+        def poll(self) -> None:
+            return None
+
+        def submit(self, source, **kwargs) -> bool:
+            assert source == "cuda-source"
+            self.submitted = kwargs
+            return True
+
+        def acquire(self, _frame_id: int):
+            return {
+                "crop_detection_uv": (0.0, 0.1, 1.0, 0.8),
+                "crop_detection_serial": 9,
+            }
+
+    backend = Backend()
+    adapter = _adapter_with_backend(backend)
+    submitted = []
+    detected = []
+    adapter.presenter._screen_crop_source_request = lambda: ((0.0, 0.1, 1.0, 0.8), True)
+    adapter.presenter._screen_crop_detection_submitted = lambda: submitted.append(True)
+    adapter.presenter._apply_screen_crop_detection = lambda crop, serial: detected.append((crop, serial))
+
+    adapter._update_glow_gpu_source("cuda-source", frame_id=77)
+
+    assert backend.submitted["source_crop_uv"] == (0.0, 0.1, 1.0, 0.8)
+    assert backend.submitted["detect_crop"] is True
+    assert submitted == [True]
+    assert detected == [((0.0, 0.1, 1.0, 0.8), 9)]
+
+
 def test_cuda_adapter_keeps_last_glow_image_after_submit_failure() -> None:
     resource = SimpleNamespace(width=320, height=180)
 
@@ -140,7 +187,10 @@ def test_cuda_adapter_keeps_last_glow_image_after_submit_failure() -> None:
         def poll(self) -> None:
             return None
 
-        def submit(self, _source, *, mode, temporal_smoothing_seconds) -> bool:
+        def submit(
+            self, _source, *, mode, temporal_smoothing_seconds, source_crop_uv,
+            detect_crop,
+        ) -> bool:
             raise RuntimeError("dispatch failed")
 
         def acquire(self, frame_id: int):

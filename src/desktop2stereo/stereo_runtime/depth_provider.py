@@ -56,6 +56,9 @@ class DepthProviderInfo:
     fallback_reason: str | None = None
     io_binding: bool = False
     dlpack: bool = False
+    native_io_binding: bool = False
+    native_output_backing: bool = False
+    native_io_reason: str | None = None
     output_device: str | None = None
     trt_lib_dirs: list[str] | None = None
 
@@ -65,7 +68,7 @@ class DepthProviderInfo:
 
 @dataclass(frozen=True)
 class DepthProfileResult:
-    depth: torch.Tensor
+    depth: Any
     preprocess_ms: float
     model_ms: float
     postprocess_ms: float
@@ -73,6 +76,13 @@ class DepthProfileResult:
     execution_slot: int | None = None
     execution_slot_count: int = 1
     slot_wait_ms: float = 0.0
+    # Provider-side guards may repair non-finite model output before it reaches
+    # normalization. Keep the result metadata explicit for viewer telemetry.
+    finite_depth: bool = True
+    nonfinite_count: int = 0
+    native_depth: Any | None = None
+    native_resource_handle: Any | None = None
+    native_zero_copy: bool = False
 
     @property
     def total_ms(self) -> float:
@@ -85,6 +95,10 @@ class DepthProfileResult:
             "postprocess_ms": float(self.postprocess_ms),
             "slot_wait_ms": float(self.slot_wait_ms),
             "total_ms": float(self.total_ms),
+            "finite_depth": bool(self.finite_depth),
+            "nonfinite_count": int(self.nonfinite_count),
+            "native_io_binding": bool(self.native_depth is not None),
+            "native_zero_copy": bool(self.native_zero_copy),
         }
 
 
@@ -117,6 +131,8 @@ class DepthProviderConfig:
     execution_slot_count: int = 1
     depth_upsample: DepthUpsampleMode = "bilinear"
     depth_upsample_edge_strength: float = 0.35
+    use_coreml: bool = False
+    recompile_coreml: bool = False
 
 
 def default_lab_cache_dir() -> Path:
@@ -167,7 +183,13 @@ def _normalize_depth(depth: torch.Tensor, subsample_cap: int = 6_144) -> torch.T
         sorted_vals = torch.sort(sampled, dim=-1).values
         amin = sorted_vals[..., lo_idx].view(depth.shape[0], 1, 1, 1)
         amax = sorted_vals[..., hi_idx].view(depth.shape[0], 1, 1, 1)
-    return ((depth - amin) / (amax - amin).clamp_min(1e-6)).clamp(0, 1)
+    normalized = (depth - amin) / (amax - amin).clamp_min(1e-6)
+    if normalized.is_floating_point():
+        # fp16 depth sources can poison normalization with NaN/Inf; sanitize
+        # at this choke point so every downstream consumer (synthesis, warp,
+        # host-frame pack) only ever sees finite [0,1] depth.
+        normalized = torch.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=0.0)
+    return normalized.clamp(0, 1)
 
 
 def _is_infinidepth_model(model_id: str) -> bool:
@@ -189,6 +211,9 @@ def _find_local_model_weight(model_dir: str | Path) -> str | None:
         for path in root.rglob(filename):
             if _is_valid_model_weight_file(path):
                 return str(path)
+    for path in root.rglob("*.pth"):
+        if _is_valid_model_weight_file(path):
+            return str(path)
     return None
 
 
@@ -210,7 +235,7 @@ def _remove_invalid_model_weight(path: str | Path) -> None:
 
 
 def _download_hf_file_direct(model_id: str, filename: str, cache_dir: str | Path, endpoint: str) -> str:
-    import requests
+    from urllib.request import Request, urlopen
     from .model_registry import resolve_model_dir
 
     target_dir = resolve_model_dir(model_id, cache_dir)
@@ -219,12 +244,13 @@ def _download_hf_file_direct(model_id: str, filename: str, cache_dir: str | Path
     tmp = target.with_suffix(target.suffix + ".tmp")
     url = _hf_resolve_url(endpoint, model_id, filename)
     _progress_print(f"[Main] Direct model download fallback: {url} -> {target}")
-    response = requests.get(url, headers=HF_DOWNLOAD_HEADERS, stream=True, timeout=30)
-    response.raise_for_status()
-    with open(tmp, "wb") as handle:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                handle.write(chunk)
+    request = Request(url, headers=HF_DOWNLOAD_HEADERS)
+    with urlopen(request, timeout=30) as response, open(tmp, "wb") as handle:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
     if not _is_valid_model_weight_file(tmp):
         _remove_invalid_model_weight(tmp)
         raise FileNotFoundError(f"direct download produced empty model weight: {target}")
@@ -328,7 +354,29 @@ def _reachable_hf_endpoints(model_id: str) -> tuple[str, ...]:
     return tuple(reachable)
 
 
-def _load_hf_with_endpoint_fallback(load_fn: Callable[[str], Any], model_id: str):
+def _load_hf_with_endpoint_fallback(
+    load_fn: Callable[[str], Any],
+    model_id: str,
+    *,
+    local_first: Callable[[], Any] | None = None,
+):
+    """Load a HuggingFace model, preferring the local cache over the network.
+
+    ``_reachable_hf_endpoints`` raises when every mirror is unreachable (DNS
+    down, offline, VPN off). That must not gate startup when the weights are
+    already fully cached locally, so callers pass ``local_first`` to attempt
+    ``from_pretrained(..., local_files_only=True)`` before any network I/O.
+    Only when the local cache is incomplete does this fall through to the
+    endpoint probe + download path.
+    """
+    if local_first is not None:
+        try:
+            return local_first()
+        except Exception as exc:
+            _progress_print(
+                f"[Main] Local cache load failed ({type(exc).__name__}); "
+                "probing download endpoints"
+            )
     last_error = None
     for endpoint in _reachable_hf_endpoints(model_id):
         model_url = _hf_resolve_url(endpoint, model_id)
@@ -502,10 +550,30 @@ class DistillAnyDepthBase518:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
-        model = _load_hf_with_endpoint_fallback(
-            lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
-            DISTILL_ANY_DEPTH_BASE_MODEL_ID,
-        )
+        if self.local_files_only:
+            # Explicit offline mode: never touch the network.
+            model = AutoModelForDepthEstimation.from_pretrained(
+                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                **kwargs,
+            )
+        else:
+            model = _load_hf_with_endpoint_fallback(
+                lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
+                DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                # Already-downloaded weights must load without network access
+                # (the endpoint probe hard-fails when offline/DNS is down).
+                local_first=(
+                    None
+                    if self.force_download
+                    else lambda: AutoModelForDepthEstimation.from_pretrained(
+                        DISTILL_ANY_DEPTH_BASE_MODEL_ID,
+                        cache_dir=str(self.cache_dir),
+                        dtype=self.dtype,
+                        weights_only=True,
+                        local_files_only=True,
+                    )
+                ),
+            )
 
         self._model = model.to(self.device).eval()
         return self._model
@@ -543,12 +611,9 @@ class DistillAnyDepthBase518:
         sync()
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
-        model = self.load()
-        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
         sync()
         start = time.perf_counter()
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
-            predicted = model(pixel_values=tensor).predicted_depth
+        predicted = self._run_depth_model(tensor).predicted_depth
         sync()
         model_ms = (time.perf_counter() - start) * 1000.0
 
@@ -566,6 +631,19 @@ class DistillAnyDepthBase518:
         sync()
         postprocess_ms = (time.perf_counter() - start) * 1000.0
         return DepthProfileResult(depth, preprocess_ms, model_ms, postprocess_ms)
+
+    def _run_depth_model(self, tensor: torch.Tensor):
+        """Model-call hook; override to route through an alternate engine.
+
+        Must be safe to call from multiple threads (parallel depth slots);
+        the default runs the torch module with the CUDA autocast policy.
+        """
+        model = self.load()
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type, enabled=use_autocast
+        ):
+            return model(pixel_values=tensor)
 
 
 class GenericAutoDepthProvider:
@@ -620,12 +698,36 @@ class GenericAutoDepthProvider:
             "local_files_only": self.local_files_only,
             "force_download": self.force_download,
         }
-        model = _load_hf_with_endpoint_fallback(
-            lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
-            self.model_id,
-        )
+        if self.local_files_only:
+            # Explicit offline mode: never touch the network.
+            model = AutoModelForDepthEstimation.from_pretrained(
+                self.model_id,
+                **kwargs,
+            )
+        else:
+            model = _load_hf_with_endpoint_fallback(
+                lambda model_id: AutoModelForDepthEstimation.from_pretrained(model_id, **kwargs),
+                self.model_id,
+                # Already-downloaded weights must load without network access.
+                local_first=(
+                    None
+                    if self.force_download
+                    else lambda: AutoModelForDepthEstimation.from_pretrained(
+                        self.model_id,
+                        cache_dir=str(self.cache_dir),
+                        dtype=self.dtype,
+                        weights_only=True,
+                        local_files_only=True,
+                    )
+                ),
+            )
         self._model = model.to(self.device).eval()
         return self._model
+
+    def _run_depth_model(self, tensor):
+        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
+        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
+            return self.load()(pixel_values=tensor)
 
     def predict(self, rgb: torch.Tensor) -> torch.Tensor:
         return self.predict_profile(rgb).depth
@@ -659,12 +761,9 @@ class GenericAutoDepthProvider:
         sync()
         preprocess_ms = (time.perf_counter() - start) * 1000.0
 
-        model = self.load()
-        use_autocast = self.device.type == "cuda" and self.dtype == torch.float16
         sync()
         start = time.perf_counter()
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=use_autocast):
-            output = model(pixel_values=tensor)
+        output = self._run_depth_model(tensor)
         predicted = _extract_depth_output(output)
         sync()
         model_ms = (time.perf_counter() - start) * 1000.0
@@ -1029,6 +1128,8 @@ class AutoDepthProvider:
                     force_download=cfg.force_download,
                     depth_upsample=cfg.depth_upsample,
                     depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+                    use_coreml=cfg.use_coreml,
+                    recompile_coreml=cfg.recompile_coreml,
                 ),
             ))
         if os.name == "nt":
@@ -1131,6 +1232,36 @@ class AutoDepthProvider:
     def predict(self, rgb: torch.Tensor) -> torch.Tensor:
         return self.predict_profile(rgb).depth
 
+    def native_io_ready_for_frame(self, width: int, height: int) -> bool:
+        """Forward the optional macOS native bridge capability to the active provider."""
+        provider = self._activate_next()
+        checker = getattr(provider, "native_io_ready_for_frame", None)
+        if not callable(checker):
+            return False
+        return bool(checker(int(width), int(height)))
+
+    def predict_profile_native(
+        self, rgb: torch.Tensor, pixel_buffer: Any, frame_id: int
+    ) -> DepthProfileResult | None:
+        """Forward native capture inference without changing fallback behavior."""
+        provider = self._activate_next()
+        predict = getattr(provider, "predict_profile_native", None)
+        if not callable(predict):
+            if not getattr(self, "_native_io_missing_logged", False):
+                self._native_io_missing_logged = True
+                print(
+                    f"[CoreMLNativeIO] active provider has no native method: {type(provider).__name__}",
+                    flush=True,
+                )
+            return None
+        result = predict(rgb, pixel_buffer, int(frame_id))
+        self.info = replace(provider.info, fallback_reason=(
+            "; ".join(
+                f"{item['backend']}: {item['reason']}" for item in self._attempts
+            ) or None
+        ))
+        return result
+
     def close(self) -> None:
         if self._provider is not None:
             close = getattr(self._provider, "close", None)
@@ -1230,6 +1361,8 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             force_download=cfg.force_download,
             depth_upsample=cfg.depth_upsample,
             depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+            use_coreml=cfg.use_coreml,
+            recompile_coreml=cfg.recompile_coreml,
         )
 
     if backend in {"tensorrt_native", "native_tensorrt", "tensorrt_native_graph"} or (
@@ -1303,6 +1436,23 @@ def create_depth_provider(config: DepthProviderConfig | dict[str, Any] | None = 
             )
 
     if backend in {"distill_base_518", "distill_base_nvidia", "nvidia_chain", "tensorrt", "tensorrt_ort", "onnx_cuda", "onnx_cuda_iobinding", "pytorch_cuda", "pytorch"}:
+        if device.type == "mps":
+            from .providers.apple import create_pytorch_mps_provider
+
+            return create_pytorch_mps_provider(
+                model_id=cfg.model_id,
+                model_name=cfg.model_name,
+                device=device,
+                cache_dir=cfg.cache_dir,
+                depth_resolution=cfg.depth_resolution,
+                patch_size=cfg.patch_size,
+                local_files_only=cfg.local_files_only,
+                force_download=cfg.force_download,
+                depth_upsample=cfg.depth_upsample,
+                depth_upsample_edge_strength=cfg.depth_upsample_edge_strength,
+                use_coreml=cfg.use_coreml,
+                recompile_coreml=cfg.recompile_coreml,
+            )
         if cfg.model_id != DISTILL_ANY_DEPTH_BASE_MODEL_ID:
             if _is_infinidepth_model(cfg.model_id):
                 return InfiniDepthProvider(

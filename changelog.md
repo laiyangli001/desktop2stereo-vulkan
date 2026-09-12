@@ -1,5 +1,12 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 合并 `lc700x/desktop2stereo-vulkan` 的跨平台运行时更新：新增和完善 macOS CoreML/MPS/Metal、
+  ROCm/Vulkan、网络推流、桌面与 OpenXR 设置菜单、GPU 同步及配套测试；同时保留本仓库的
+  授权租约、GUI1/GUI2 切换、Windows CUDA 捕获、视频编码器选择和本地显示器配置。
+
+- OpenXR Filament 屏幕几何现在直接按当前所选头显预设解析，不再误用进程启动时缓存的
+  全局配置，运行中切换头显型号后屏幕距离和尺寸可正确生效。
+
 - 授权实施文档已拆分：本仓库只维护三平台客户端、启动器和 Runtime 门禁计划；new-api
   服务端开发计划与 `d2s.site` 部署基准迁入 `desktop2stereo-site`，避免两端状态混写。
 

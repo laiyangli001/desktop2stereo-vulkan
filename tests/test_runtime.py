@@ -7,6 +7,7 @@ from path_config import APP_ROOT
 import logging
 import pytest
 import torch
+import stereo_runtime.runtime as runtime_module
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
@@ -134,6 +135,98 @@ def test_runtime_process_rgb_frame_accepts_precomputed_depth_profile():
     assert provider.predict_count == 1
     assert result.depth is profile.depth
     assert result.timing["depth_total_ms"] == pytest.approx(profile.total_ms)
+
+
+def test_macos_stream_native_coreml_defers_gpu_pack_to_output(monkeypatch):
+    class NativeFrame:
+        source_size = (4, 2)
+        depth_width = 2
+        depth_height = 2
+        finite_depth = True
+        nonfinite_count = 0
+        preprocess_ms = 0.5
+        model_ms = 4.0
+        postprocess_ms = 0.2
+        input_shared = True
+        output_backing_used = True
+        output_zero_copy = False
+        released = False
+
+        def configure_warp(self, **values):
+            self.warp_values = values
+
+        def pack(self, destination, output_size, output_format, *, rgb=False):
+            assert output_size == (4, 2)
+            assert output_format == "half_tab"
+            assert rgb is True
+            for offset in range(0, len(destination), 3):
+                destination[offset : offset + 3] = bytes((10, 20, 30))
+
+        def release(self):
+            self.released = True
+
+    class NativeProvider(FakeDepthProvider):
+        def __init__(self):
+            super().__init__()
+            self.info = DepthProviderInfo(
+                provider="fake-coreml",
+                model_name="fake-coreml",
+                model_id="xingyang1/Distill-Any-Depth-Small-hf",
+                depth_resolution=2,
+                cache_dir=".",
+                depth_backend="coreml",
+                runtime="coreml",
+            )
+            self.native_frame = NativeFrame()
+
+        def predict_profile(self, rgb):
+            raise AssertionError("native stream must not use Python depth path")
+
+        def predict_profile_native(self, rgb, pixel_buffer, frame_id):
+            assert pixel_buffer is not None
+            assert frame_id == 7
+            return DepthProfileResult(
+                depth=self.native_frame,
+                preprocess_ms=0.5,
+                model_ms=4.0,
+                postprocess_ms=0.2,
+                finite_depth=True,
+                native_depth=self.native_frame,
+            )
+
+    monkeypatch.setattr(runtime_module.sys, "platform", "darwin")
+    monkeypatch.setenv("D2S_MAC_STREAM_NATIVE_IO", "1")
+    provider = NativeProvider()
+    runtime = StereoRuntime(
+        StereoRuntimeConfig(
+            model_id="xingyang1/Distill-Any-Depth-Small-hf",
+            device="cpu",
+            depth_backend="pytorch_mps",
+            stereo_quality="quality_4k",
+            output_format="half_tab",
+            temporal=False,
+            hole_fill="none",
+        ),
+        depth_provider=provider,
+        collect_memory_stats=False,
+    )
+
+    result = runtime.process_rgb_frame(
+        torch.empty(1, 3, 2, 4),
+        pixel_buffer=object(),
+        capture_frame_id=7,
+    )
+
+    assert result.sbs.shape == (1, 3, 2, 4)
+    assert result.native_stream_frame is provider.native_frame
+    assert result.native_stream_fallback is not None
+    assert result.output_pack_backend == "native_coreml_metal_stream_pack"
+    assert result.debug_info["native_coreml_stream_pack"] == 0
+    assert result.debug_info["native_coreml_stream_pack_deferred"] == 1
+    assert result.debug_info["native_coreml_input_shared"] == 1
+    assert result.depth_complete is True
+    assert provider.native_frame.released is False
+    runtime.close()
 
 
 def test_runtime_inference_gate_pauses_processing_and_reports_state():
