@@ -176,8 +176,9 @@ FilamentBridge* bridge_context_create(
         }
         eye.color_grading = bridge->color_grading;
         eye.foreground_view->setColorGrading(eye.color_grading);
+        filament::LinearToneMapper linear_tone_mapper;
         eye.controller_color_grading = filament::ColorGrading::Builder()
-                .toneMapping(filament::ColorGrading::ToneMapping::LINEAR)
+                .toneMapper(&linear_tone_mapper)
                 .exposure(0.0f)
                 .outputColorSpace(
                         filament::color::Rec709 - filament::color::Linear -

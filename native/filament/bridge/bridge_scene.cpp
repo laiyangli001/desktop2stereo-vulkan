@@ -48,7 +48,9 @@ int bridge_scene_load_glb(FilamentBridge* bridge, const uint8_t* bytes, uint32_t
         bridge_set_error(bridge, "Filament could not parse GLB");
         return 0;
     }
-    filament::gltfio::ResourceConfiguration config{bridge->engine, nullptr, true};
+    filament::gltfio::ResourceConfiguration config{};
+    config.engine = bridge->engine;
+    config.normalizeSkinningWeights = true;
     filament::gltfio::ResourceLoader resources(config);
     resources.addTextureProvider("image/png", bridge->texture_provider);
     resources.addTextureProvider("image/jpeg", bridge->texture_provider);

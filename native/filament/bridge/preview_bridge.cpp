@@ -278,7 +278,9 @@ int preview_bridge_load_glb(FilamentPreview* preview, const uint8_t* bytes, uint
         preview_bridge_set_error(preview, "Filament preview could not parse GLB");
         return 0;
     }
-    filament::gltfio::ResourceConfiguration config{preview->engine, nullptr, true};
+    filament::gltfio::ResourceConfiguration config{};
+    config.engine = preview->engine;
+    config.normalizeSkinningWeights = true;
     filament::gltfio::ResourceLoader resources(config);
     resources.addTextureProvider("image/png", preview->texture_provider);
     resources.addTextureProvider("image/jpeg", preview->texture_provider);

@@ -398,7 +398,9 @@ int bridge_controller_load(
         controller = {};
         return 0;
     }
-    filament::gltfio::ResourceConfiguration config{bridge->engine, nullptr, true};
+    filament::gltfio::ResourceConfiguration config{};
+    config.engine = bridge->engine;
+    config.normalizeSkinningWeights = true;
     filament::gltfio::ResourceLoader resources(config);
     resources.addTextureProvider("image/png", bridge->texture_provider);
     resources.addTextureProvider("image/jpeg", bridge->texture_provider);

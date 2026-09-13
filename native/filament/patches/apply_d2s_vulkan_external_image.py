@@ -31,6 +31,23 @@ def main() -> int:
     renderer_cpp = root / "filament/src/details/Renderer.cpp"
     post_process_manager_cpp = root / "filament/src/PostProcessManager.cpp"
     vulkan_fbo_cache_cpp = root / "filament/backend/src/vulkan/VulkanFboCache.cpp"
+    material_builder_h = root / "libs/filamat/include/filamat/MaterialBuilder.h"
+
+    # Filament 1.76's inline backend-to-target mapping omits a fallback return.
+    # MSVC and Clang diagnose this when the public header is included by the
+    # bridge, even though all current enum values are covered by the switch.
+    replace_once(
+        material_builder_h,
+        """        case Backend::NOOP:    return TargetApi::OPENGL;
+    }
+}
+""",
+        """        case Backend::NOOP:    return TargetApi::OPENGL;
+    }
+    return TargetApi::ALL;
+}
+""",
+    )
 
     # Filament 1.76 builds a multiview clearDepth package but always registers
     # the ordinary instanced package in PostProcessManager. Match the package
