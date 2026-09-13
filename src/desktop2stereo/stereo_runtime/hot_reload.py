@@ -5,7 +5,6 @@ import time
 from dataclasses import replace
 from typing import Callable
 
-from stereo_runtime import stereo_config_for_preset
 from stereo_runtime.adapter import (
     _depth_export_size_from_settings,
     _normalize_depth_backend,
@@ -15,7 +14,6 @@ from stereo_runtime.adapter import (
     _normalize_stereo_quality,
     preset_for_runtime_mode,
 )
-from stereo_runtime.presets import normalize_preset
 from stereo_runtime.settings_snapshot import RuntimeSettingsSnapshot
 from utils.xr_headset_presets import resolve_xr_headset_preset
 
@@ -162,6 +160,8 @@ def _add_rebuild_fields_if_changed(values: dict, settings_dict: dict, config) ->
 
 
 def hot_reload_value_snapshot(settings_dict: dict, config) -> dict:
+    from stereo_runtime.presets import normalize_preset
+
     has_hole_fill_mode = "Hole Fill Mode" in settings_dict
     hole_fill_mode, hole_fill_radius, hole_fill_strength = _normalize_hole_fill_mode(
         settings_dict.get("Hole Fill Mode", getattr(config, "hole_fill_mode", "balanced"))
@@ -396,6 +396,8 @@ class StereoHotReloader:
         on_openxr_config_update: Callable[..., None],
         on_mode_log: Callable[[str], None],
     ) -> bool:
+        from stereo_runtime import stereo_config_for_preset
+
         polled = self.poll_settings_snapshot_if_needed(runtime=runtime, active_preset=active_preset)
         if polled is None:
             return False
