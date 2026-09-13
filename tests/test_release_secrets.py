@@ -49,6 +49,18 @@ def test_release_secret_scan_allows_runtime_code_without_embedded_credentials(tm
     assert "secret scan passed" in result.stdout
 
 
+def test_release_secret_scan_ignores_marker_literals_in_bundled_site_packages(tmp_path: Path):
+    package = tmp_path / "Desktop2Stereo"
+    _make_package(package)
+    dependency = package / "src/python3/lib/python3.12/site-packages/cryptography/hazmat/primitives/serialization/ssh.py"
+    dependency.parent.mkdir(parents=True, exist_ok=True)
+    dependency.write_text('PRIVATE_KEY_HEADER = "-----BEGIN PRIVATE KEY-----"\n', encoding="ascii")
+
+    result = _run_scanner(package)
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("relative", "content", "expected"),
     [

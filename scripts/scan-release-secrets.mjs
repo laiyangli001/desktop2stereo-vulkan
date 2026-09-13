@@ -29,6 +29,10 @@ function relativePath(path) {
   return relative(packageRoot, path).replaceAll("\\", "/");
 }
 
+function isBundledRuntimeDependency(name) {
+  return /^src\/python3\/(?:lib\/python3\.\d+\/site-packages|Lib\/site-packages)\//i.test(name);
+}
+
 function lineNumber(content, offset) {
   return content.slice(0, offset).split(/\r?\n/).length;
 }
@@ -53,7 +57,7 @@ async function main() {
     const name = relativePath(path);
     if (forbiddenPath.test(name)) fail(`credential-like file: ${name}`);
     const extension = name.slice(name.lastIndexOf(".")).toLowerCase();
-    if (!textExtensions.has(extension)) continue;
+    if (!textExtensions.has(extension) || isBundledRuntimeDependency(name)) continue;
     const content = await readFile(path, "utf8");
     for (const [label, pattern] of secretPatterns) {
       const match = pattern.exec(content);

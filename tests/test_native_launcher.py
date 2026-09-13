@@ -32,6 +32,15 @@ def test_windows_launcher_build_definition_is_native_executable():
     assert "windowscodecs" in cmake
 
 
+def test_windows_launcher_registers_small_and_large_icons_with_wndclassex():
+    source = WINDOWS_SOURCE.read_text(encoding="utf-8")
+    assert "WNDCLASSEXW windowClass{}" in source
+    assert "windowClass.cbSize = sizeof(windowClass);" in source
+    assert "RegisterClassExW(&windowClass);" in source
+    assert "#define UNICODE" not in source
+    assert "#define _UNICODE" not in source
+
+
 def test_windows_release_launcher_does_not_bypass_authentication():
     source = WINDOWS_SOURCE.read_text(encoding="utf-8")
     assert 'SetEnvironmentVariableW(L"D2S_SKIP_AUTH", L"1")' not in source
@@ -106,6 +115,7 @@ def test_remote_build_workflow_covers_all_native_launcher_platforms():
     assert "Desktop2Stereo-macos dist/Desktop2Stereo/src/" in workflow
     assert "Desktop2Stereo.app" not in workflow
     assert "dist/Desktop2Stereo/src/" in workflow
+    assert workflow.count("actions/checkout@v5") == 3
 
 
 def test_launchers_normalize_src_directory_to_project_root():

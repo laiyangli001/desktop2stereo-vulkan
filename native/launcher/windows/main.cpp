@@ -1,6 +1,4 @@
 #define NOMINMAX
-#define UNICODE
-#define _UNICODE
 #include <windows.h>
 #include <wincodec.h>
 #include <shellapi.h>
@@ -238,13 +236,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         CoUninitialize();
         return 4;
     }
-    WNDCLASSW windowClass{};
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
     windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_DESKTOP2STEREO));
     windowClass.hIconSm = windowClass.hIcon;
     windowClass.lpfnWndProc = WindowProc;
     windowClass.lpszClassName = kWindowClass;
-    RegisterClassW(&windowClass);
+    RegisterClassExW(&windowClass);
     g_window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW |
         WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         kWindowClass, L"Desktop2Stereo", WS_POPUP,

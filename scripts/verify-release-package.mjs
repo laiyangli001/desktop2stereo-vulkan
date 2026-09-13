@@ -25,6 +25,10 @@ function relativePath(path) {
   return value;
 }
 
+function isBundledRuntimeDependency(name) {
+  return /^src\/python3\/(?:lib\/python3\.\d+\/site-packages|Lib\/site-packages)\//i.test(name);
+}
+
 async function filesUnder(directory) {
   const result = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -92,7 +96,7 @@ async function main() {
     if (forbiddenPath.test(name)) fail(`forbidden credential-like file: ${name}`);
     actualPaths.add(name);
     const extension = name.slice(name.lastIndexOf(".")).toLowerCase();
-    if (textExtensions.has(extension)) {
+    if (textExtensions.has(extension) && !isBundledRuntimeDependency(name)) {
       const content = await readFile(path, "utf8");
       if (privateKeyMarker.test(content)) fail(`private key material found in ${name}`);
     }

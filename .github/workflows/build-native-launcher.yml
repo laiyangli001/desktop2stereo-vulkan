@@ -28,7 +28,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -S native/launcher/windows -B build/native-launcher -A x64
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install launcher dependencies
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libpng-dev pkg-config
@@ -128,7 +128,7 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure universal build
         run: cmake -S native/launcher/macos -B build/native-launcher-macos -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"

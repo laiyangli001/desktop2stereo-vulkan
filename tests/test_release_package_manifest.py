@@ -126,6 +126,19 @@ def test_release_package_allows_public_pem_certificates(tmp_path: Path):
     assert verified.returncode == 0, verified.stderr
 
 
+def test_release_package_allows_pem_marker_literals_in_bundled_site_packages(tmp_path: Path):
+    package = tmp_path / "Desktop2Stereo"
+    _make_windows_package(package)
+    dependency = package / "src/python3/lib/python3.12/site-packages/cryptography/hazmat/primitives/serialization/ssh.py"
+    dependency.parent.mkdir(parents=True, exist_ok=True)
+    dependency.write_text('PRIVATE_KEY_HEADER = "-----BEGIN PRIVATE KEY-----"\n', encoding="ascii")
+    written = _run_node(MANIFEST_WRITER, str(package), cwd=ROOT)
+    assert written.returncode == 0, written.stderr
+
+    verified = _run_node(PACKAGE_VERIFIER, str(package), "windows", cwd=ROOT)
+    assert verified.returncode == 0, verified.stderr
+
+
 @pytest.mark.parametrize("platform", ["linux", "macos"])
 def test_release_package_verifies_posix_launcher_layout(tmp_path: Path, platform: str):
     if platform == "linux" and sys.platform in {"win32", "darwin"}:
