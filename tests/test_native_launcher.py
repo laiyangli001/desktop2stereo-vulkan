@@ -209,6 +209,7 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "cache: pip" in workflow
     assert "--timeout 120 --retries 3" in workflow
     assert "download.pytorch.org/whl/cpu" in workflow
+    assert "Failed to install the Windows CPU PyTorch wheel." in workflow
     assert "runtime archive SHA-256 mismatch" in stager
     assert "runtime contains a symbolic link" in stager
     assert "runtime-manifest.json" in stager
