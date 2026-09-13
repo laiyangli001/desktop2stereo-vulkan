@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 修复 launcher 最终 ClamAV 扫描阶段失败：先停止 runner 自动启动的 `clamav-freshclam` 服务再更新病毒库，避免 `freshclam.log` 锁冲突，并升级 artifact Actions 以消除 Node 20 弃用警告。
 - 优化 launcher 发布依赖安装：启用 GitHub Actions pip 缓存，Linux 优先安装 CPU PyTorch wheel，增加 pip/curl 超时与重试，避免重复下载 CUDA 版 Torch 导致工作流长时间卡住。
 - 修复发布包安全扫描误报：允许嵌入式 Python 标准库中的 `secrets.py`，仍继续拦截项目代码和其他路径中的凭据文件。
 - 进一步修复无 PyTorch 环境的授权回归：`stereo_runtime.hot_reload` 不再在模块导入阶段加载 OpenXR/Torch 渲染配置，纯 YAML 读取和设置测试可独立运行。

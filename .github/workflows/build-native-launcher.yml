@@ -71,7 +71,7 @@ jobs:
           node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload Windows launcher
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Desktop2Stereo-windows-launcher-${{ github.sha }}
           path: dist/Desktop2Stereo
@@ -124,7 +124,7 @@ jobs:
           node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload Linux launcher
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Desktop2Stereo-linux-launcher-${{ github.sha }}
           path: dist/Desktop2Stereo
@@ -173,7 +173,7 @@ jobs:
           node scripts/scan-release-secrets.mjs dist/Desktop2Stereo
 
       - name: Upload macOS launcher
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Desktop2Stereo-macos-launcher-${{ github.sha }}
           path: dist/Desktop2Stereo
@@ -186,7 +186,7 @@ jobs:
       contents: read
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: Desktop2Stereo-*-launcher-${{ github.sha }}
           path: dist
@@ -195,7 +195,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
 
       - name: Update ClamAV signatures
-        run: sudo freshclam --stdout --verbose
+        run: |
+          sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
+          sudo freshclam --stdout --verbose --log=/dev/stderr
 
       - name: Scan final release artifacts
         run: |
