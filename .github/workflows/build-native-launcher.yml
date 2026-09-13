@@ -188,7 +188,7 @@ jobs:
       contents: read
     steps:
       - name: Download all platform artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           pattern: Desktop2Stereo-*-launcher-${{ github.sha }}
           path: dist
@@ -199,7 +199,9 @@ jobs:
       - name: Update ClamAV signatures
         run: |
           sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
-          sudo freshclam --stdout --verbose --log=/dev/stderr
+          freshclam_log="$RUNNER_TEMP/freshclam.log"
+          sudo freshclam --verbose --log="$freshclam_log"
+          sudo cat "$freshclam_log"
 
       - name: Scan final release artifacts
         run: |
