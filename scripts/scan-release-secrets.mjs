@@ -29,6 +29,10 @@ function relativePath(path) {
   return relative(packageRoot, path).replaceAll("\\", "/");
 }
 
+function isBundledPythonRuntimeFile(name) {
+  return /^src\/python3\/(?:lib\/python3\.\d+|Lib)\//i.test(name);
+}
+
 function isBundledRuntimeDependency(name) {
   return /^src\/python3\/(?:lib\/python3\.\d+\/site-packages|Lib\/site-packages)\//i.test(name);
 }
@@ -55,7 +59,9 @@ async function main() {
 
   for (const path of await filesUnder(packageRoot)) {
     const name = relativePath(path);
-    if (forbiddenPath.test(name)) fail(`credential-like file: ${name}`);
+    if (forbiddenPath.test(name) && !isBundledPythonRuntimeFile(name)) {
+      fail(`credential-like file: ${name}`);
+    }
     const extension = name.slice(name.lastIndexOf(".")).toLowerCase();
     if (!textExtensions.has(extension) || isBundledRuntimeDependency(name)) continue;
     const content = await readFile(path, "utf8");

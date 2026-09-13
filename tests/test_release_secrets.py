@@ -61,6 +61,18 @@ def test_release_secret_scan_ignores_marker_literals_in_bundled_site_packages(tm
     assert result.returncode == 0, result.stderr
 
 
+def test_release_secret_scan_allows_python_stdlib_secrets_module(tmp_path: Path):
+    package = tmp_path / "Desktop2Stereo"
+    _make_package(package)
+    stdlib = package / "src/python3/lib/python3.12/secrets.py"
+    stdlib.parent.mkdir(parents=True, exist_ok=True)
+    stdlib.write_text("# Python standard library secrets module\n", encoding="ascii")
+
+    result = _run_scanner(package)
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("relative", "content", "expected"),
     [
