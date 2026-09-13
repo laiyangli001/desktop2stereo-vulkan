@@ -1,4 +1,5 @@
 #include <X11/Xlib.h>
+#include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <png.h>
 
@@ -43,6 +44,15 @@ static fs::path find_asset(const fs::path& root) {
                                   root / "d2s_blur.png",
                                   root / "resources/d2s_blur.png"}) {
         if (fs::is_regular_file(candidate)) return candidate;
+    }
+    return {};
+}
+
+static fs::path find_icon_asset(const fs::path& root) {
+    for (const auto& candidate : {root / "src/desktop2stereo/icon/icon-256x256.png",
+                                  root / "src/desktop2stereo/icon/icon-256x256.ico",
+                                  root / "resources/icon-256x256.png"}) {
+        if (fs::is_regular_file(candidate) && candidate.extension() == ".png") return candidate;
     }
     return {};
 }
@@ -101,6 +111,21 @@ static bool ready(const fs::path& auth_path, const fs::path& gui_path) {
     return fs::is_regular_file(auth_path) || fs::is_regular_file(gui_path);
 }
 
+static void set_window_icon(Display* display, Window window, const Image& icon) {
+    const Atom property = XInternAtom(display, "_NET_WM_ICON", False);
+    const Atom cardinal = XInternAtom(display, "CARDINAL", False);
+    if (property == None || cardinal == None || icon.pixels.empty()) return;
+    std::vector<unsigned long> data(2 + icon.pixels.size());
+    data[0] = static_cast<unsigned long>(icon.width);
+    data[1] = static_cast<unsigned long>(icon.height);
+    for (size_t index = 0; index < icon.pixels.size(); ++index) {
+        data[index + 2] = static_cast<unsigned long>(icon.pixels[index]);
+    }
+    XChangeProperty(display, window, property, cardinal, 32, PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(data.data()),
+                    static_cast<int>(data.size()));
+}
+
 static void stop_child(pid_t child) {
     if (child <= 0) return;
     if (kill(child, SIGTERM) == 0) {
@@ -125,8 +150,9 @@ int main() {
     const auto ready_file = log_dir / "gui_ready.flag";
     const auto auth_ready_file = log_dir / "auth_ready.flag";
     const auto image_path = find_asset(root);
-    if (!fs::is_regular_file(python) || !fs::is_regular_file(main_script) || image_path.empty()) {
-        std::cerr << "Desktop2Stereo launcher: runtime, main.py, or d2s_blur.png is missing\n";
+    const auto icon_path = find_icon_asset(root);
+    if (!fs::is_regular_file(python) || !fs::is_regular_file(main_script) || image_path.empty() || icon_path.empty()) {
+        std::cerr << "Desktop2Stereo launcher: runtime, main.py, splash, or icon is missing\n";
         return 2;
     }
     std::error_code ec;
@@ -152,6 +178,12 @@ int main() {
         std::cerr << "Desktop2Stereo launcher: failed to decode d2s_blur.png\n";
         return 4;
     }
+    Image icon;
+    if (!load_png(icon_path, 256, 256, icon)) {
+        XCloseDisplay(display);
+        std::cerr << "Desktop2Stereo launcher: failed to decode application icon\n";
+        return 4;
+    }
 
     XVisualInfo visual_info{};
     const bool has_argb_visual = XMatchVisualInfo(display, screen, 32, TrueColor, &visual_info) != 0;
@@ -166,6 +198,7 @@ int main() {
                                   (screen_width - width) / 2, (screen_height - height) / 2,
                                   width, height, 0, depth, InputOutput, visual,
                                   CWOverrideRedirect | CWColormap | CWBackPixel, &attributes);
+    set_window_icon(display, window, icon);
     XSelectInput(display, window, ExposureMask | StructureNotifyMask);
     XMapRaised(display, window);
     XFlush(display);

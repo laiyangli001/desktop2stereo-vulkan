@@ -5,9 +5,9 @@ import { join, relative, resolve } from "node:path";
 const packageRoot = resolve(process.argv[2] || "");
 const platform = String(process.argv[3] || "").trim().toLowerCase();
 const requiredFiles = {
-  windows: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo.exe", "src/python3/python.exe", "src/desktop2stereo/main.py"],
-  linux: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo", "src/python3/bin/python", "src/desktop2stereo/main.py"],
-  macos: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo-macos", "src/python3/bin/python", "src/desktop2stereo/main.py"],
+  windows: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo.exe", "src/python3/python.exe", "src/desktop2stereo/main.py", "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png"],
+  linux: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo", "src/python3/bin/python", "src/desktop2stereo/main.py", "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png"],
+  macos: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo-macos", "src/python3/bin/python", "src/desktop2stereo/main.py", "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png"],
 };
 const textExtensions = new Set([".bat", ".bash", ".cpp", ".h", ".json", ".md", ".mm", ".pem", ".plist", ".py", ".sh", ".txt", ".yml", ".yaml"]);
 const forbiddenPath = /(^|\/)(?:\.env(?:\..*)?|credentials|secrets?|.*\.(?:pfx|p12|p8))$/i;

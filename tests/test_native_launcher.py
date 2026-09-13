@@ -27,7 +27,8 @@ def test_windows_launcher_uses_native_layered_splash_and_ready_handshake():
 
 def test_windows_launcher_build_definition_is_native_executable():
     cmake = WINDOWS_CMAKE.read_text(encoding="utf-8")
-    assert "add_executable(Desktop2Stereo WIN32 main.cpp)" in cmake
+    assert "add_executable(Desktop2Stereo WIN32 main.cpp resource.rc)" in cmake
+    assert (ROOT / "native/launcher/windows/resource.rc").is_file()
     assert "windowscodecs" in cmake
 
 

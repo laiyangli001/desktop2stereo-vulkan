@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <wincodec.h>
 #include <shellapi.h>
+#include "resource.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -239,6 +240,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     WNDCLASSW windowClass{};
     windowClass.hInstance = instance;
+    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_DESKTOP2STEREO));
+    windowClass.hIconSm = windowClass.hIcon;
     windowClass.lpfnWndProc = WindowProc;
     windowClass.lpszClassName = kWindowClass;
     RegisterClassW(&windowClass);

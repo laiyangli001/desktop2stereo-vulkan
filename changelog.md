@@ -1,5 +1,7 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 统一三平台应用图标：GUI1、GUI2 和授权窗口使用多分辨率图标资源；Windows 原生启动器嵌入 ICO，Linux X11 启动器设置 `_NET_WM_ICON`，macOS 启动器设置 AppKit 应用图标，发布包同步携带 ICO/PNG 图标目录。
+
 - 合并 `lc700x/desktop2stereo-vulkan` 的跨平台运行时更新：新增和完善 macOS CoreML/MPS/Metal、
   ROCm/Vulkan、网络推流、桌面与 OpenXR 设置菜单、GPU 同步及配套测试；同时保留本仓库的
   授权租约、GUI1/GUI2 切换、Windows CUDA 捕获、视频编码器选择和本地显示器配置。

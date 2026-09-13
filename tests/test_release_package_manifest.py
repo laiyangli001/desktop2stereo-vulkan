@@ -23,7 +23,10 @@ def _run_node(script: Path, *args: str, cwd: Path) -> subprocess.CompletedProces
 
 
 def _make_windows_package(root: Path) -> None:
-    for relative in ("src/Desktop2Stereo.exe", "src/python3/python.exe", "src/desktop2stereo/main.py"):
+    for relative in (
+        "src/Desktop2Stereo.exe", "src/python3/python.exe", "src/desktop2stereo/main.py",
+        "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png",
+    ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(relative.encode("ascii"))
@@ -45,7 +48,10 @@ def _make_windows_package(root: Path) -> None:
 
 def _make_posix_package(root: Path, platform: str) -> None:
     binary = "src/Desktop2Stereo" if platform == "linux" else "src/Desktop2Stereo-macos"
-    for relative in (binary, "src/python3/bin/python", "src/desktop2stereo/main.py"):
+    for relative in (
+        binary, "src/python3/bin/python", "src/desktop2stereo/main.py",
+        "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png",
+    ):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(relative.encode("ascii"))

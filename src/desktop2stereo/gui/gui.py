@@ -21,7 +21,7 @@ from .config_mgr import GUIConfigMixin
 from .process import GUIProcessMixin, _setup_console_logging
 from .config import DEFAULTS
 from .controls import S
-from .paths import BASE_DIR, GUI_READY_FILE, LOG_DIR
+from .paths import APP_ICON_PATH, BASE_DIR, GUI_READY_FILE, LOG_DIR
 from .localization import UI_MESSAGES
 
 
@@ -103,7 +103,7 @@ class Desktop2StereoGUI(
         self._hot_save_task = None
 
         self.page.title = f"Desktop2Stereo v{VERSION}"
-        self.page.window.icon = os.path.join(BASE_DIR, "icon.ico")
+        self.page.window.icon = APP_ICON_PATH
         self.page.padding = self.GUI_PAGE_PADDING
         self.page.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
         if OS_NAME == "Windows":

@@ -34,7 +34,9 @@
     NSString* python = [root stringByAppendingPathComponent:@"src/python3/bin/python"];
     NSString* script = [app stringByAppendingPathComponent:@"main.py"];
     NSString* imagePath = [app stringByAppendingPathComponent:@"d2s_blur.png"];
+    NSString* iconPath = [app stringByAppendingPathComponent:@"icon/icon-256x256.png"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:imagePath]) imagePath = [root stringByAppendingPathComponent:@"d2s_blur.png"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:iconPath]) iconPath = [root stringByAppendingPathComponent:@"src/desktop2stereo/icon/icon-256x256.png"];
     self.readyPath = [app stringByAppendingPathComponent:@"logs/gui_ready.flag"];
     self.authReadyPath = [app stringByAppendingPathComponent:@"logs/auth_ready.flag"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:python] || ![[NSFileManager defaultManager] fileExistsAtPath:script] || ![[NSFileManager defaultManager] fileExistsAtPath:imagePath]) {
@@ -42,6 +44,8 @@
         [NSApp terminate:nil];
         return;
     }
+    NSImage* applicationIcon = [[NSImage alloc] initWithContentsOfFile:iconPath];
+    if (applicationIcon != nil) [NSApp setApplicationIconImage:applicationIcon];
     [[NSFileManager defaultManager] removeItemAtPath:self.readyPath error:nil];
     [[NSFileManager defaultManager] removeItemAtPath:self.authReadyPath error:nil];
     NSScreen* screen = [NSScreen mainScreen];

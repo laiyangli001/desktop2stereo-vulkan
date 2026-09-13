@@ -5,4 +5,5 @@
 <key>CFBundleExecutable</key><string>Desktop2Stereo</string>
 <key>CFBundleIdentifier</key><string>site.d2s.desktop2stereo.launcher</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>icon-256x256.png</string>
 </dict></plist>

@@ -127,6 +127,9 @@ class LoginLauncher:
     async def _main(self, page: ft.Page):
         self._page = page
         page.title = "Desktop2Stereo 登录验证"
+        icon_path = Path(__file__).resolve().parent / "icon" / "icon-256x256.ico"
+        if icon_path.is_file():
+            page.window.icon = str(icon_path)
         page.window.width = 440
         page.window.height = 560
         page.window.resizable = False

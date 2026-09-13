@@ -7,6 +7,7 @@ on:
       - "native/launcher/**"
       - "src/desktop2stereo/auth/**"
       - "src/desktop2stereo/app_runtime/**"
+      - "src/desktop2stereo/icon/**"
       - "src/desktop2stereo/main.py"
       - "src/env_install/requirements*.txt"
       - "scripts/install-public-key.mjs"
@@ -52,6 +53,7 @@ jobs:
           Copy-Item src/desktop2stereo/main.py dist/Desktop2Stereo/src/desktop2stereo/
           Copy-Item src/desktop2stereo/app_runtime,src/desktop2stereo/auth,src/desktop2stereo/gui,src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/ -Recurse
           Copy-Item src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
+          Copy-Item src/desktop2stereo/icon dist/Desktop2Stereo/src/desktop2stereo/ -Recurse
           Copy-Item native/launcher/windows/README.md dist/Desktop2Stereo/
           node scripts/write-build-info.mjs dist/Desktop2Stereo
           $runtimeUrl = "https://www.nuget.org/api/v2/package/python/3.12.10"
@@ -103,6 +105,7 @@ jobs:
           cp src/desktop2stereo/main.py dist/Desktop2Stereo/src/desktop2stereo/
           cp -R src/desktop2stereo/app_runtime src/desktop2stereo/auth src/desktop2stereo/gui src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/
           cp src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
+          cp -R src/desktop2stereo/icon dist/Desktop2Stereo/src/desktop2stereo/
           cp native/launcher/linux/README.md dist/Desktop2Stereo/
           node scripts/write-build-info.mjs dist/Desktop2Stereo
           runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
@@ -149,6 +152,7 @@ jobs:
           cp src/desktop2stereo/main.py dist/Desktop2Stereo/src/desktop2stereo/
           cp -R src/desktop2stereo/app_runtime src/desktop2stereo/auth src/desktop2stereo/gui src/desktop2stereo/gui2 dist/Desktop2Stereo/src/desktop2stereo/
           cp src/desktop2stereo/d2s_blur.png dist/Desktop2Stereo/src/desktop2stereo/
+          cp -R src/desktop2stereo/icon dist/Desktop2Stereo/src/desktop2stereo/
           cp native/launcher/macos/README.md dist/Desktop2Stereo/
           node scripts/write-build-info.mjs dist/Desktop2Stereo
           runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-apple-darwin-install_only_stripped.tar.gz"
