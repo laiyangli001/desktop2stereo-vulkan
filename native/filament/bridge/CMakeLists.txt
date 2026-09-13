@@ -10,11 +10,11 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/windows/v1.75.0")
+    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/windows/v1.76.0")
 elseif(APPLE)
-    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/macos/v1.75.0/filament")
+    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/macos/v1.76.0/filament")
 elseif(UNIX)
-    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/linux/v1.75.0/filament")
+    set(_filament_default_sdk "${CMAKE_CURRENT_SOURCE_DIR}/../sdk/linux/v1.76.0/filament")
 endif()
 set(FILAMENT_SDK_ROOT "${_filament_default_sdk}" CACHE PATH "Root of the platform-specific Filament SDK")
 if(NOT FILAMENT_SDK_ROOT)
@@ -32,7 +32,7 @@ set(_bluevk_header "${_bluevk_include_dir}/bluevk/BlueVK.h")
 if(NOT EXISTS "${_bluevk_header}")
     file(MAKE_DIRECTORY "${_bluevk_include_dir}/bluevk")
     file(DOWNLOAD
-        "https://raw.githubusercontent.com/google/filament/v1.75.0/libs/bluevk/include/bluevk/BlueVK.h"
+        "https://raw.githubusercontent.com/google/filament/v1.76.0/libs/bluevk/include/bluevk/BlueVK.h"
         "${_bluevk_header}"
         EXPECTED_HASH SHA256=a015af17b3cac987df35fb0896f4bd92497a5937e515db817203baac034ca424
         STATUS _bluevk_download_status

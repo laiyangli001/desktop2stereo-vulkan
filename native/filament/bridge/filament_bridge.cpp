@@ -297,7 +297,7 @@ int filament_bridge_vulkan_external_image_abi_available(
 #if defined(D2S_FILAMENT_VULKAN_EXTERNAL_IMAGE)
     return 1;
 #else
-    // Filament v1.75's public Texture::Builder::import API does not accept
+    // Filament v1.76's public Texture::Builder::import API does not accept
     // Vulkan VkImage handles. Keep the capability disabled until the Vulkan
     // backend is extended with a real external-image implementation.
     return 0;

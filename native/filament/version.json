@@ -1,23 +1,23 @@
 {
-  "version": "1.75.0",
-  "release_url": "https://github.com/google/filament/releases/tag/v1.75.0",
+  "version": "1.76.0",
+  "release_url": "https://github.com/google/filament/releases/tag/v1.76.0",
   "source": {
     "repository": "https://github.com/google/filament.git",
-    "ref": "v1.75.0",
+    "ref": "v1.76.0",
     "patch": "native/filament/patches/apply_d2s_vulkan_external_image.py"
   },
   "platforms": {
     "windows": {
-      "asset": "filament-v1.75.0-windows.tgz",
-      "sha256": "36b3f90e3551e683fd1567cf36fc01eddd284a774f64ddfaeca624ccdc657e03"
+      "asset": "filament-v1.76.0-windows.tgz",
+      "sha256": "1f58ebac557dd9ce9551ad67cede02db962c31a8c6abc9c87f74dc7ee50b0098"
     },
     "linux": {
-      "asset": "filament-v1.75.0-linux.tgz",
-      "sha256": "c5d2e0f692e5fb98ed029a5a3a52c8174660d02844d5db5a804dc5264bbab6d1"
+      "asset": "filament-v1.76.0-linux.tgz",
+      "sha256": "08f96fbce1432d7a5faf34b3e96a186639b89663f8a215e6d2c36ad6cb73fa4a"
     },
     "macos": {
-      "asset": "filament-v1.75.0-mac.tgz",
-      "sha256": "731b5fe71844e82e2ee45b891b05b9c07599fabccd297033275d90baefe97021"
+      "asset": "filament-v1.76.0-mac.tgz",
+      "sha256": "6f067ac0931b305c32be108679cf5b0c59a3fb51753d0c64d60d290b4f28b2db"
     }
   }
 }

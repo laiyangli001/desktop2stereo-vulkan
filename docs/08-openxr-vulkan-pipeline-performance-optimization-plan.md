@@ -110,7 +110,7 @@ Renderer 后，连续对两个 SwapChain 执行 deferred frame 又会在固定�
 条件，Presenter 当前固定使用逐眼 `endFrame()` + `flushAndWait()`，完成一眼后才切换
 SwapChain。真正的一次双眼提交必须建立在单个 array swapchain / multiview frame 上。
 
-共享 Renderer 后仍需修复 Filament 1.75 Vulkan backend 的多 SwapChain 状态：
+共享 Renderer 后仍需修复 Filament 1.76 Vulkan backend 的多 SwapChain 状态：
 `VulkanDriver` 只保存一个 `mDefaultRenderTarget`，且 `isSwapchainBound()` 不区分左右眼
 SwapChain，导致切换到 eye1 时仍绑定 eye0 的默认 RenderTarget。D2S backend patch 让
 `VulkanRenderTarget` 记录当前绑定的 SwapChain/image，`acquireNextSwapchainImage()` 在

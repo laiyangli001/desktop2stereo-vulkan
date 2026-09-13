@@ -72,7 +72,7 @@ Python产品代码必须直接支持Windows x86_64、Linux x86_64和macOS arm64�
 
 新工程允许重新实现该Bridge，使其支持Filament Vulkan Backend和Python提供的Vulkan/OpenXR目标。Bridge是核心 XR 场景的自有原生边界，只管理Filament对象和渲染调用；Capture、Inference、Vulkan资源图、OpenXR生命周期和产品状态机必须保留在Python。网络/捕获/推理边界的可选原生组件另行管理，不能越过边界拥有 OpenXR 或场景资源。所有桥接使用窄C ABI并由Python通过`ctypes`或`cffi`加载。
 
-Filament Vulkan 外部源图像接口必须以源码扩展方式接入，不得把 release SDK 的通用 `Texture::Builder::import()` 猜测为 Vulkan `VkImage` 接口。当前版本锁定 Filament `v1.75.0`，补丁脚本为 `native/filament/patches/apply_d2s_vulkan_external_image.py`：它在 `VulkanPlatform` 中增加借用式 `VkImage` 外部句柄、格式/尺寸元数据和 `ExternalImage` 工厂，Bridge 通过 `D2S_FILAMENT_VULKAN_EXTERNAL_IMAGE` 编译开关启用。补丁只包装调用方所有的 `VkImage`，不负责销毁图像、内存、OpenXR swapchain 或 producer semaphore；layout、queue family、producer-ready 和 consumer-release 仍由 Python Presenter 的 Vulkan 同步契约负责。
+Filament Vulkan 外部源图像接口必须以源码扩展方式接入，不得把 release SDK 的通用 `Texture::Builder::import()` 猜测为 Vulkan `VkImage` 接口。当前版本锁定 Filament `v1.76.0`，补丁脚本为 `native/filament/patches/apply_d2s_vulkan_external_image.py`：它在 `VulkanPlatform` 中增加借用式 `VkImage` 外部句柄、格式/尺寸元数据和 `ExternalImage` 工厂，Bridge 通过 `D2S_FILAMENT_VULKAN_EXTERNAL_IMAGE` 编译开关启用。补丁只包装调用方所有的 `VkImage`，不负责销毁图像、内存、OpenXR swapchain 或 producer semaphore；layout、queue family、producer-ready 和 consumer-release 仍由 Python Presenter 的 Vulkan 同步契约负责。
 
 该 Filament 源码和 Bridge 必须由 GitHub Actions 在 Windows、Linux、macOS 三个平台远程构建并安装到临时构建前缀；本机不编译 C++/Filament。三平台二进制只有在 CI 构建完成、ABI 能力探针通过并下载回 `src/desktop2stereo/xr_viewer/native/<platform>/` 后，才允许实机启用外部源图像路径。旧 stock SDK 或旧 Bridge 的能力探针返回 false 时，必须保持 Vulkan GPU copy/Quad Layer 回退。
 
@@ -419,7 +419,7 @@ Presenter 只能通过 `GpuProducerAdapter` 注册表创建具体 producer；不
 
 适配器发现或加载失败属于能力缺失，不得传播为 Presenter 线程异常；必须限频记录原因、保持 OpenXR 生命周期运行，并在后续输出帧重新尝试创建适配器。若当前 producer 没有可用 Vulkan import/copy 能力，则该帧只能丢弃，禁止退回 CPU 像素往返。
 
-当前实现状态：图像环、Filament 多槽缓存、Vulkan Compute 直接写图像、Compute timeline、source barrier、Filament visible semaphore、consumer-release barrier、Filament per-eye render-finished ABI 和 CUDA/ROCm/HIP producer wait 已接入；Filament v1.75.0 源码补丁和三平台 CI 远程构建入口已接入。直接外部采样请求默认开启，但只有带 `D2S_FILAMENT_VULKAN_EXTERNAL_IMAGE` 的新 Bridge 才会报告 `filament_bridge_vulkan_external_image_abi_available=true` 并实际包装外部 `VkImage`；旧 stock SDK/Bridge 仍报告 false，Presenter 自动回退到显式标记的 Vulkan GPU copy。`D2S_ENABLE_FILAMENT_SCREEN_IMAGE=0` 仍可用于回归测试和故障隔离。不得把通用 `import()` 强行当作 Vulkan 外部纹理接口，也不得移除 consumer-release。
+当前实现状态：图像环、Filament 多槽缓存、Vulkan Compute 直接写图像、Compute timeline、source barrier、Filament visible semaphore、consumer-release barrier、Filament per-eye render-finished ABI 和 CUDA/ROCm/HIP producer wait 已接入；Filament v1.76.0 源码补丁和三平台 CI 远程构建入口已接入。直接外部采样请求默认开启，但只有带 `D2S_FILAMENT_VULKAN_EXTERNAL_IMAGE` 的新 Bridge 才会报告 `filament_bridge_vulkan_external_image_abi_available=true` 并实际包装外部 `VkImage`；旧 stock SDK/Bridge 仍报告 false，Presenter 自动回退到显式标记的 Vulkan GPU copy。`D2S_ENABLE_FILAMENT_SCREEN_IMAGE=0` 仍可用于回归测试和故障隔离。不得把通用 `import()` 强行当作 Vulkan 外部纹理接口，也不得移除 consumer-release。
 
 ### 5.5 Projection Layer 异步提交
 
@@ -838,7 +838,7 @@ OpenGL Fallback 直接渲染到 OpenGL OpenXR swapchain 或 OpenGL window frameb
 
 本节旧版“前景 View 合成屏幕/UI/激光”的描述由 11.2.2 当前架构修订覆盖；Filament 只输出环境与手柄 GLB 的颜色/深度，屏幕采样、激光、Glow 和 2D 光圈由 Vulkan 合成。
 
-Filament Bridge 必须将 GLB 放入房间 Scene，将原始 PBR 手柄、显示参考屏幕/UI 和激光放入前景 Scene。房间 View 先渲染，前景 View 随后在同一帧合成；两个 View 使用同一 Camera、Renderer、交换链目标和深度附件，前景 View 不清理已有颜色/深度。手柄使用原始 PBR 材质并写前景深度；激光使用不透明、`depthWrite=true`、`depthCulling=true` 的材质和控制器相同的 layer，因此外壳在几何上遮挡激光。房间 Scene 的 IndirectLight 不得挂到前景 Scene；HDR 模式的 controller IBL 必须只挂到前景 Scene。左右眼共享的 Renderer 必须在创建时显式设置 `ClearOptions.clear=true`、黑色 clear color 和 `discard=true`。由于 Filament 1.75 Vulkan backend 的默认 RenderTarget 是单例，Bridge 必须通过 D2S backend patch 让默认 RenderTarget 记录当前绑定的 SwapChain/image，切换左右眼时先释放旧绑定再绑定当前眼，避免两个 OpenXR SwapChain 互相污染并触发 `VK_ERROR_DEVICE_LOST`。两个 View 使用 ColorGrading `LINEAR` tone mapping，不应用 ACES/其他场景曲线；保留后处理仅用于最终目标的单次 sRGB 编码。AssetLoader 只加载一个 controller asset，不得为遮挡创建副本、修改同一 Renderable 的材质绑定或创建第二个 Engine。屏幕源格式必须与其采样语义匹配：sRGB 源使用 `VK_FORMAT_R8G8B8A8_SRGB`/`SRGB8_A8`，Compute 输出的 `VK_FORMAT_R8G8B8A8_UNORM` 必须在 shader 中先完成 sRGB→线性转换并以 Filament `RGBA8` 采样；禁止把 sRGB 数值直接写入 UNORM 后再当线性纹理使用。
+Filament Bridge 必须将 GLB 放入房间 Scene，将原始 PBR 手柄、显示参考屏幕/UI 和激光放入前景 Scene。房间 View 先渲染，前景 View 随后在同一帧合成；两个 View 使用同一 Camera、Renderer、交换链目标和深度附件，前景 View 不清理已有颜色/深度。手柄使用原始 PBR 材质并写前景深度；激光使用不透明、`depthWrite=true`、`depthCulling=true` 的材质和控制器相同的 layer，因此外壳在几何上遮挡激光。房间 Scene 的 IndirectLight 不得挂到前景 Scene；HDR 模式的 controller IBL 必须只挂到前景 Scene。左右眼共享的 Renderer 必须在创建时显式设置 `ClearOptions.clear=true`、黑色 clear color 和 `discard=true`。由于 Filament 1.76 Vulkan backend 的默认 RenderTarget 是单例，Bridge 必须通过 D2S backend patch 让默认 RenderTarget 记录当前绑定的 SwapChain/image，切换左右眼时先释放旧绑定再绑定当前眼，避免两个 OpenXR SwapChain 互相污染并触发 `VK_ERROR_DEVICE_LOST`。两个 View 使用 ColorGrading `LINEAR` tone mapping，不应用 ACES/其他场景曲线；保留后处理仅用于最终目标的单次 sRGB 编码。AssetLoader 只加载一个 controller asset，不得为遮挡创建副本、修改同一 Renderable 的材质绑定或创建第二个 Engine。屏幕源格式必须与其采样语义匹配：sRGB 源使用 `VK_FORMAT_R8G8B8A8_SRGB`/`SRGB8_A8`，Compute 输出的 `VK_FORMAT_R8G8B8A8_UNORM` 必须在 shader 中先完成 sRGB→线性转换并以 Filament `RGBA8` 采样；禁止把 sRGB 数值直接写入 UNORM 后再当线性纹理使用。
 
 ### 11.2.3 Bridge 接口边界与完整性清单
 
@@ -1286,7 +1286,7 @@ format/lint
 
 ### 20.1.1 Filament Bridge 三平台构建策略
 
-Filament Bridge 的正式构建由 GitHub Actions 负责。三平台必须使用对应平台 runner 编译和链接 Filament 1.75 及其运行库，构建结果通过 Actions Artifact 或 GitHub Release 交付给 Python 运行时。
+Filament Bridge 的正式构建由 GitHub Actions 负责。三平台必须使用对应平台 runner 编译和链接 Filament 1.76 及其运行库，构建结果通过 Actions Artifact 或 GitHub Release 交付给 Python 运行时。
 
 ```text
 native/filament/bridge source change

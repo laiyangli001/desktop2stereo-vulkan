@@ -50,6 +50,21 @@ per-eye handle queryable for diagnostics. The remaining native work is to
 implement the required layout transition and render-pass ownership before
 advertising the capability.
 
+## Filament 1.76.0 upgrade assessment
+
+The validated SDK is pinned to Filament `v1.76.0`, matching Issue #7 and the
+official Windows, Linux, and macOS archive digests in `../version.json`. The
+existing D2S Vulkan external-image patch was replayed successfully against the
+`v1.76.0` source tree.
+
+The release's async completion status, multiple-directional-light support, and
+second specular lobe are opt-in API/material features. This bridge does not
+chain Filament async callbacks, does not need additional directional lights,
+and does not define custom hazy materials, so those features remain disabled
+to preserve the validated rendering contract. The v1.76 material changes are
+handled by rebuilding the bridge and its runtime-generated materials in the
+GitHub Actions workflow.
+
 The desktop preview ABI exposes `filament_preview_apply_animations` for embedded glTF animations.
 
 The OpenXR bridge prints bounded native diagnostics for the first eight stereo

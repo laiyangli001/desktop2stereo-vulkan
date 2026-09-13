@@ -147,10 +147,10 @@ def test_remote_filament_build_enables_multiview_without_stale_sdk_cache() -> No
         encoding="utf-8"
     )
 
-    assert manifest["version"] == "1.75.0"
-    assert manifest["source"]["ref"] == "v1.75.0"
-    assert all("v1.75.0" in entry["asset"] for entry in manifest["platforms"].values())
-    assert "google/filament/v1.75.0/libs/bluevk" in cmake
+    assert manifest["version"] == "1.76.0"
+    assert manifest["source"]["ref"] == "v1.76.0"
+    assert all("v1.76.0" in entry["asset"] for entry in manifest["platforms"].values())
+    assert "google/filament/v1.76.0/libs/bluevk" in cmake
     assert "#if defined(VK_EXT_depth_clamp_control)" in cmake
     assert "VK_EXT_depth_clamp_control) || defined(VK_EXT_shader_object" in cmake
     assert workflow.count("-DFILAMENT_ENABLE_MULTIVIEW=ON") == 2

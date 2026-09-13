@@ -1,5 +1,7 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- Filament SDK 从 `v1.75.0` 升级到官方 `v1.76.0`：更新三平台资产 SHA-256、CMake 默认 SDK 路径和 BlueVK 来源，并确认 D2S Vulkan 外部图像补丁可应用；异步回调、多方向光和第二高光瓣暂不启用，以保持现有 OpenXR 渲染行为稳定。
+
 - 统一三平台应用图标：GUI1、GUI2 和授权窗口使用多分辨率图标资源；Windows 原生启动器嵌入 ICO，Linux X11 启动器设置 `_NET_WM_ICON`，macOS 启动器设置 AppKit 应用图标，发布包同步携带 ICO/PNG 图标目录。
 
 - 合并 `lc700x/desktop2stereo-vulkan` 的跨平台运行时更新：新增和完善 macOS CoreML/MPS/Metal、

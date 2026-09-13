@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the pinned Filament 1.75 D2S Vulkan external-image extension."""
+"""Apply the pinned Filament 1.76 D2S Vulkan external-image extension."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def main() -> int:
     post_process_manager_cpp = root / "filament/src/PostProcessManager.cpp"
     vulkan_fbo_cache_cpp = root / "filament/backend/src/vulkan/VulkanFboCache.cpp"
 
-    # Filament 1.75 builds a multiview clearDepth package but always registers
+    # Filament 1.76 builds a multiview clearDepth package but always registers
     # the ordinary instanced package in PostProcessManager. Match the package
     # to the Engine stereo mode just like the default material and skybox do.
     replace_once(
