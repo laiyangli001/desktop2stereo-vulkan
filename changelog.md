@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 修复授权与 launcher 契约测试在无 PyTorch 环境下失败的问题：OpenXR 菜单的 YAML 设置持久化改用轻量运行时读写函数，不再为保存界面配置导入 GPU/torch 依赖。
 - 修复三平台原生启动器发布工作流：Windows 启动器改用 `WNDCLASSEXW` 正确注册大小图标，发布包扫描跳过第三方 Python `site-packages` 中的密钥标记示例误报，并将 checkout Action 升级到 Node 24 版本。
 - Filament SDK 从 `v1.75.0` 升级到官方 `v1.76.0`：更新三平台资产 SHA-256、CMake 默认 SDK 路径和 BlueVK 来源，并确认 D2S Vulkan 外部图像补丁可应用；异步回调、多方向光和第二高光瓣暂不启用，以保持现有 OpenXR 渲染行为稳定。
 - 修复 Filament v1.76.0 远程三平台构建中的项目侧弃用警告：改用 `LinearToneMapper`、移除 `ResourceConfiguration::gltfPath` 初始化，并为 `MaterialBuilder` 后端映射补充安全返回。

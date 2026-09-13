@@ -237,12 +237,10 @@ class RuntimeCallbacks:
                 return False
         if action == "persist_openxr_render_auto":
             try:
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
                 from utils.xr_headset_presets import resolve_xr_headset_preset
 
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 numeric = max(
                     OPENXR_RENDER_SCALE_MIN,
                     min(
@@ -255,7 +253,7 @@ class RuntimeCallbacks:
                 settings["XR Render Mode"] = "auto"
                 settings["XR Render"] = numeric
                 settings["OpenXR Render Scale"] = numeric
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 return True
@@ -267,11 +265,8 @@ class RuntimeCallbacks:
                 environment = str(values.get("environment", "Default") or "Default").strip()
                 if not environment:
                     environment = "Default"
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
-
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 states = settings.get("OpenXR Screen States", {})
                 states = dict(states) if isinstance(states, dict) else {}
                 if action == "reset_openxr_screen_state":
@@ -282,7 +277,7 @@ class RuntimeCallbacks:
                         return False
                     states[environment] = dict(state)
                 settings["OpenXR Screen States"] = states
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 self._screen_state_save_error_logged = False
@@ -310,16 +305,13 @@ class RuntimeCallbacks:
                 }.get(mode, mode)
                 if mode not in {"off", "surround", "glow", "veil"}:
                     return False
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
-
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 modes = settings.get("OpenXR Glow Modes", {})
                 modes = dict(modes) if isinstance(modes, dict) else {}
                 modes[environment] = mode
                 settings["OpenXR Glow Modes"] = modes
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 return True
@@ -335,11 +327,8 @@ class RuntimeCallbacks:
                     1.0,
                     max(0.0, float(values.get("transparency", 0.0))),
                 )
-                from gui.config import save_yaml
-                from stereo_runtime.hot_reload import read_yaml
-
                 settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-                settings = read_yaml(settings_path)
+                settings = _read_settings_yaml(settings_path)
                 transparencies = settings.get("OpenXR Glow Transparency", {})
                 transparencies = (
                     dict(transparencies)
@@ -347,7 +336,7 @@ class RuntimeCallbacks:
                 )
                 transparencies[environment] = transparency
                 settings["OpenXR Glow Transparency"] = transparencies
-                ok, error = save_yaml(settings_path, settings)
+                ok, error = _save_settings_yaml(settings_path, settings)
                 if not ok:
                     raise OSError(error)
                 return True
@@ -455,16 +444,13 @@ class RuntimeCallbacks:
         if not persist:
             return True
         try:
-            from gui.config import save_yaml
-            from stereo_runtime.hot_reload import read_yaml
-
             settings_path = os.path.join(self.context.base_dir, "settings.yaml")
-            settings = read_yaml(settings_path)
+            settings = _read_settings_yaml(settings_path)
             for name, numeric in numeric_values.items():
                 settings[yaml_keys[name]] = numeric
                 if name == "openxr_render_scale":
                     settings["OpenXR Render Scale"] = numeric
-            ok, error = save_yaml(settings_path, settings)
+            ok, error = _save_settings_yaml(settings_path, settings)
             if not ok:
                 raise OSError(error)
         except Exception as exc:
