@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 优化 launcher 发布依赖安装：启用 GitHub Actions pip 缓存，Linux 优先安装 CPU PyTorch wheel，增加 pip/curl 超时与重试，避免重复下载 CUDA 版 Torch 导致工作流长时间卡住。
 - 修复发布包安全扫描误报：允许嵌入式 Python 标准库中的 `secrets.py`，仍继续拦截项目代码和其他路径中的凭据文件。
 - 进一步修复无 PyTorch 环境的授权回归：`stereo_runtime.hot_reload` 不再在模块导入阶段加载 OpenXR/Torch 渲染配置，纯 YAML 读取和设置测试可独立运行。
 - 修复授权与 launcher 契约测试在无 PyTorch 环境下失败的问题：OpenXR 菜单的 YAML 设置持久化改用轻量运行时读写函数，不再为保存界面配置导入 GPU/torch 依赖。

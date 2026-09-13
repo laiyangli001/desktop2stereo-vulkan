@@ -204,7 +204,9 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "stage-python-runtime.py linux" in workflow
     assert "stage-python-runtime.py macos" in workflow
     assert "-r src/env_install/requirements.txt" in workflow
-    assert "--no-cache-dir" in workflow
+    assert "cache: pip" in workflow
+    assert "--timeout 120 --retries 3" in workflow
+    assert "download.pytorch.org/whl/cpu" in workflow
     assert "runtime archive SHA-256 mismatch" in stager
     assert "runtime contains a symbolic link" in stager
     assert "runtime-manifest.json" in stager

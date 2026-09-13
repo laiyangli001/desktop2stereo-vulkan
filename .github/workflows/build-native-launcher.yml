@@ -40,6 +40,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: src/env_install/requirements*.txt
 
       - name: Package launcher
         shell: pwsh
@@ -61,7 +63,7 @@ jobs:
           Invoke-WebRequest -Uri $runtimeUrl -OutFile $runtimeArchive
           python scripts/stage-python-runtime.py windows $runtimeArchive dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url $runtimeUrl --sha256 0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8 --expected-version 3.12.10
           $runtimePython = (Resolve-Path dist/Desktop2Stereo/src/python3/python.exe).Path
-          & $runtimePython -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          & $runtimePython -m pip install --disable-pip-version-check --no-input --prefer-binary --no-compile --no-warn-script-location --timeout 120 --retries 3 -r src/env_install/requirements.txt
           if ($LASTEXITCODE -ne 0) { throw "Failed to install locked release dependencies." }
           node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
@@ -93,6 +95,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: src/env_install/requirements*.txt
 
       - name: Package launcher
         env:
@@ -110,9 +114,10 @@ jobs:
           node scripts/write-build-info.mjs dist/Desktop2Stereo
           runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
           runtime_archive="$RUNNER_TEMP/python-3.12.14-linux.tar.gz"
-          curl --fail --location --retry 3 "$runtime_url" --output "$runtime_archive"
+          curl --fail --location --retry 3 --connect-timeout 30 --max-time 900 "$runtime_url" --output "$runtime_archive"
           python scripts/stage-python-runtime.py linux "$runtime_archive" dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url "$runtime_url" --sha256 72748da13197c1fb161e3afeef20a6a385ff24f2165e6e2758e47008e7faba4c --expected-version 3.12.14
-          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --prefer-binary --no-compile --no-warn-script-location --timeout 120 --retries 3 --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
+          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --prefer-binary --no-compile --no-warn-script-location --timeout 120 --retries 3 -r src/env_install/requirements.txt
           node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
           node scripts/verify-release-package.mjs dist/Desktop2Stereo linux
@@ -140,6 +145,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12.10"
+          cache: pip
+          cache-dependency-path: src/env_install/requirements*.txt
 
       - name: Package launcher
         env:
@@ -157,9 +164,9 @@ jobs:
           node scripts/write-build-info.mjs dist/Desktop2Stereo
           runtime_url="https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14%2B20260901-aarch64-apple-darwin-install_only_stripped.tar.gz"
           runtime_archive="$RUNNER_TEMP/python-3.12.14-macos-arm64.tar.gz"
-          curl --fail --location --retry 3 "$runtime_url" --output "$runtime_archive"
+          curl --fail --location --retry 3 --connect-timeout 30 --max-time 900 "$runtime_url" --output "$runtime_archive"
           python scripts/stage-python-runtime.py macos "$runtime_archive" dist/Desktop2Stereo/src/python3 --package-root dist/Desktop2Stereo --source-url "$runtime_url" --sha256 81a359f1cfadd4da11766534c5913791cea55f26e1bb902cacd2a531bb1e4b2b --expected-version 3.12.14
-          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --no-cache-dir --prefer-binary --no-compile --no-warn-script-location -r src/env_install/requirements.txt
+          dist/Desktop2Stereo/src/python3/bin/python -m pip install --disable-pip-version-check --no-input --prefer-binary --no-compile --no-warn-script-location --timeout 120 --retries 3 -r src/env_install/requirements.txt
           node scripts/write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt
           node scripts/write-release-manifest.mjs dist/Desktop2Stereo
           node scripts/verify-release-package.mjs dist/Desktop2Stereo macos
