@@ -10,7 +10,7 @@ from .config import (
     environment_display_label, parse_model_name, save_yaml, GUI_MODEL_CATALOG,
 )
 from .paths import BASE_DIR, DIAG_LOG
-from .localization import UI_MESSAGES
+from .localization import UI_MESSAGES, resolve_locale
 from .capture_sources import (
     get_monitor_index_for_point,
     get_primary_monitor_index,
@@ -210,8 +210,14 @@ class GUIConfigMixin:
         )
         self.lsfg_cb.value = bool(cfg.get("LSFG Support", DEFAULTS["LSFG Support"]))
         if keep_optional:
-            self.locale = cfg.get("Language", DEFAULTS["Language"])
-            self.lang_dd.value = "English" if self.locale == "EN" else "简体中文"
+            saved_language = str(cfg.get("Language", DEFAULTS["Language"])).upper()
+            self._language_preference = saved_language
+            self.locale = resolve_locale(saved_language)
+            self.lang_dd.value = {
+                "AUTO": "Follow system",
+                "EN": "English",
+                "CN": "简体中文",
+            }.get(saved_language, "English" if self.locale == "EN" else "简体中文")
 
         saved_ctrl = cfg.get("Controller Model", DEFAULTS.get("Controller Model", "PICO"))
         saved_ctrl_key = str(saved_ctrl).strip().casefold()
@@ -402,7 +408,7 @@ class GUIConfigMixin:
             "Depth Resolution": self._parse_int(self.depth_res_dd.value, DEFAULTS["Depth Resolution"]),
             "FP16": fp16_value,
             "Computing Device": self.device_label_to_index.get(self.device_dd.value, DEFAULTS["Computing Device"]),
-            "Language": self.locale,
+            "Language": getattr(self, "_language_preference", self.locale),
             "Run Mode": self.run_mode_key,
             "XR Headset Model": display_to_xr_headset(self.xr_headset_dd.value),
             "XR Preview Window": self.xr_preview_cb.value,

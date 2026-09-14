@@ -11,6 +11,7 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit
 import flet as ft
+import yaml
 
 from .client import (
     AuthClient,
@@ -32,9 +33,11 @@ from .gate import (
 )
 from .offline import OfflineEntitlementStore
 from .storage import TokenStore
+from .localization import LOCALE_LABELS, auth_text, normalize_locale
 
 
 AUTH_READY_FILE = Path(__file__).resolve().parents[1] / "logs" / "auth_ready.flag"
+SETTINGS_FILE = Path(__file__).resolve().parents[1] / "settings.yaml"
 DEFAULT_WEBSITE_URL = "https://100393.com"
 LICENSE_MODES = {"online", "offline", "permanent"}
 OFFLINE_PERIODS = {7, 14, 30}
@@ -105,6 +108,33 @@ def _write_auth_ready_flag() -> None:
     AUTH_READY_FILE.write_text("ready\n", encoding="utf-8")
 
 
+def _load_locale() -> str:
+    """Load the shared GUI language without making authentication depend on the GUI."""
+
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as stream:
+            settings = yaml.safe_load(stream) or {}
+        return normalize_locale(settings.get("Language", "AUTO")) if isinstance(settings, dict) else "AUTO"
+    except (OSError, yaml.YAMLError):
+        return "AUTO"
+
+
+def _save_locale(locale: str) -> None:
+    """Persist only the language preference in the shared settings file."""
+
+    try:
+        with SETTINGS_FILE.open("r", encoding="utf-8") as stream:
+            settings = yaml.safe_load(stream) or {}
+    except (OSError, yaml.YAMLError):
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["Language"] = normalize_locale(locale)
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with SETTINGS_FILE.open("w", encoding="utf-8") as stream:
+        yaml.safe_dump(settings, stream, allow_unicode=True, sort_keys=False)
+
+
 class LoginLauncher:
     """Authenticate before importing either existing runtime GUI."""
 
@@ -114,11 +144,85 @@ class LoginLauncher:
         self.session: AuthSession | None = None
         self._page: ft.Page | None = None
         self._busy = False
+        self.locale = _load_locale()
+        self._text_controls: dict[str, object] = {}
 
-    @staticmethod
-    def _error_text(error: AuthError) -> str:
-        suffix = f"，请求 ID：{error.request_id}" if error.request_id else ""
-        return f"{error} ({error.code}){suffix}"
+    def _t(self, key: str, **values: object) -> str:
+        return auth_text(self.locale, key, **values)
+
+    def _refresh_texts(self) -> None:
+        for key, control in self._text_controls.items():
+            if key == "version":
+                control.value = self._t("version", **self._diagnostic_values)
+            elif key == "website":
+                control.content = self._t("open_website", host=_configured_website_label())
+            elif key == "sign_in":
+                control.content = self._t("sign_in")
+            elif key == "browser_sign_in":
+                control.content = self._t("browser_sign_in")
+            elif key == "clear_login":
+                control.content = self._t("clear_login")
+            elif key == "captcha_button":
+                control.content = self._t("captcha_button")
+            elif key == "language":
+                control.label = self._t("language")
+            elif key == "email":
+                control.label = self._t("email")
+            elif key == "password":
+                control.label = self._t("password")
+            elif key == "license":
+                control.label = self._t("license")
+            elif key == "mode":
+                control.label = self._t("mode")
+            elif key == "offline_period":
+                control.label = self._t("offline_period")
+            elif key == "permanent_confirmation":
+                control.label = self._t("permanent_confirmation")
+            elif key in {"confirm_license", "apply_mode", "retry", "relogin", "copy_request", "copy_diagnostics", "exit"}:
+                control.content = self._t(key)
+        mode_picker = self._text_controls.get("mode_picker")
+        if mode_picker is not None:
+            mode_picker.options = [
+                ft.DropdownOption(key="online", text=self._t("mode_online")),
+                ft.DropdownOption(key="offline", text=self._t("mode_offline")),
+                ft.DropdownOption(key="permanent", text=self._t("mode_permanent")),
+            ]
+        offline_picker = self._text_controls.get("offline_period_picker")
+        if offline_picker is not None:
+            offline_picker.options = [
+                ft.DropdownOption(key=str(days), text=self._t("days", days=days))
+                for days in sorted(OFFLINE_PERIODS)
+            ]
+        if self._page is not None:
+            self._page.title = self._t("window_title")
+            self._page.update()
+
+    def _change_locale(self, event) -> None:
+        self.locale = normalize_locale(getattr(event.control, "value", "EN"))
+        try:
+            _save_locale(self.locale)
+        except (OSError, yaml.YAMLError):
+            pass
+        self._refresh_texts()
+
+    def _error_text(self, error: AuthError | None = None) -> str:
+        # Keep the historical class-level helper contract while using the active locale in the UI.
+        if error is None:
+            error = self
+            locale = "EN"
+        else:
+            locale = self.locale
+        key_by_code = {
+            "captcha_required": "captcha_required", "invalid_response": "token_missing",
+            "device_code_expired": "device_expired", "license_unavailable": "license_unavailable",
+            "license_selection_required": "invalid_license", "license_mode_invalid": "mode_invalid",
+            "permanent_confirmation_required": "permanent_required", "secure_storage_unavailable": "secure_storage",
+            "login_required": "login_required", "device_identity_unavailable": "device_identity",
+        }
+        key = key_by_code.get(error.code)
+        message = auth_text(locale, key) if key else str(error)
+        suffix = f" · request ID: {error.request_id}" if error.request_id else ""
+        return f"{message} ({error.code}){suffix}"
 
     def run(self) -> AuthSession | None:
         ft.run(self._main, view=ft.AppView.FLET_APP_HIDDEN)
@@ -126,7 +230,7 @@ class LoginLauncher:
 
     async def _main(self, page: ft.Page):
         self._page = page
-        page.title = "Desktop2Stereo 登录验证"
+        page.title = self._t("window_title")
         icon_path = Path(__file__).resolve().parent / "icon" / "icon-256x256.ico"
         if icon_path.is_file():
             page.window.icon = str(icon_path)
@@ -136,8 +240,15 @@ class LoginLauncher:
         page.padding = 28
         page.theme = ft.Theme(color_scheme_seed="blue")
 
-        email = ft.TextField(label="邮箱 / Email", autofocus=True)
-        password = ft.TextField(label="密码 / Password", password=True, can_reveal_password=True)
+        language_picker = ft.Dropdown(
+            label=self._t("language"),
+            value=self.locale,
+            options=[ft.DropdownOption(key=key, text=label) for key, label in LOCALE_LABELS.items()],
+            width=150,
+        )
+        language_picker.on_select = self._change_locale
+        email = ft.TextField(label=self._t("email"), autofocus=True)
+        password = ft.TextField(label=self._t("password"), password=True, can_reveal_password=True)
         status = ft.Text(color=ft.Colors.RED, selectable=True)
         device_qr = ft.Image(src="", width=180, height=180, fit=ft.BoxFit.CONTAIN, visible=False)
         device_code_label = ft.Text("", selectable=True, visible=False)
@@ -155,43 +266,43 @@ class LoginLauncher:
         captcha_progress = ft.Text("0/0")
         captcha_dialog = ft.AlertDialog(
             modal=True,
-            title=ft.Text("点击完成验证"),
+            title=ft.Text(self._t("captcha_title")),
             content=ft.Column([
-                ft.Text("请按提示在图片中依次点击所有目标。"),
+                ft.Text(self._t("captcha_instruction")),
                 ft.Row([captcha_thumb, captcha_progress], alignment=ft.MainAxisAlignment.CENTER),
             ], tight=True),
-            actions=[ft.TextButton(content="取消", on_click=lambda e: page.pop_dialog())],
+            actions=[ft.TextButton(content=self._t("captcha_cancel"), on_click=lambda e: page.pop_dialog())],
         )
         captcha_image_detector = ft.GestureDetector(
             content=captcha_image,
             on_tap=lambda e: self._captcha_click(e, captcha_state, captcha_progress, captcha_dialog, captcha_button),
         )
         captcha_dialog.content = ft.Column([
-                ft.Text("请按提示在图片中依次点击所有目标。"),
-                ft.Row([ft.Text("目标："), captcha_thumb, captcha_progress], alignment=ft.MainAxisAlignment.CENTER),
+                ft.Text(self._t("captcha_instruction")),
+                ft.Row([ft.Text(self._t("captcha_target")), captcha_thumb, captcha_progress], alignment=ft.MainAxisAlignment.CENTER),
                 captcha_image_detector,
         ], tight=True)
         captcha_button = ft.OutlinedButton(
-            content="点击完成验证",
+            content=self._t("captcha_button"),
             on_click=lambda e: self._open_captcha(status, captcha_button, captcha_state, captcha_image, captcha_progress, captcha_dialog),
         )
-        license_picker = ft.Dropdown(label="选择授权", visible=False, options=[])
+        license_picker = ft.Dropdown(label=self._t("license"), visible=False, options=[])
         mode_picker = ft.Dropdown(
-            label="授权模式",
+            label=self._t("mode"),
             visible=False,
             options=[
-                ft.DropdownOption(key="online", text="在线（联网心跳）"),
-                ft.DropdownOption(key="offline", text="离线（7/14/30 天）"),
-                ft.DropdownOption(key="permanent", text="永久绑定（不可降级）"),
+                ft.DropdownOption(key="online", text=self._t("mode_online")),
+                ft.DropdownOption(key="offline", text=self._t("mode_offline")),
+                ft.DropdownOption(key="permanent", text=self._t("mode_permanent")),
             ],
         )
         offline_period_picker = ft.Dropdown(
-            label="离线有效期",
+            label=self._t("offline_period"),
             visible=False,
-            options=[ft.DropdownOption(key=str(days), text=f"{days} 天") for days in sorted(OFFLINE_PERIODS)],
+            options=[ft.DropdownOption(key=str(days), text=self._t("days", days=days)) for days in sorted(OFFLINE_PERIODS)],
         )
         permanent_confirmation = ft.TextField(
-            label="永久绑定确认（输入 PERMANENT）",
+            label=self._t("permanent_confirmation"),
             visible=False,
             password=True,
         )
@@ -199,26 +310,26 @@ class LoginLauncher:
             mode_picker, offline_period_picker, permanent_confirmation
         )
         confirm = ft.Button(
-            content="确认授权",
+            content=self._t("confirm_license"),
             visible=False,
             on_click=lambda e: self._confirm_selection(
                 status, license_picker, confirm, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
             ),
         )
         apply_mode = ft.Button(
-            content="应用模式并启动",
+            content=self._t("apply_mode"),
             visible=False,
             on_click=lambda e: self._apply_license_mode(
                 status, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
             ),
         )
         self._mode_controls = (mode_picker, offline_period_picker, permanent_confirmation, apply_mode)
-        retry_action = ft.TextButton(content="重试", visible=False)
-        relogin_action = ft.TextButton(content="重新登录", visible=False)
-        website_action = ft.TextButton(content=f"打开 {_configured_website_label()}", visible=False)
-        copy_request_action = ft.TextButton(content="复制 request_id", visible=False)
-        diagnostic_action = ft.TextButton(content="复制脱敏诊断", visible=False)
-        exit_action = ft.TextButton(content="退出", on_click=lambda e: self._exit_launcher())
+        retry_action = ft.TextButton(content=self._t("retry"), visible=False)
+        relogin_action = ft.TextButton(content=self._t("relogin"), visible=False)
+        website_action = ft.TextButton(content=self._t("open_website", host=_configured_website_label()), visible=False)
+        copy_request_action = ft.TextButton(content=self._t("copy_request"), visible=False)
+        diagnostic_action = ft.TextButton(content=self._t("copy_diagnostics"), visible=False)
+        exit_action = ft.TextButton(content=self._t("exit"), on_click=lambda e: self._exit_launcher())
         self._error_controls = (
             retry_action,
             relogin_action,
@@ -228,7 +339,7 @@ class LoginLauncher:
             exit_action,
         )
         self._selection_controls = (license_picker, confirm)
-        login = ft.Button(content="登录 / Sign in", on_click=lambda e: self._login(
+        login = ft.Button(content=self._t("sign_in"), on_click=lambda e: self._login(
             e,
             email,
             password,
@@ -242,7 +353,7 @@ class LoginLauncher:
             permanent_confirmation,
             apply_mode,
         ))
-        device_login = ft.OutlinedButton(content="浏览器授权登录", on_click=lambda e: self._device_login(
+        device_login = ft.OutlinedButton(content=self._t("browser_sign_in"), on_click=lambda e: self._device_login(
             status,
             license_picker,
             confirm,
@@ -255,18 +366,35 @@ class LoginLauncher:
             device_uri_label,
             device_login_info,
         ))
-        logout = ft.TextButton(content="退出登录 / Clear saved login", on_click=lambda e: self._logout_saved(status))
+        logout = ft.TextButton(content=self._t("clear_login"), on_click=lambda e: self._logout_saved(status))
 
         diagnostic = authorization_diagnostics()
-        page.add(ft.Column([
-            ft.Text("Desktop2Stereo", size=26, weight=ft.FontWeight.BOLD),
-            ft.Text("登录后验证授权，验证成功才会启动运行界面。"),
-            ft.Text(
-                f"版本 {diagnostic['app_version']} · Git {diagnostic['git_sha']} · "
-                f"服务器 {diagnostic['server_environment']} ({diagnostic['server_host']})",
+        version = ft.Text(
+                self._t("version", version=diagnostic['app_version'], git=diagnostic['git_sha'],
+                         environment=diagnostic['server_environment'], host=diagnostic['server_host']),
                 size=11,
                 color=ft.Colors.GREY,
-            ),
+            )
+        self._diagnostic_values = {
+            "version": diagnostic['app_version'], "git": diagnostic['git_sha'],
+            "environment": diagnostic['server_environment'], "host": diagnostic['server_host'],
+        }
+        self._text_controls = {
+            "language": language_picker, "email": email, "password": password,
+            "license": license_picker, "mode": mode_picker, "mode_picker": mode_picker,
+            "offline_period": offline_period_picker, "offline_period_picker": offline_period_picker,
+            "permanent_confirmation": permanent_confirmation, "confirm_license": confirm,
+            "apply_mode": apply_mode, "retry": retry_action, "relogin": relogin_action,
+            "website": website_action, "copy_request": copy_request_action,
+            "copy_diagnostics": diagnostic_action, "exit": exit_action,
+            "sign_in": login, "browser_sign_in": device_login, "clear_login": logout,
+            "captcha_button": captcha_button, "version": version,
+        }
+        page.add(ft.Column([
+            ft.Row([ft.Text(self._t("brand"), size=26, weight=ft.FontWeight.BOLD), language_picker],
+                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ft.Text(self._t("description")),
+            version,
             email,
             password,
             captcha_button,
@@ -319,14 +447,14 @@ class LoginLauncher:
         if self._busy:
             return
         self._busy = True
-        status.value = "正在验证授权... / Validating..."
+        status.value = self._t("validating")
         status.color = ft.Colors.BLUE
         self._page.update()
         try:
             challenge = captcha_state.get("challenge")
             clicks = captcha_state.get("clicks")
             if not isinstance(challenge, CaptchaChallenge) or not isinstance(clicks, list) or len(clicks) != challenge.required_clicks:
-                raise AuthError("请先完成点击验证码", "captcha_required")
+                raise AuthError(self._t("captcha_required"), "captcha_required")
             self.session = await asyncio.to_thread(
                 self.client.login,
                 email.value or "",
@@ -336,7 +464,7 @@ class LoginLauncher:
                 clicks,
             )
             if not self.session.access_token:
-                raise AuthError("授权服务器未返回登录令牌", "invalid_response")
+                raise AuthError(self._t("token_missing"), "invalid_response")
             await self._accept_session(status, license_picker, confirm, mode_picker, offline_period_picker, permanent_confirmation, apply_mode)
         except AuthError as exc:
             if exc.code == "BEHAVIOR_CAPTCHA_REQUIRED":
@@ -379,7 +507,7 @@ class LoginLauncher:
                     if isinstance(child, ft.Image) and child.width == 80:
                         child.src = challenge.thumb_image
         progress.value = f"0/{challenge.required_clicks}"
-        button.content = f"点击完成验证 (0/{challenge.required_clicks})"
+        button.content = f"{self._t('captcha_button')} (0/{challenge.required_clicks})"
         dialog.open = True
         self._page.show_dialog(dialog)
 
@@ -397,17 +525,16 @@ class LoginLauncher:
         })
         progress.value = f"{len(clicks)}/{challenge.required_clicks}"
         if len(clicks) >= challenge.required_clicks:
-            button.content = f"✓ 验证码已完成 ({len(clicks)}/{challenge.required_clicks})"
+            button.content = self._t("captcha_done", count=len(clicks), total=challenge.required_clicks)
             dialog.open = False
             self._page.pop_dialog()
         self._page.update()
 
-    @staticmethod
-    def _reset_captcha(state: dict, button: ft.Control | None = None) -> None:
+    def _reset_captcha(self, state: dict, button: ft.Control | None = None) -> None:
         state["challenge"] = None
         state["clicks"] = []
         if button is not None:
-            button.content = "点击完成验证"
+            button.content = self._t("captcha_button")
 
     async def _device_login(
         self,
@@ -436,8 +563,9 @@ class LoginLauncher:
                 device_code_label,
                 device_uri_label,
                 device_login_info,
+                locale=self.locale,
             )
-            status.value = f"请在浏览器确认授权，用户码：{authorization.user_code}"
+            status.value = self._t("device_status", code=authorization.user_code)
             status.color = ft.Colors.BLUE
             self._page.update()
             deadline = time.monotonic() + authorization.expires_in
@@ -455,7 +583,7 @@ class LoginLauncher:
                     elif exc.code != "authorization_pending":
                         raise
                 await asyncio.sleep(authorization.interval)
-            raise AuthError("设备授权已超时，请重新尝试", "device_code_expired")
+            raise AuthError(self._t("device_expired"), "device_code_expired")
         except AuthError as exc:
             if authorization is not None:
                 await asyncio.to_thread(self.client.cancel_device, authorization.device_code)
@@ -483,6 +611,7 @@ class LoginLauncher:
         device_code_label: ft.Text | None,
         device_uri_label: ft.Text | None,
         device_login_info: ft.Control | None,
+        locale: str = "EN",
     ) -> None:
         qr_value = authorization.verification_uri_complete or authorization.verification_uri
         qr_source = _device_qr_data_uri(qr_value)
@@ -490,10 +619,10 @@ class LoginLauncher:
             device_qr.src = qr_source or ""
             device_qr.visible = bool(qr_source)
         if device_code_label is not None:
-            device_code_label.value = f"用户码：{authorization.user_code}"
+            device_code_label.value = auth_text(locale, "device_code", code=authorization.user_code)
             device_code_label.visible = True
         if device_uri_label is not None:
-            device_uri_label.value = f"验证地址：{authorization.verification_uri}"
+            device_uri_label.value = auth_text(locale, "verification_uri", uri=authorization.verification_uri)
             device_uri_label.visible = True
         if device_login_info is not None:
             device_login_info.visible = True
@@ -509,19 +638,19 @@ class LoginLauncher:
         apply_mode: ft.Button | None = None,
     ):
         if not self.session:
-            raise AuthError("账号没有可用授权", "license_unavailable")
+            raise AuthError(self._t("license_unavailable"), "license_unavailable")
         if self.session.access_token:
             license_status = await asyncio.to_thread(self.client.status, self.session.access_token)
             if license_status.get("valid") is not True:
-                raise AuthError("账号没有可用授权", "license_unavailable")
+                raise AuthError(self._t("license_unavailable"), "license_unavailable")
             self.session.licenses = license_status.get("licenses") if isinstance(license_status.get("licenses"), list) else []
             server_time = license_status.get("server_time")
             if server_time is not None:
                 if isinstance(server_time, bool) or not isinstance(server_time, int) or server_time <= 0:
-                    raise AuthError("授权服务器时间响应无效", "invalid_response")
+                    raise AuthError(self._t("token_missing"), "invalid_response")
                 self.session.server_time = server_time
         if not self.session.licenses:
-            raise AuthError("账号没有可用授权", "license_unavailable")
+            raise AuthError(self._t("license_unavailable"), "license_unavailable")
         if len(self.session.licenses) > 1 and not license_picker.value:
             license_picker.options = [
                 ft.DropdownOption(
@@ -533,7 +662,7 @@ class LoginLauncher:
             ]
             license_picker.visible = True
             confirm.visible = True
-            status.value = "请选择要绑定当前设备的授权。"
+            status.value = self._t("select_license")
             status.color = ft.Colors.BLUE
             self._page.update()
             return
@@ -541,25 +670,25 @@ class LoginLauncher:
         if not selected or not isinstance(selected, str) or not any(
             _license_record_id(item) == selected for item in self.session.licenses
         ):
-            raise AuthError("请选择有效授权", "license_selection_required")
+            raise AuthError(self._t("invalid_license"), "license_selection_required")
         self.session.selected_license_id = selected
         license_picker.visible = False
         confirm.visible = False
         if not self.session or not self.session.access_token:
-            raise AuthError("授权服务器未返回登录令牌", "invalid_response")
+            raise AuthError(self._t("token_missing"), "invalid_response")
         if not self.session.refresh_token:
-            raise AuthError("授权服务器未返回刷新令牌，无法保存登录状态", "invalid_response")
+            raise AuthError(self._t("refresh_missing"), "invalid_response")
         if mode_picker is not None and offline_period_picker is not None and permanent_confirmation is not None and apply_mode is not None:
             await self._bind_selected_license()
             self._show_mode_controls(mode_picker, offline_period_picker, permanent_confirmation, apply_mode)
-            status.value = "设备已绑定，请选择授权模式后应用并启动。"
+            status.value = self._t("bound_select_mode")
             status.color = ft.Colors.BLUE
             self._clear_error_actions()
             self._page.update()
             return
         saved = self.store.save({"refresh_token": self.session.refresh_token, "user": self.session.user, "licenses": self.session.licenses, "selected_license_id": selected})
         if not saved:
-            raise AuthError("无法使用系统安全凭据保存登录状态，请先配置 Windows DPAPI、macOS Keychain 或 Linux Secret Service", "secure_storage_unavailable")
+            raise AuthError(self._t("secure_storage"), "secure_storage_unavailable")
         self._clear_error_actions()
         await self._page.window.destroy()
 
@@ -589,7 +718,7 @@ class LoginLauncher:
 
     async def _bind_selected_license(self) -> None:
         if not self.session or not self.session.access_token or not self.session.selected_license_id:
-            raise AuthError("授权服务器未返回登录令牌或授权选择", "invalid_response")
+                raise AuthError(self._t("auth_token_missing"), "invalid_response")
         try:
             identity = await asyncio.to_thread(device_identity)
         except DeviceIdentityError as exc:
@@ -633,27 +762,27 @@ class LoginLauncher:
 
     def _selected_license(self) -> dict:
         if not self.session or not self.session.selected_license_id:
-            raise AuthError("当前需要选择有效授权", "license_selection_required")
+            raise AuthError(self._t("invalid_license"), "license_selection_required")
         selected = next(
             (item for item in self.session.licenses if _license_record_id(item) == self.session.selected_license_id),
             None,
         )
         if selected is None:
-            raise AuthError("当前需要选择有效授权", "license_selection_required")
+            raise AuthError(self._t("invalid_license"), "license_selection_required")
         return selected
 
     def _merge_license_response(self, response: dict) -> dict:
         license_data = response.get("license") if isinstance(response, dict) else None
         if not isinstance(license_data, dict):
-            raise AuthError("授权服务器未返回有效授权状态", "invalid_response")
+            raise AuthError(self._t("license_status"), "invalid_response")
         if not self.session:
-            raise AuthError("登录会话已失效，请重新登录", "login_required")
+            raise AuthError(self._t("login_required"), "login_required")
         license_id = license_data.get("id")
         if not isinstance(license_id, str) or not license_id.strip():
-            raise AuthError("授权服务器未返回有效授权 ID", "invalid_response")
+            raise AuthError(self._t("license_id"), "invalid_response")
         license_id = license_id.strip()
         if self.session.selected_license_id and license_id != self.session.selected_license_id:
-            raise AuthError("授权服务器返回了不匹配的授权 ID", "invalid_response")
+            raise AuthError(self._t("license_mismatch"), "invalid_response")
         self.session.licenses = [
             license_data if _license_record_id(item) == license_id else item
             for item in self.session.licenses
@@ -673,10 +802,10 @@ class LoginLauncher:
         self._busy = True
         try:
             if not self.session or not self.session.access_token:
-                raise AuthError("登录会话已失效，请重新登录", "login_required")
+                raise AuthError(self._t("login_required"), "login_required")
             mode = str(mode_picker.value or "").casefold()
             if mode not in LICENSE_MODES:
-                raise AuthError("请选择有效授权模式", "license_mode_invalid")
+                raise AuthError(self._t("mode_invalid"), "license_mode_invalid")
             selected = self._selected_license()
             current_mode = _license_mode(selected)
             days = 7
@@ -685,7 +814,7 @@ class LoginLauncher:
             identity = await asyncio.to_thread(device_identity)
             if mode == "permanent" and current_mode != "permanent":
                 if (permanent_confirmation.value or "").strip() != "PERMANENT":
-                    raise AuthError("永久绑定不可降级，请输入 PERMANENT 确认", "permanent_confirmation_required")
+                    raise AuthError(self._t("permanent_required"), "permanent_confirmation_required")
                 response = await asyncio.to_thread(
                     self.client.confirm_permanent,
                     self.session.access_token,
@@ -715,7 +844,7 @@ class LoginLauncher:
 
                 OfflineEntitlementStore().clear()
             if not self.store.save({"refresh_token": self.session.refresh_token, "user": self.session.user, "licenses": self.session.licenses, "selected_license_id": self.session.selected_license_id}):
-                raise AuthError("无法使用系统安全凭据保存登录状态，请先配置平台安全存储", "secure_storage_unavailable")
+                raise AuthError(self._t("secure_storage"), "secure_storage_unavailable")
             self._clear_error_actions()
             await self._page.window.destroy()
         except (AuthError, DeviceIdentityError) as exc:
@@ -751,7 +880,7 @@ class LoginLauncher:
             self._show_error(status, logout_error)
             self._page.update()
             return
-        status.value = "已退出登录并清除本地登录状态。"
+        status.value = self._t("logged_out")
         status.color = ft.Colors.BLUE
         self._clear_error_actions()
         self._page.update()
@@ -816,7 +945,7 @@ class LoginLauncher:
             permanent_confirmation.visible = False
             apply_mode.visible = False
         if status is not None:
-            status.value = "已清除当前登录状态，请重新登录。"
+            status.value = self._t("cleared_login")
             status.color = ft.Colors.BLUE
         self._clear_error_actions()
         if self._page is not None:
@@ -832,9 +961,9 @@ class LoginLauncher:
         try:
             await self._page.clipboard.set(request_id)
         except Exception as exc:
-            self._show_error(status, AuthError(f"无法复制 request_id：{exc}", "clipboard_unavailable", request_id))
+            self._show_error(status, AuthError(self._t("copy_request_failed", error=exc), "clipboard_unavailable", request_id))
         else:
-            status.value = "request_id 已复制。"
+            status.value = self._t("request_copied")
             status.color = ft.Colors.BLUE
         self._page.update()
 
@@ -845,9 +974,9 @@ class LoginLauncher:
         try:
             await self._page.clipboard.set(payload)
         except Exception as exc:
-            self._show_error(status, AuthError(f"无法复制脱敏诊断：{exc}", "clipboard_unavailable", error.request_id))
+            self._show_error(status, AuthError(self._t("copy_diagnostics_failed", error=exc), "clipboard_unavailable", error.request_id))
         else:
-            status.value = "脱敏诊断信息已复制。"
+            status.value = self._t("diagnostics_copied")
             status.color = ft.Colors.BLUE
         self._page.update()
 

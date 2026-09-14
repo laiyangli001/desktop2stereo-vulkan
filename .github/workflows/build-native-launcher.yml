@@ -29,6 +29,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Verify application icon assets
+        shell: pwsh
+        run: |
+          $icon = "src/desktop2stereo/icon/icon-256x256.ico"
+          if (-not (Test-Path -LiteralPath $icon)) { throw "Application icon asset was not found: $icon" }
+
       - name: Configure
         run: cmake -S native/launcher/windows -B build/native-launcher -A x64
 

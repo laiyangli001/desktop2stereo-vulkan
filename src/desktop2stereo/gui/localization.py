@@ -1,4 +1,7 @@
 import gettext
+import locale as system_locale
+import os
+import sys
 from types import MappingProxyType
 
 
@@ -153,6 +156,7 @@ MESSAGE_CATALOGS = {
         "Switching startup menu": "Switching startup menu...",
         "Failed to switch startup menu": "Failed to switch startup menu: {}",
         "Set Language:": "Set Language:",
+        "Follow system": "Follow system",
         "Error": "Error",
         "Warning": "Warning",
         "Display refresh warning": "Display refresh warning",
@@ -545,6 +549,7 @@ MESSAGE_CATALOGS = {
         "Switching startup menu": "正在切换启动菜单...",
         "Failed to switch startup menu": "切换启动菜单失败：{}",
         "Set Language:": "设置语言:",
+        "Follow system": "跟随系统",
         "Error": "错误",
         "Warning": "警告",
         "Display refresh warning": "输出显示器刷新率过低",
@@ -845,6 +850,39 @@ _LOCALE_TRANSLATIONS = {
 def normalize_locale(locale):
     key = str(locale or DEFAULT_LOCALE).replace(" ", "_").upper()
     return LOCALE_ALIASES.get(key, key if key in MESSAGE_CATALOGS else DEFAULT_LOCALE)
+
+
+def detect_system_locale():
+    """Return the supported locale closest to the host UI language."""
+
+    candidates = []
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            buffer = ctypes.create_unicode_buffer(LOCALE_NAME_MAX_LENGTH)
+            if ctypes.windll.kernel32.GetUserDefaultLocaleName(buffer, len(buffer)):
+                candidates.append(buffer.value)
+        except (AttributeError, OSError):
+            pass
+    candidates.extend(os.environ.get(name, "") for name in ("LC_ALL", "LANG", "LANGUAGE"))
+    try:
+        candidates.append(system_locale.getlocale()[0] or "")
+    except ValueError:
+        pass
+    return "CN" if any(str(value).replace("-", "_").upper().startswith(("ZH", "CN")) for value in candidates) else "EN"
+
+
+LOCALE_NAME_MAX_LENGTH = 85
+
+
+def resolve_locale(locale):
+    """Resolve AUTO while keeping explicit EN/CN selections unchanged."""
+
+    value = str(locale or DEFAULT_LOCALE).replace(" ", "_").upper()
+    if value in {"AUTO", "SYSTEM"}:
+        return detect_system_locale()
+    return normalize_locale(value)
 
 
 def is_supported_locale(locale):

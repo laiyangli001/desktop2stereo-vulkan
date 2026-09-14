@@ -30,7 +30,7 @@ from .config import (
     get_environment_model_options, load_environment_display_names,
 )
 from .controls import FONT_SIZE
-from .localization import UI_MESSAGES, is_supported_locale
+from .localization import UI_MESSAGES, is_supported_locale, resolve_locale
 from .paths import BASE_DIR
 from .devices import DEVICES
 
@@ -742,10 +742,11 @@ class GUIHandlerMixin:
 
     def on_language_change(self, e):
         lang_display = e.control.value
-        _LANG_MAP = {"English": "EN", "简体中文": "CN"}
-        lang = _LANG_MAP.get(lang_display, "EN")
-        if is_supported_locale(lang):
-            self.locale = lang
+        _LANG_MAP = {"Follow system": "AUTO", "跟随系统": "AUTO", "English": "EN", "简体中文": "CN"}
+        lang = _LANG_MAP.get(lang_display, "AUTO")
+        if lang == "AUTO" or is_supported_locale(lang):
+            self.locale = resolve_locale(lang)
+            self._language_preference = lang
             os.environ["DESKTOP2STEREO_LOCALE"] = self.locale
             self._config["Language"] = lang
             # OpenXR runs in the child runtime process. Persist the locale so

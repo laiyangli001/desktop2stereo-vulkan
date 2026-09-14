@@ -399,7 +399,10 @@ def test_login_launcher_relogin_action_resets_authorization_selection(monkeypatc
     assert confirm.visible is False
     assert mode.value is None and mode.visible is False
     assert period.visible is False and permanent.visible is False and apply.visible is False
-    assert "重新登录" in status.value
+    assert status.value in {
+        "Current login state cleared. Please log in again.",
+        "已清除当前登录状态，请重新登录。",
+    }
 
 
 def test_login_launcher_rejects_license_response_for_another_license():

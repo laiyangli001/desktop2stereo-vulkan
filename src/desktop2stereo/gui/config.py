@@ -165,7 +165,7 @@ DEFAULTS = {
     "Recompile MIGraphX": False,
     "Recompile OpenVINO": False,
     "Computing Device": 0,
-    "Language": "EN",
+    "Language": "AUTO",
     "Run Mode": "OpenXR Link",
     "XR Headset Model": DEFAULT_XR_HEADSET_MODEL,
     "XR Preview Window": True,

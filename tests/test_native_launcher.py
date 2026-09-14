@@ -160,7 +160,7 @@ def test_native_launcher_workflow_does_not_build_a_python_release_package():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "setup-python" not in workflow
     assert "stage-python-runtime.py" not in workflow
-    assert "src/desktop2stereo" not in workflow
+    assert "src/desktop2stereo/auth" not in workflow
     assert "src/env_install" not in workflow
 
 

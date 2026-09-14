@@ -23,6 +23,7 @@ from utils import (
 )
 from utils.display_info import resolve_windows_fullscreen_policy
 from utils.run_mode import normalize_run_mode, target_fps_for_run_mode
+from gui.localization import resolve_locale
 from utils.xr_headset_presets import (
     DEFAULT_XR_HEADSET_MODEL,
     resolve_xr_headset_preset,
@@ -852,7 +853,7 @@ def run_processing_runtime(
         return capture_target
 
     def report_display_refresh_warning(refresh_hz: int, sbs_fps: float) -> None:
-        if str(settings.get("Language", "EN")).strip().upper() == "CN":
+        if resolve_locale(settings.get("Language", "AUTO")) == "CN":
             message = (
                 f"SBS 输出显示器当前仅 {refresh_hz} Hz，低于实测 {sbs_fps:.1f} FPS "
                 "或建议最低 60 Hz；请在 Windows 显示设置或显卡控制面板中提高刷新率。"
@@ -880,7 +881,7 @@ def run_processing_runtime(
     def report_capture_refresh_warning(
         refresh_hz: int, capture_target: int
     ) -> None:
-        if str(settings.get("Language", "EN")).strip().upper() == "CN":
+        if resolve_locale(settings.get("Language", "AUTO")) == "CN":
             message = (
                 f"输入显示器当前仅 {refresh_hz} Hz，低于动态捕获目标 "
                 f"{capture_target} FPS；请提高输入显示器刷新率，或手动降低捕获帧率。"

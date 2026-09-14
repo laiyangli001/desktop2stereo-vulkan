@@ -816,7 +816,7 @@ class GUIBuilderMixin:
 
         # Bottom: Language + Theme + Buttons
         self.lang_label = ft.Text("Set Language:", size=FONT_SIZE, width=S(130))
-        self.lang_dd = CompactDropdown(options=["English", "简体中文"],
+        self.lang_dd = CompactDropdown(options=["Follow system", "English", "简体中文"],
             value="English", on_select=self.on_language_change, width=S(130))
         self.theme_label = ft.IconButton(
             icon=ft.Icons.DARK_MODE,

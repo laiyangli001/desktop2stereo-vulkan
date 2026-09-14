@@ -22,7 +22,7 @@ from .process import GUIProcessMixin, _setup_console_logging
 from .config import DEFAULTS
 from .controls import S
 from .paths import APP_ICON_PATH, BASE_DIR, GUI_READY_FILE, LOG_DIR
-from .localization import UI_MESSAGES
+from .localization import UI_MESSAGES, resolve_locale
 
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ class Desktop2StereoGUI(
                 if cfg:
                     self._config.update(cfg)
                     self._yaml_loaded = True
-                    self.locale = self._config.get("Language", "EN")
+                    self.locale = resolve_locale(self._config.get("Language", "AUTO"))
                     os.environ["DESKTOP2STEREO_LOCALE"] = self.locale
                     self.apply_config(self._config)
                     self.set_status(UI_MESSAGES[self.locale]["Loaded settings.yaml at startup"],
