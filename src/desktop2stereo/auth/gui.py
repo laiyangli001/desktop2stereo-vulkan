@@ -231,7 +231,7 @@ class LoginLauncher:
     async def _main(self, page: ft.Page):
         self._page = page
         page.title = self._t("window_title")
-        icon_path = Path(__file__).resolve().parent / "icon" / "icon-256x256.ico"
+        icon_path = Path(__file__).resolve().parents[1] / "icon" / "icon-256x256.ico"
         if icon_path.is_file():
             page.window.icon = str(icon_path)
         page.window.width = 440

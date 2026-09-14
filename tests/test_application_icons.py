@@ -25,7 +25,7 @@ def test_gui_and_auth_use_packaged_icon_paths() -> None:
     auth_source = (ROOT / "src/desktop2stereo/auth/gui.py").read_text(encoding="utf-8")
     workflow = (ROOT / ".github/workflows/build-native-launcher.yml").read_text(encoding="utf-8")
     assert "APP_ICON_PATH" in gui_source
-    assert 'icon" / "icon-256x256.ico' in auth_source
+    assert 'parents[1] / "icon" / "icon-256x256.ico' in auth_source
     assert "src/desktop2stereo/icon" in workflow
 
 
