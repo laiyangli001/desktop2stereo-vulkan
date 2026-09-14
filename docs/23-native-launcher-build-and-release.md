@@ -21,9 +21,8 @@ Install one hardware profile separately when preparing a complete runtime:
 The profile owns its Torch/TorchVision versions, wheel indexes and accelerator
 packages. The common file is installed after the selected profile by the
 platform installation scripts. The native-launcher Actions job does not install
-any Python requirements: it validates the pinned runtime archive, generates the
-SBOM from the requirement files, and publishes only the native binary. This
-prevents launcher builds from downloading a large Torch or CUDA dependency tree.
+Python requirements or download a Python runtime. It publishes only the native
+binary, so launcher builds do not perform unrelated dependency downloads.
 
 ## Standard workflow
 
@@ -34,7 +33,7 @@ prevents launcher builds from downloading a large Torch or CUDA dependency tree.
    binaries as proof that the remote release build passed.
 3. Commit and push the workflow/source changes to `main`.
 4. Monitor the GitHub Actions native-launcher workflow until Windows, Linux,
-   macOS, SBOM/manifest verification and ClamAV scanning all succeed.
+   macOS and ClamAV scanning all succeed.
 5. Confirm that each artifact contains only one native launcher and that its
    size is in the small KB-range, not hundreds of MB or GB.
 6. Download the three successful artifacts locally and copy the binaries to

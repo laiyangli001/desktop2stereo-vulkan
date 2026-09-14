@@ -112,13 +112,12 @@ def test_remote_build_workflow_covers_all_native_launcher_platforms():
     assert "macos-14" in workflow
     assert "Desktop2Stereo-linux-launcher" in workflow
     assert "Desktop2Stereo-macos-launcher" in workflow
-    assert "Desktop2Stereo-macos dist/Desktop2Stereo/src/" in workflow
-    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo.exe" in workflow
-    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo\n" in workflow
-    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo-macos" in workflow
+    assert "path: build/native-launcher/Release/Desktop2Stereo.exe" in workflow
+    assert "path: build/native-launcher-linux/Desktop2Stereo" in workflow
+    assert "path: build/native-launcher-macos/Desktop2Stereo-macos" in workflow
     assert workflow.count("if-no-files-found: error") == 3
     assert "Desktop2Stereo.app" not in workflow
-    assert "dist/Desktop2Stereo/src/" in workflow
+    assert "dist/Desktop2Stereo" not in workflow
     assert workflow.count("actions/checkout@v5") == 3
 
 
@@ -157,39 +156,12 @@ def test_native_launchers_use_the_release_src_as_python_module_root():
     assert 'stringByAppendingPathComponent:@"src"' in MACOS_SOURCE.read_text(encoding="utf-8")
 
 
-def test_native_launcher_package_workflow_includes_independent_auth_sources():
+def test_native_launcher_workflow_does_not_build_a_python_release_package():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    auth_workflow = (ROOT / ".github" / "workflows" / "auth.yml").read_text(encoding="utf-8")
-    for module in ("src/desktop2stereo/auth", "src/desktop2stereo/app_runtime", "src/desktop2stereo/gui", "src/desktop2stereo/gui2"):
-        assert module in workflow
-    for runner in ("windows-latest", "ubuntu-latest", "macos-14"):
-        assert runner in auth_workflow
-    assert "write-release-manifest.mjs" in workflow
-
-
-def test_release_packaging_requires_and_installs_server_public_key():
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    installer = PUBLIC_KEY_INSTALLER.read_text(encoding="utf-8")
-    assert "D2S_LICENSE_PUBLIC_KEY_JSON" in workflow
-    assert "install-public-key.mjs" in workflow
-    assert "required for release packaging" in workflow
-    assert "BEGIN PUBLIC KEY" in installer
-    assert "PRIVATE KEY" in installer
-
-
-def test_release_package_verifier_is_part_of_release_contract():
-    verifier = PACKAGE_VERIFIER.read_text(encoding="utf-8")
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert "required ${platform} release file is missing" in verifier
-    assert "private key material found" in verifier
-    assert "verify-release-package.mjs" in workflow
-
-
-def test_release_package_secret_scan_is_part_of_release_contract():
-    scanner = (ROOT / "scripts" / "scan-release-secrets.mjs").read_text(encoding="utf-8")
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    assert "literal credential value" in scanner
-    assert "scan-release-secrets.mjs dist/Desktop2Stereo" in workflow
+    assert "setup-python" not in workflow
+    assert "stage-python-runtime.py" not in workflow
+    assert "src/desktop2stereo" not in workflow
+    assert "src/env_install" not in workflow
 
 
 def test_release_workflow_scans_all_final_artifacts_for_malware():
@@ -205,21 +177,17 @@ def test_release_workflow_scans_all_final_artifacts_for_malware():
     assert "clamav-freshclam.service" in workflow
     assert "install -d -o clamav -g clamav -m 755 /var/log/clamav" in workflow
     assert "freshclam --stdout --verbose --log=\"$freshclam_log\"" in workflow
-    assert "! -path '*/src/python3/*'" in workflow
+    assert "find artifacts -type f -print0" in workflow
     assert "clamscan --infected --no-summary" in workflow
 
 
-def test_release_workflow_stages_verified_standalone_python_runtime():
+def test_release_workflow_keeps_dependencies_out_of_native_build():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    stager = RUNTIME_STAGER.read_text(encoding="utf-8")
-    assert "stage-python-runtime.py windows" in workflow
-    assert "stage-python-runtime.py linux" in workflow
-    assert "stage-python-runtime.py macos" in workflow
+    assert "setup-python" not in workflow
+    assert "stage-python-runtime.py" not in workflow
     assert "-r src/env_install/requirements.txt" not in workflow
-    assert "cache: pip" not in workflow
     assert "-m pip install" not in workflow
     assert "download.pytorch.org/whl/cpu" not in workflow
-    assert "write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt" in workflow
     pip_options = (ROOT / "src/env_install/requirements-pip-options.txt").read_text(encoding="utf-8")
     assert "download.pytorch.org/whl/cpu" not in pip_options
     base_requirements = (ROOT / "src/env_install/requirements.txt").read_text(encoding="utf-8")
@@ -233,21 +201,7 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "torch==" in (ROOT / "src/env_install/requirements-cuda-legacy.txt").read_text(encoding="utf-8")
     assert "torch[device-all]" in (ROOT / "src/env_install/requirements-rocm7.txt").read_text(encoding="utf-8")
     assert "torch==" in (ROOT / "src/env_install/requirements-mps.txt").read_text(encoding="utf-8")
-    assert "runtime archive SHA-256 mismatch" in stager
-    assert "runtime contains a symbolic link" in stager
-    assert "runtime-manifest.json" in stager
-
-
-def test_release_workflow_generates_verified_build_metadata():
+def test_native_build_reacts_to_native_launcher_source_changes():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    writer = BUILD_INFO_WRITER.read_text(encoding="utf-8")
-    verifier = PACKAGE_VERIFIER.read_text(encoding="utf-8")
-    assert workflow.count("write-build-info.mjs dist/Desktop2Stereo") == 3
-    assert '"build-info.json"' in verifier
-    assert "git_sha: gitSha()" in writer
-
-
-def test_native_build_reacts_to_authentication_source_changes():
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    for path in ("src/desktop2stereo/auth/**", "src/desktop2stereo/app_runtime/**", "scripts/install-public-key.mjs", "scripts/stage-python-runtime.py"):
-        assert path in workflow
+    assert '"native/launcher/**"' in workflow
+    assert '".github/workflows/build-native-launcher.yml"' in workflow
