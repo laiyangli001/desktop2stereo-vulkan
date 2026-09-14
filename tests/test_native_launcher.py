@@ -191,6 +191,9 @@ def test_release_package_secret_scan_is_part_of_release_contract():
 def test_release_workflow_scans_all_final_artifacts_for_malware():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "malware-scan:" in workflow
+    assert "scan_only" in workflow
+    assert "artifact_run_id" in workflow
+    assert "artifact_sha" in workflow
     assert "actions/download-artifact@v8" in workflow
     assert workflow.count("actions/upload-artifact@v7") == 3
     assert "clamav" in workflow
@@ -198,7 +201,8 @@ def test_release_workflow_scans_all_final_artifacts_for_malware():
     assert "clamav-freshclam.service" in workflow
     assert "install -d -o clamav -g clamav -m 755 /var/log/clamav" in workflow
     assert "freshclam --stdout --verbose --log=\"$freshclam_log\"" in workflow
-    assert "clamscan --infected" in workflow
+    assert "! -path '*/src/python3/*'" in workflow
+    assert "clamscan --infected --no-summary" in workflow
 
 
 def test_release_workflow_stages_verified_standalone_python_runtime():

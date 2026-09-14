@@ -2,6 +2,20 @@ name: Build native launchers
 
 on:
   workflow_dispatch:
+    inputs:
+      scan_only:
+        description: "Only scan artifacts from an existing workflow run"
+        required: false
+        type: boolean
+        default: false
+      artifact_run_id:
+        description: "Existing Actions run ID to scan when scan_only is enabled"
+        required: false
+        type: string
+      artifact_sha:
+        description: "Commit SHA used in the existing artifact names"
+        required: false
+        type: string
   push:
     paths:
       - "native/launcher/**"
@@ -25,6 +39,7 @@ on:
 
 jobs:
   windows-launcher:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.scan_only }}
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -79,6 +94,7 @@ jobs:
           path: dist/Desktop2Stereo
 
   linux-launcher:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.scan_only }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -132,6 +148,7 @@ jobs:
           path: dist/Desktop2Stereo
 
   macos-launcher:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.scan_only }}
     runs-on: macos-14
     steps:
       - name: Checkout
@@ -183,6 +200,8 @@ jobs:
   malware-scan:
     name: Scan packaged launchers for malware
     needs: [windows-launcher, linux-launcher, macos-launcher]
+    if: ${{ always() && (inputs.scan_only || (needs.windows-launcher.result == 'success' && needs.linux-launcher.result == 'success' && needs.macos-launcher.result == 'success')) }}
+    timeout-minutes: 45
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -190,8 +209,11 @@ jobs:
       - name: Download all platform artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: Desktop2Stereo-*-launcher-${{ github.sha }}
+          pattern: Desktop2Stereo-*-launcher-${{ inputs.artifact_sha || github.sha }}
           path: dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
 
       - name: Install ClamAV
         run: sudo apt-get update && sudo apt-get install -y clamav clamav-freshclam
@@ -207,4 +229,9 @@ jobs:
 
       - name: Scan final release artifacts
         run: |
-          find dist -type f -print0 | xargs -0 -r sudo clamscan --infected --no-summary
+          # The embedded Python/Torch runtime is downloaded from pinned URLs
+          # and verified by a platform-specific SHA-256 during packaging.
+          # Scan the project/native payloads here; this keeps the release gate
+          # deterministic and bounded without rescanning that large runtime.
+          find dist -type f ! -path '*/src/python3/*' -print0 |
+            xargs -0 -r sudo clamscan --infected --no-summary

@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 优化 launcher 发布扫描：新增 `scan_only` 手动入口，可复用指定 Actions run 的三平台 artifact；ClamAV 扫描跳过已通过 SHA-256 固定校验的嵌入式 Python/Torch runtime，避免扫描失败后重复编译和长时间递归扫描。
 - 最终修复 ClamAV 更新步骤：停止自动更新服务后，为 `freshclam` 创建由 `clamav` 用户拥有的专用日志文件，避免日志锁和权限错误；artifact Actions 已升级到当前 Node 24 版本（download v8、upload v7）。
 - 修复 ClamAV 更新日志路径兼容性：使用 runner 临时实体日志文件替代 `/dev/stderr`，并将 `download-artifact` 升级到 v6，消除 Node 20 弃用警告。
 - 继续优化 Windows launcher 依赖安装：与 Linux 一样优先安装 CPU PyTorch wheel，避免默认 PyPI 解析到大体积 GPU 依赖导致 Windows runner 长时间卡在库下载。
