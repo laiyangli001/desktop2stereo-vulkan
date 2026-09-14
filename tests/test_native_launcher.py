@@ -37,6 +37,13 @@ def test_windows_launcher_registers_small_and_large_icons_with_wndclassex():
     assert "WNDCLASSEXW windowClass{}" in source
     assert "windowClass.cbSize = sizeof(windowClass);" in source
     assert "RegisterClassExW(&windowClass);" in source
+    assert "LoadLauncherIcons" in source
+    assert "IMAGE_ICON, 32, 32" in source
+    assert "IMAGE_ICON, 16, 16" in source
+    assert "windowClass.hIcon = g_icon_large;" in source
+    assert "windowClass.hIconSm = g_icon_small;" in source
+    assert "DestroyIcon(g_icon_large)" in source
+    assert "DestroyIcon(g_icon_small)" in source
     assert "#define UNICODE" not in source
     assert "#define _UNICODE" not in source
 

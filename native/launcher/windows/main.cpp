@@ -23,6 +23,8 @@ HWND g_window = nullptr;
 HANDLE g_process = nullptr;
 DWORD g_startedAt = 0;
 HBITMAP g_bitmap = nullptr;
+HICON g_icon_large = nullptr;
+HICON g_icon_small = nullptr;
 int g_width = 0;
 int g_height = 0;
 std::filesystem::path g_root;
@@ -93,6 +95,19 @@ bool LoadPng(const std::filesystem::path& path, int width, int height) {
     if (decoder) decoder->Release();
     if (factory) factory->Release();
     return ok;
+}
+
+bool LoadLauncherIcons(HINSTANCE instance) {
+    g_icon_large = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(IDI_DESKTOP2STEREO), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
+    g_icon_small = static_cast<HICON>(LoadImageW(
+        instance, MAKEINTRESOURCEW(IDI_DESKTOP2STEREO), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+    if (g_icon_large && g_icon_small) return true;
+    if (g_icon_large) DestroyIcon(g_icon_large);
+    if (g_icon_small) DestroyIcon(g_icon_small);
+    g_icon_large = nullptr;
+    g_icon_small = nullptr;
+    return false;
 }
 
 void PresentBitmap() {
@@ -201,6 +216,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             DeleteObject(g_bitmap);
             g_bitmap = nullptr;
         }
+        if (g_icon_large) {
+            DestroyIcon(g_icon_large);
+            g_icon_large = nullptr;
+        }
+        if (g_icon_small) {
+            DestroyIcon(g_icon_small);
+            g_icon_small = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -236,11 +259,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         CoUninitialize();
         return 4;
     }
+    if (!LoadLauncherIcons(instance)) {
+        ShowFailure(L"Desktop2Stereo application icons could not be loaded.");
+        DeleteObject(g_bitmap);
+        g_bitmap = nullptr;
+        CoUninitialize();
+        return 5;
+    }
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
-    windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_DESKTOP2STEREO));
-    windowClass.hIconSm = windowClass.hIcon;
+    windowClass.hIcon = g_icon_large;
+    windowClass.hIconSm = g_icon_small;
     windowClass.lpfnWndProc = WindowProc;
     windowClass.lpszClassName = kWindowClass;
     RegisterClassExW(&windowClass);
@@ -250,8 +280,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         0, 0, g_width, g_height, nullptr, nullptr, instance, nullptr);
     if (!g_window) {
         ShowFailure(L"Failed to create the native startup window.");
+        DestroyIcon(g_icon_large);
+        DestroyIcon(g_icon_small);
+        g_icon_large = nullptr;
+        g_icon_small = nullptr;
+        DeleteObject(g_bitmap);
+        g_bitmap = nullptr;
         CoUninitialize();
-        return 5;
+        return 6;
     }
     PresentBitmap();
     ShowWindow(g_window, SW_SHOWNOACTIVATE);
@@ -262,7 +298,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     UpdateWindow(g_window);
     if (!StartPython()) {
         CoUninitialize();
-        return 6;
+        return 7;
     }
     SetTimer(g_window, kTimerId, kPollMs, nullptr);
     MSG message{};
