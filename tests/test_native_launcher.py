@@ -218,11 +218,18 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "-r src/env_install/requirements.txt" in workflow
     assert "cache: pip" in workflow
     assert "--timeout 120 --retries 3" in workflow
-    assert "download.pytorch.org/whl/cpu" in workflow
+    assert "download.pytorch.org/whl/cpu" not in workflow
     assert workflow.count("-r src/env_install/requirements.txt") >= 3
     assert "install --disable-pip-version-check" in workflow
     pip_options = (ROOT / "src/env_install/requirements-pip-options.txt").read_text(encoding="utf-8")
-    assert "--extra-index-url https://download.pytorch.org/whl/cpu" in pip_options
+    assert "download.pytorch.org/whl/cpu" not in pip_options
+    base_requirements = (ROOT / "src/env_install/requirements.txt").read_text(encoding="utf-8")
+    assert "torch==" not in base_requirements
+    assert "torchvision==" not in base_requirements
+    assert "torch==" in (ROOT / "src/env_install/requirements-cuda.txt").read_text(encoding="utf-8")
+    assert "torch==" in (ROOT / "src/env_install/requirements-cuda-legacy.txt").read_text(encoding="utf-8")
+    assert "torch[device-all]" in (ROOT / "src/env_install/requirements-rocm7.txt").read_text(encoding="utf-8")
+    assert "torch==" in (ROOT / "src/env_install/requirements-mps.txt").read_text(encoding="utf-8")
     assert "runtime archive SHA-256 mismatch" in stager
     assert "runtime contains a symbolic link" in stager
     assert "runtime-manifest.json" in stager

@@ -1,10 +1,10 @@
 # Desktop2Stereo Vulkan 项目日志
 
-- 修复平台标记依赖导致的 SBOM 冲突：基础 requirements 统一声明 `torch==2.14.0` 和 `torchvision==0.29.0`，由索引按平台解析 CPU/MPS wheel，避免同一依赖在 SBOM 中出现 `+cpu` 与 macOS 版本冲突。
-- 修复统一 requirements 的索引覆盖问题：将 PyTorch CPU 源加入公共 pip 选项，确保 Windows/Linux 的 `+cpu` 固定版本不会回退到 PyPI CUDA 依赖，也不会因找不到本地版本导致远程构建失败。
+- 明确三平台启动器的依赖边界：`requirements.txt` 仅保留公共依赖，CUDA、ROCm 和 MPS 的 Torch/TorchVision 及专用索引分别保留在对应 profile 文件；GitHub Actions 仅构建并发布 KB 级原生启动器，完整编译、下载和发布流程记录于 `docs/23-native-launcher-build-and-release.md`。
+
+- 移除基础依赖中的平台专用 Torch/TorchVision 版本和 PyTorch CPU 索引，避免远程启动器构建误安装与目标 GPU 无关的大型运行时；各平台安装脚本仍按所选硬件 profile 安装对应依赖。
 - 调整 launcher 构建产物：GitHub Actions 现在只上传 Windows/Linux/macOS 原生启动器文件，不再把 Python runtime 和 site-packages 混入启动器 artifact；启动器文件恢复为 KB 级别，运行时仍从旁边的 `src/python3` 和 `src/desktop2stereo` 加载环境。
 - 修正三平台基础依赖误选 CUDA wheel：Windows/Linux 固定使用 `torch`/`torchvision` CPU wheel（`+cpu`），避免 Linux 发布包误带 CUDA 13/NVIDIA 依赖而膨胀到 3 GB；原生启动器本身仍不内置 Python 或 Torch。
-- 统一三平台 launcher 依赖安装：将 `torch` 和 `torchvision` 纳入基础 `requirements.txt`，Windows/Linux 使用 CPU wheel 源、macOS 使用平台默认 wheel 源，避免工作流单独重复安装 Torch。
 - 优化 launcher 发布扫描：新增 `scan_only` 手动入口，可复用指定 Actions run 的三平台 artifact；ClamAV 扫描跳过已通过 SHA-256 固定校验的嵌入式 Python/Torch runtime，避免扫描失败后重复编译和长时间递归扫描。
 - 最终修复 ClamAV 更新步骤：停止自动更新服务后，为 `freshclam` 创建由 `clamav` 用户拥有的专用日志文件，避免日志锁和权限错误；artifact Actions 已升级到当前 Node 24 版本（download v8、upload v7）。
 - 修复 ClamAV 更新日志路径兼容性：使用 runner 临时实体日志文件替代 `/dev/stderr`，并将 `download-artifact` 升级到 v6，消除 Node 20 弃用警告。
