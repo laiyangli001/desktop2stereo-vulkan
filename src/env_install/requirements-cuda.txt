@@ -5,6 +5,9 @@ torch==2.11.0
 torchvision==0.26.0
 # torchaudio==2.11.0
 
+# Optional NVIDIA zero-copy encoder API; FFmpeg remains the fallback.
+PyNvVideoCodec==2.2.0; platform_system == "Windows" and platform_machine == "AMD64"
+
 # Optional Triton dependency for torch.compile on Windows.
 triton==3.6.0; sys_platform == "linux"
 triton-windows==3.6.0.post26; sys_platform == "win32"

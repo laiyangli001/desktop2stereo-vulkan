@@ -226,6 +226,10 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     base_requirements = (ROOT / "src/env_install/requirements.txt").read_text(encoding="utf-8")
     assert "torch==" not in base_requirements
     assert "torchvision==" not in base_requirements
+    assert "PyNvVideoCodec" not in base_requirements
+    assert "PyNvVideoCodec" in (ROOT / "src/env_install/requirements-cuda.txt").read_text(encoding="utf-8")
+    assert "PyNvVideoCodec" in (ROOT / "src/env_install/requirements-cuda-legacy.txt").read_text(encoding="utf-8")
+    assert "PyNvVideoCodec" not in (ROOT / "src/env_install/requirements-rocm7.txt").read_text(encoding="utf-8")
     assert "torch==" in (ROOT / "src/env_install/requirements-cuda.txt").read_text(encoding="utf-8")
     assert "torch==" in (ROOT / "src/env_install/requirements-cuda-legacy.txt").read_text(encoding="utf-8")
     assert "torch[device-all]" in (ROOT / "src/env_install/requirements-rocm7.txt").read_text(encoding="utf-8")
