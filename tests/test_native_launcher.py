@@ -196,7 +196,8 @@ def test_release_workflow_scans_all_final_artifacts_for_malware():
     assert "clamav" in workflow
     assert "freshclam" in workflow
     assert "clamav-freshclam.service" in workflow
-    assert "freshclam --stdout --verbose --log=/dev/null" in workflow
+    assert "install -d -o clamav -g clamav -m 755 /var/log/clamav" in workflow
+    assert "freshclam --stdout --verbose --log=\"$freshclam_log\"" in workflow
     assert "clamscan --infected" in workflow
 
 

@@ -199,7 +199,11 @@ jobs:
       - name: Update ClamAV signatures
         run: |
           sudo systemctl stop clamav-freshclam.service 2>/dev/null || true
-          sudo freshclam --stdout --verbose --log=/dev/null
+          freshclam_log=/var/log/clamav/desktop2stereo-freshclam.log
+          sudo install -d -o clamav -g clamav -m 755 /var/log/clamav
+          sudo install -o clamav -g clamav -m 664 /dev/null "$freshclam_log"
+          sudo freshclam --stdout --verbose --log="$freshclam_log"
+          sudo cat "$freshclam_log"
 
       - name: Scan final release artifacts
         run: |
