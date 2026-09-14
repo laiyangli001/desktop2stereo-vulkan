@@ -1,5 +1,7 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 调整 launcher 构建产物：GitHub Actions 现在只上传 Windows/Linux/macOS 原生启动器文件，不再把 Python runtime 和 site-packages 混入启动器 artifact；启动器文件恢复为 KB 级别，运行时仍从旁边的 `src/python3` 和 `src/desktop2stereo` 加载环境。
+- 修正三平台基础依赖误选 CUDA wheel：Windows/Linux 固定使用 `torch`/`torchvision` CPU wheel（`+cpu`），避免 Linux 发布包误带 CUDA 13/NVIDIA 依赖而膨胀到 3 GB；原生启动器本身仍不内置 Python 或 Torch。
 - 统一三平台 launcher 依赖安装：将 `torch` 和 `torchvision` 纳入基础 `requirements.txt`，Windows/Linux 使用 CPU wheel 源、macOS 使用平台默认 wheel 源，避免工作流单独重复安装 Torch。
 - 优化 launcher 发布扫描：新增 `scan_only` 手动入口，可复用指定 Actions run 的三平台 artifact；ClamAV 扫描跳过已通过 SHA-256 固定校验的嵌入式 Python/Torch runtime，避免扫描失败后重复编译和长时间递归扫描。
 - 最终修复 ClamAV 更新步骤：停止自动更新服务后，为 `freshclam` 创建由 `clamav` 用户拥有的专用日志文件，避免日志锁和权限错误；artifact Actions 已升级到当前 Node 24 版本（download v8、upload v7）。

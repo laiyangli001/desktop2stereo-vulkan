@@ -41,10 +41,13 @@ PyOpenGL-accelerate==3.1.10
 
 # Torch 2.11 requires setuptools<82.
 setuptools==78.1.0
-# Common inference runtime for the three remote build platforms. The selected
-# wheel remains platform-specific; CUDA/ROCm profiles override this base set.
-torch==2.11.0
-torchvision==0.26.0
+# Common CPU/MPS inference runtime for the three remote build platforms. Keep
+# the CPU local-version suffix on Windows/Linux so pip cannot select the large
+# CUDA dependency graph; CUDA/ROCm profiles override this base set.
+torch==2.14.0+cpu; platform_system == "Windows" or platform_system == "Linux"
+torchvision==0.29.0+cpu; platform_system == "Windows" or platform_system == "Linux"
+torch==2.14.0; platform_system == "Darwin"
+torchvision==0.29.0; platform_system == "Darwin"
 
 # for da3
 omegaconf==2.3.1

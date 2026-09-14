@@ -89,7 +89,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Desktop2Stereo-windows-launcher-${{ github.sha }}
-          path: dist/Desktop2Stereo
+          path: dist/Desktop2Stereo/src/Desktop2Stereo.exe
+          if-no-files-found: error
 
   linux-launcher:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.scan_only }}
@@ -142,7 +143,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Desktop2Stereo-linux-launcher-${{ github.sha }}
-          path: dist/Desktop2Stereo
+          path: dist/Desktop2Stereo/src/Desktop2Stereo
+          if-no-files-found: error
 
   macos-launcher:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.scan_only }}
@@ -192,7 +194,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: Desktop2Stereo-macos-launcher-${{ github.sha }}
-          path: dist/Desktop2Stereo
+          path: dist/Desktop2Stereo/src/Desktop2Stereo-macos
+          if-no-files-found: error
 
   malware-scan:
     name: Scan packaged launchers for malware

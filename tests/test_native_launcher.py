@@ -113,6 +113,10 @@ def test_remote_build_workflow_covers_all_native_launcher_platforms():
     assert "Desktop2Stereo-linux-launcher" in workflow
     assert "Desktop2Stereo-macos-launcher" in workflow
     assert "Desktop2Stereo-macos dist/Desktop2Stereo/src/" in workflow
+    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo.exe" in workflow
+    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo\n" in workflow
+    assert "path: dist/Desktop2Stereo/src/Desktop2Stereo-macos" in workflow
+    assert workflow.count("if-no-files-found: error") == 3
     assert "Desktop2Stereo.app" not in workflow
     assert "dist/Desktop2Stereo/src/" in workflow
     assert workflow.count("actions/checkout@v5") == 3
