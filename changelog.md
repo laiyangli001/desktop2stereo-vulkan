@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 修复平台标记依赖导致的 SBOM 冲突：基础 requirements 统一声明 `torch==2.14.0` 和 `torchvision==0.29.0`，由索引按平台解析 CPU/MPS wheel，避免同一依赖在 SBOM 中出现 `+cpu` 与 macOS 版本冲突。
 - 修复统一 requirements 的索引覆盖问题：将 PyTorch CPU 源加入公共 pip 选项，确保 Windows/Linux 的 `+cpu` 固定版本不会回退到 PyPI CUDA 依赖，也不会因找不到本地版本导致远程构建失败。
 - 调整 launcher 构建产物：GitHub Actions 现在只上传 Windows/Linux/macOS 原生启动器文件，不再把 Python runtime 和 site-packages 混入启动器 artifact；启动器文件恢复为 KB 级别，运行时仍从旁边的 `src/python3` 和 `src/desktop2stereo` 加载环境。
 - 修正三平台基础依赖误选 CUDA wheel：Windows/Linux 固定使用 `torch`/`torchvision` CPU wheel（`+cpu`），避免 Linux 发布包误带 CUDA 13/NVIDIA 依赖而膨胀到 3 GB；原生启动器本身仍不内置 Python 或 Torch。
