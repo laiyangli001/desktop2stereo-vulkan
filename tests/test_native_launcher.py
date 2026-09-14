@@ -221,6 +221,8 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "download.pytorch.org/whl/cpu" in workflow
     assert workflow.count("-r src/env_install/requirements.txt") >= 3
     assert "install --disable-pip-version-check" in workflow
+    pip_options = (ROOT / "src/env_install/requirements-pip-options.txt").read_text(encoding="utf-8")
+    assert "--extra-index-url https://download.pytorch.org/whl/cpu" in pip_options
     assert "runtime archive SHA-256 mismatch" in stager
     assert "runtime contains a symbolic link" in stager
     assert "runtime-manifest.json" in stager
