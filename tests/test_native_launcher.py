@@ -191,12 +191,12 @@ def test_release_package_secret_scan_is_part_of_release_contract():
 def test_release_workflow_scans_all_final_artifacts_for_malware():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "malware-scan:" in workflow
-    assert "actions/download-artifact@v6" in workflow
-    assert workflow.count("actions/upload-artifact@v6") == 3
+    assert "actions/download-artifact@v8" in workflow
+    assert workflow.count("actions/upload-artifact@v7") == 3
     assert "clamav" in workflow
     assert "freshclam" in workflow
     assert "clamav-freshclam.service" in workflow
-    assert 'freshclam_log="$RUNNER_TEMP/freshclam.log"' in workflow
+    assert "freshclam --stdout --verbose --log=/dev/null" in workflow
     assert "clamscan --infected" in workflow
 
 

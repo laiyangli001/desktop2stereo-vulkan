@@ -1,5 +1,6 @@
 # Desktop2Stereo Vulkan 项目日志
 
+- 最终修复 ClamAV 更新步骤：`freshclam` 改用 `/dev/null` 日志目标，避免 runner 临时目录权限问题，并升级 artifact Actions 到当前 Node 24 版本（download v8、upload v7）。
 - 修复 ClamAV 更新日志路径兼容性：使用 runner 临时实体日志文件替代 `/dev/stderr`，并将 `download-artifact` 升级到 v6，消除 Node 20 弃用警告。
 - 继续优化 Windows launcher 依赖安装：与 Linux 一样优先安装 CPU PyTorch wheel，避免默认 PyPI 解析到大体积 GPU 依赖导致 Windows runner 长时间卡在库下载。
 - 修复 launcher 最终 ClamAV 扫描阶段失败：先停止 runner 自动启动的 `clamav-freshclam` 服务再更新病毒库，避免 `freshclam.log` 锁冲突，并升级 artifact Actions 以消除 Node 20 弃用警告。
