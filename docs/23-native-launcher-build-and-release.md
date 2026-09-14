@@ -20,9 +20,10 @@ Install one hardware profile separately when preparing a complete runtime:
 
 The profile owns its Torch/TorchVision versions, wheel indexes and accelerator
 packages. The common file is installed after the selected profile by the
-platform installation scripts. A native-launcher Actions job installs only the
-common file for package validation, so it must not download a large Torch or
-CUDA dependency tree.
+platform installation scripts. The native-launcher Actions job does not install
+any Python requirements: it validates the pinned runtime archive, generates the
+SBOM from the requirement files, and publishes only the native binary. This
+prevents launcher builds from downloading a large Torch or CUDA dependency tree.
 
 ## Standard workflow
 

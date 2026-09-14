@@ -2,6 +2,7 @@
 
 - 明确三平台启动器的依赖边界：`requirements.txt` 仅保留公共依赖，CUDA、ROCm 和 MPS 的 Torch/TorchVision 及专用索引分别保留在对应 profile 文件；GitHub Actions 仅构建并发布 KB 级原生启动器，完整编译、下载和发布流程记录于 `docs/23-native-launcher-build-and-release.md`。
 - 修正显卡专用依赖归属：`PyNvVideoCodec` 从公共依赖移至 NVIDIA CUDA profile（含 legacy profile），Windows 通用的 `soundcard` 保留在公共依赖；ROCm/MPS profile 不引入 NVIDIA 编码器包。
+- 修复 Linux/Windows 启动器打包超时：远程原生启动器工作流不再安装完整 Python 依赖，仅校验固定 Python runtime、生成 SBOM/manifest 并上传原生二进制，避免无关的 Torch/CUDA 下载。
 
 - 移除基础依赖中的平台专用 Torch/TorchVision 版本和 PyTorch CPU 索引，避免远程启动器构建误安装与目标 GPU 无关的大型运行时；各平台安装脚本仍按所选硬件 profile 安装对应依赖。
 - 调整 launcher 构建产物：GitHub Actions 现在只上传 Windows/Linux/macOS 原生启动器文件，不再把 Python runtime 和 site-packages 混入启动器 artifact；启动器文件恢复为 KB 级别，运行时仍从旁边的 `src/python3` 和 `src/desktop2stereo` 加载环境。

@@ -215,12 +215,11 @@ def test_release_workflow_stages_verified_standalone_python_runtime():
     assert "stage-python-runtime.py windows" in workflow
     assert "stage-python-runtime.py linux" in workflow
     assert "stage-python-runtime.py macos" in workflow
-    assert "-r src/env_install/requirements.txt" in workflow
-    assert "cache: pip" in workflow
-    assert "--timeout 120 --retries 3" in workflow
+    assert "-r src/env_install/requirements.txt" not in workflow
+    assert "cache: pip" not in workflow
+    assert "-m pip install" not in workflow
     assert "download.pytorch.org/whl/cpu" not in workflow
-    assert workflow.count("-r src/env_install/requirements.txt") >= 3
-    assert "install --disable-pip-version-check" in workflow
+    assert "write-release-sbom.mjs dist/Desktop2Stereo/sbom.cdx.json src/env_install/requirements.txt" in workflow
     pip_options = (ROOT / "src/env_install/requirements-pip-options.txt").read_text(encoding="utf-8")
     assert "download.pytorch.org/whl/cpu" not in pip_options
     base_requirements = (ROOT / "src/env_install/requirements.txt").read_text(encoding="utf-8")
