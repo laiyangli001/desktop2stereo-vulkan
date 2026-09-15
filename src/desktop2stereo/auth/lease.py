@@ -80,6 +80,7 @@ class RuntimeLease:
         self._thread: threading.Thread | None = None
         self._server_time: int | None = None
         self._server_time_monotonic: float | None = None
+        self.core_grant: dict | None = None
 
     def start(self) -> None:
         result = self.client.online_heartbeat(self.session.access_token, self.license_id, self.device)
@@ -87,6 +88,11 @@ class RuntimeLease:
         self.heartbeat_interval = _response_heartbeat_interval(result, self.heartbeat_interval)
         self.lease_token = _response_lease_token(result)
         self.lease_expires_at = self._response_lease_expiry(result)
+        self.core_grant = self.client.core_grant(
+            self.session.access_token,
+            self.license_id,
+            self.device,
+        )
         self._thread = threading.Thread(target=self._run, name="D2SOnlineLease", daemon=True)
         self._thread.start()
 
@@ -102,6 +108,11 @@ class RuntimeLease:
             try:
                 result = self.client.online_heartbeat(self.session.access_token, self.license_id, self.device, self.lease_token)
                 self._apply_heartbeat_result(result)
+                self.core_grant = self.client.core_grant(
+                    self.session.access_token,
+                    self.license_id,
+                    self.device,
+                )
             except AuthError as error:
                 if not self._retry_until_expiry(error):
                     self.lost.set()
@@ -211,6 +222,11 @@ class RuntimeLease:
                     self.lease_token,
                 )
                 self._apply_heartbeat_result(result)
+                self.core_grant = self.client.core_grant(
+                    self.session.access_token,
+                    self.license_id,
+                    self.device,
+                )
                 return True
             except AuthError as retry_error:
                 if not _heartbeat_error_retryable(retry_error):
