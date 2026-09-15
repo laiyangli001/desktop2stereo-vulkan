@@ -6,6 +6,9 @@ from typing import Any
 
 DepthResponseFn = Callable[[Any], Any]
 
+_PROTECTED_PARALLAX_CORE = None
+_PROTECTED_PARALLAX_GRANT = None
+
 PARALLAX_RESOLVER_VERSION = 1
 DEPTH_RESPONSE_NAME = "linear_clamp_convergence_v1"
 
@@ -49,6 +52,14 @@ def resolve_parallax_budget(
     *,
     max_disparity_px: float | None = None,
 ) -> ParallaxBudget:
+    if _PROTECTED_PARALLAX_CORE is not None:
+        return _PROTECTED_PARALLAX_CORE.resolve_parallax_budget(
+            render_width,
+            render_height,
+            preset,
+            convergence,
+            max_disparity_px=max_disparity_px,
+        )
     normalized_preset = _normalize_strength_preset(preset)
     width = max(1, int(render_width))
     height = max(1, int(render_height))
@@ -73,11 +84,42 @@ def resolve_parallax_budget(
 
 
 def parallax_debug_info(budget: ParallaxBudget) -> dict[str, float | int | str]:
+    if _PROTECTED_PARALLAX_CORE is not None:
+        return _PROTECTED_PARALLAX_CORE.parallax_debug_info(budget)
     return {
         "resolved_max_disparity_px": float(budget.max_disparity_px),
         "parallax_budget_preset": str(budget.preset),
         "depth_response": str(budget.depth_response_name),
         "parallax_resolver_version": int(budget.resolver_version),
+    }
+
+
+def configure_protected_parallax_core(
+    resource_path: str,
+    grant_jws: str,
+    *,
+    now: int,
+    expected_device_hash: str | None = None,
+) -> dict[str, Any]:
+    """Load the authorized parallax implementation before runtime imports it."""
+
+    global _PROTECTED_PARALLAX_CORE, _PROTECTED_PARALLAX_GRANT
+    from desktop2stereo.auth.core import load_core_module
+
+    grant, module = load_core_module(
+        resource_path,
+        grant_jws,
+        now=now,
+        expected_device_hash=expected_device_hash,
+    )
+    _PROTECTED_PARALLAX_GRANT = grant
+    _PROTECTED_PARALLAX_CORE = module
+    return {
+        "core_id": grant.core_id,
+        "core_version": grant.core_version,
+        "license_id": grant.license_id,
+        "grant_id": grant.grant_id,
+        "expires_at": grant.expires_at,
     }
 
 

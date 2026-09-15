@@ -8,6 +8,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Sequence
+from pathlib import Path
 
 from .probe import build_capability_report
 from .gui_selection import LEGACY_GUI, MODERN_GUI, read_startup_gui
@@ -114,6 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             if lease is not None:
                 lease.start()
+            _configure_protected_parallax_core(session, lease)
             from .runtime_entry import run_processing_runtime
             return run_processing_runtime(
                 max_seconds=args.runtime_seconds,
@@ -192,3 +194,46 @@ def _uses_online_lease(session) -> bool:
             return not isinstance(mode, str) or mode.casefold() == "online"
     # Keep legacy sessions fail-safe until their next status refresh.
     return True
+
+
+def _configure_protected_parallax_core(session, lease) -> None:
+    """Authorize the parallax implementation before importing the runtime."""
+
+    resource_path = os.environ.get("D2S_PARALLAX_CORE_RESOURCE", "").strip()
+    if not resource_path:
+        resource_path = str(Path(__file__).resolve().parents[1] / "protected" / "parallax-core.enc")
+    if not Path(resource_path).is_file():
+        raise AuthError("3D 核心资源不可用", "core_resource_unavailable")
+    grant_jws = None
+    expected_device_hash = None
+    if lease is not None:
+        payload = lease.core_grant
+        if isinstance(payload, dict):
+            grant_jws = payload.get("grant")
+        expected_device_hash = lease.device
+    elif isinstance(getattr(session, "core_grant", None), str):
+        grant_jws = session.core_grant
+        try:
+            from desktop2stereo.auth.device import device_identity
+        except ModuleNotFoundError:
+            from auth.device import device_identity
+        expected_device_hash = device_identity().device_hash
+    if not isinstance(grant_jws, str) or grant_jws.count(".") != 2:
+        raise AuthError("3D 核心授权不可用", "core_grant_unavailable")
+    try:
+        from desktop2stereo.auth.clock import TrustedClock
+        from desktop2stereo.auth.core import ProtectedCoreError
+        from desktop2stereo.stereo_runtime.parallax import configure_protected_parallax_core
+    except ModuleNotFoundError:
+        from auth.clock import TrustedClock
+        from auth.core import ProtectedCoreError
+        from stereo_runtime.parallax import configure_protected_parallax_core
+    try:
+        configure_protected_parallax_core(
+            resource_path,
+            grant_jws,
+            now=TrustedClock().now(),
+            expected_device_hash=expected_device_hash,
+        )
+    except ProtectedCoreError as exc:
+        raise AuthError("3D 核心未开启", "core_unavailable") from exc
