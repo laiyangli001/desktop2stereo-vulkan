@@ -105,6 +105,8 @@ def verify_core_grant(jws: str, *, now: int, expected_device_hash: str | None = 
         "core_id", "core_version", "resource_sha256", "core_key", "issued_at",
         "not_before", "expires_at",
     }
+    if "grant_id" not in claims and "entitlement_id" in claims:
+        claims["grant_id"] = claims["entitlement_id"]
     if not required.issubset(claims) or claims.get("version") != 1 or claims.get("key_id") != key_id:
         raise ProtectedCoreError("protected core authorization fields are invalid")
     string_fields = ("key_id", "grant_id", "license_id", "product", "device_hash", "core_id", "resource_sha256", "core_key")
@@ -147,6 +149,26 @@ def verify_core_grant(jws: str, *, now: int, expected_device_hash: str | None = 
         not_before=claims["not_before"],
         expires_at=claims["expires_at"],
     )
+
+
+def load_core_module(resource_path: str | Path, grant_jws: str, *, now: int, expected_device_hash: str | None = None):
+    """Decrypt and compile the protected formula in memory for runtime use."""
+
+    import types
+
+    grant = verify_core_grant(grant_jws, now=now, expected_device_hash=expected_device_hash)
+    source = decrypt_core_resource(resource_path, grant)
+    try:
+        code = compile(source, "<desktop2stereo-protected-parallax>", "exec")
+    except (SyntaxError, TypeError) as exc:
+        raise ProtectedCoreError("protected core code is invalid") from exc
+    module = types.ModuleType("desktop2stereo_protected_parallax")
+    module.__file__ = "<desktop2stereo-protected-parallax>"
+    exec(code, module.__dict__)
+    for name in ("resolve_parallax_budget", "parallax_debug_info"):
+        if not callable(getattr(module, name, None)):
+            raise ProtectedCoreError("protected core interface is incomplete")
+    return grant, module
 
 
 def decrypt_core_resource(resource_path: str | Path, grant: CoreGrant) -> bytes:

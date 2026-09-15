@@ -56,8 +56,9 @@ def _load_offline_session(saved: dict | None, trusted_clock: TrustedClock | None
         clock = trusted_clock or TrustedClock()
         if not clock.has_checkpoint():
             return None
+        entitlement = OfflineEntitlementStore().load() or ""
         claims = verify_entitlement(
-            OfflineEntitlementStore().load() or "",
+            entitlement,
             now=clock.now(),
             expected_device_hash=device_identity().device_hash,
         )
@@ -66,7 +67,10 @@ def _load_offline_session(saved: dict | None, trusted_clock: TrustedClock | None
     license_id = _license_record_id(claims)
     if license_id is None:
         return None
-    return AuthSession("", None, saved.get("user", {}) if isinstance(saved, dict) else {}, [claims], license_id)
+    return AuthSession(
+        "", None, saved.get("user", {}) if isinstance(saved, dict) else {}, [claims],
+        license_id, core_grant=entitlement,
+    )
 
 
 def validate_saved_authentication() -> AuthSession:

@@ -64,6 +64,7 @@ class AuthSession:
     licenses: list[dict[str, Any]]
     selected_license_id: str | None = None
     server_time: int | None = None
+    core_grant: str | None = None
 
 
 @dataclass
