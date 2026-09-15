@@ -40,6 +40,9 @@ artifacts/
 # Proprietary parallax assets belong to the separate private core repository.
 # Do not commit any copy of them to this public source repository.
 private/parallax-core/
+# Generated from the private core repository during packaging; never commit
+# the staged protected resource to the public source repository.
+src/desktop2stereo/protected/
 AGENTS.md
 .tmp
 .serena

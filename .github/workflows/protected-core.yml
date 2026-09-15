@@ -1,0 +1,52 @@
+name: Verify protected core integration
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/stage-protected-core.py"
+      - "src/desktop2stereo/auth/core.py"
+      - "src/desktop2stereo/app_runtime/bootstrap.py"
+      - "src/desktop2stereo/stereo_runtime/parallax.py"
+      - "tests/test_protected_core.py"
+      - ".github/workflows/protected-core.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout public source
+        uses: actions/checkout@v4
+
+      - name: Checkout private core assets
+        uses: actions/checkout@v4
+        with:
+          repository: laiyangli001/desktop2stereo-vulkan-core
+          token: ${{ secrets.D2S_CORE_REPO_TOKEN }}
+          path: private-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install protected-core verification dependencies
+        run: python -m pip install cryptography pytest
+
+      - name: Stage encrypted resource and verify manifest
+        run: python scripts/stage-protected-core.py --private-core private-core
+
+      - name: Verify protected-core contracts
+        run: >-
+          python -m pytest -q
+          tests/test_protected_core.py
+          tests/test_auth.py
+
+      - name: Verify staged resource is encrypted-only
+        shell: bash
+        run: |
+          test -f src/desktop2stereo/protected/parallax-core.enc
+          ! grep -a -q 'PARALLAX_RESOLVER_VERSION' src/desktop2stereo/protected/parallax-core.enc
