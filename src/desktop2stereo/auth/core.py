@@ -181,12 +181,52 @@ def _native_library_candidates(resource_path: Path, native_path: str | Path | No
     return [root / name for root in roots for name in names]
 
 
-def _decrypt_with_native(resource_path: Path, grant: CoreGrant, native_path: str | Path | None) -> bytes:
+def _verify_native_signature(library, signed: bytes, signature: bytes, key_id: str) -> None:
+    key_data = PUBLIC_KEYS.get(key_id)
+    if not key_data or len(signature) != 64:
+        raise ProtectedCoreError("protected core native signature is invalid")
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        public_key = serialization.load_pem_public_key(key_data)
+        numbers = public_key.public_numbers()
+        verify = library.d2s_core_verify_es256
+        verify.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte), ctypes.POINTER(ctypes.c_ubyte),
+        ]
+        verify.restype = ctypes.c_int
+        message = ctypes.create_string_buffer(signed)
+        raw_signature = (ctypes.c_ubyte * 64).from_buffer_copy(signature)
+        public_x = (ctypes.c_ubyte * 32).from_buffer_copy(numbers.x.to_bytes(32, "big"))
+        public_y = (ctypes.c_ubyte * 32).from_buffer_copy(numbers.y.to_bytes(32, "big"))
+        result = verify(message, len(signed), raw_signature, public_x, public_y)
+        if result != 0:
+            raise ProtectedCoreError("protected core native signature is invalid")
+    except ProtectedCoreError:
+        raise
+    except Exception as exc:
+        raise ProtectedCoreError("protected core native signature is invalid") from exc
+
+
+def _decrypt_with_native(
+    resource_path: Path,
+    grant: CoreGrant,
+    native_path: str | Path | None,
+    grant_jws: str,
+) -> bytes:
     library_path = next((candidate for candidate in _native_library_candidates(resource_path, native_path) if candidate.is_file()), None)
     if library_path is None:
         raise ProtectedCoreError("protected core native module is unavailable")
     try:
         library = ctypes.WinDLL(str(library_path)) if sys.platform == "win32" else ctypes.CDLL(str(library_path))
+        signed_header, signed_payload, signed_signature = grant_jws.split(".")
+        _verify_native_signature(
+            library,
+            f"{signed_header}.{signed_payload}".encode("ascii"),
+            _decode_b64(signed_signature),
+            grant.key_id,
+        )
         decrypt = library.d2s_core_decrypt_resource
         decrypt.argtypes = [
             ctypes.c_char_p,
@@ -248,7 +288,12 @@ def load_core_module(
     grant = verify_core_grant(grant_jws, now=now, expected_device_hash=expected_device_hash)
     resource = Path(resource_path)
     if native_path is not None or require_native or os.environ.get("D2S_PARALLAX_CORE_NATIVE", "").strip():
-        source = _decrypt_with_native(resource, grant, native_path or os.environ.get("D2S_PARALLAX_CORE_NATIVE"))
+        source = _decrypt_with_native(
+            resource,
+            grant,
+            native_path or os.environ.get("D2S_PARALLAX_CORE_NATIVE"),
+            grant_jws,
+        )
     else:
         source = decrypt_core_resource(resource, grant)
     try:
