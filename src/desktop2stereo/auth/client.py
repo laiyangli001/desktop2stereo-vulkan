@@ -501,6 +501,45 @@ class AuthClient:
             raise AuthError(f"无法连接授权服务器：{exc}", "network_error") from exc
         return self._d2s_data(response)
 
+    def core_grant(
+        self,
+        access_token: str,
+        license_id: str,
+        device_hash: str,
+        core_id: str = "parallax-core",
+        core_version: int = 1,
+    ) -> dict[str, Any]:
+        """Request a server-signed grant for the protected stereo core."""
+
+        self._validate_license_identity(license_id, device_hash)
+        if not isinstance(core_id, str) or not core_id.strip():
+            raise AuthError("受保护核心标识无效", "invalid_input")
+        if isinstance(core_version, bool) or not isinstance(core_version, int) or core_version <= 0:
+            raise AuthError("受保护核心版本无效", "invalid_input")
+        try:
+            response = httpx.post(
+                f"{self.base_url}/license/core/grant",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={
+                    "license_id": license_id,
+                    "device_hash": device_hash,
+                    "core_id": core_id.strip(),
+                    "core_version": core_version,
+                },
+                timeout=self.timeout,
+                **self._http_options(),
+            )
+        except httpx.HTTPError as exc:
+            raise AuthError(f"无法连接授权服务器：{exc}", "network_error") from exc
+        data = self._d2s_data(response)
+        grant = data.get("grant")
+        if not isinstance(grant, str) or grant.count(".") != 2:
+            raise AuthError("授权服务器未返回有效核心授权包", "invalid_response")
+        claims = data.get("claims")
+        if not isinstance(claims, dict):
+            raise AuthError("授权服务器未返回有效核心授权字段", "invalid_response")
+        return {"grant": grant, "claims": claims}
+
     def online_logout(self, access_token: str, license_id: str, lease_token: str) -> None:
         self._validate_license_id(license_id)
         if not isinstance(lease_token, str) or not lease_token.strip():
