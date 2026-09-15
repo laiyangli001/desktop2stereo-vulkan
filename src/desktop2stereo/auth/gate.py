@@ -61,6 +61,7 @@ def _load_offline_session(saved: dict | None, trusted_clock: TrustedClock | None
             entitlement,
             now=clock.now(),
             expected_device_hash=device_identity().device_hash,
+            require_core=True,
         )
     except (OfflineEntitlementError, ClockSuspectError, DeviceIdentityError):
         return None

@@ -67,7 +67,13 @@ class OfflineEntitlementStore:
             pass
 
 
-def verify_entitlement(jws: str, *, now: int | None = None, expected_device_hash: str | None = None) -> dict[str, Any]:
+def verify_entitlement(
+    jws: str,
+    *,
+    now: int | None = None,
+    expected_device_hash: str | None = None,
+    require_core: bool = False,
+) -> dict[str, Any]:
     try:
         encoded_header, encoded_payload, encoded_signature = jws.split(".")
         header = json.loads(_decode(encoded_header))
@@ -127,6 +133,21 @@ def verify_entitlement(jws: str, *, now: int | None = None, expected_device_hash
         raise OfflineEntitlementError("离线授权字段无效")
     if expected_device_hash is not None and claims.get("device_hash") != expected_device_hash:
         raise OfflineEntitlementError("离线授权设备不匹配")
+    if require_core:
+        core_string_fields = (
+            "core_id", "resource_sha256", "wrapped_core_key",
+            "key_wrap_ephemeral_public_key", "key_wrap_nonce",
+        )
+        if (
+            not {"core_id", "core_version", "resource_sha256", "wrapped_core_key", "key_wrap_ephemeral_public_key", "key_wrap_nonce"}.issubset(claims)
+            or any(not isinstance(claims.get(field), str) or not claims[field].strip() for field in core_string_fields)
+            or claims.get("core_id") != "parallax-core"
+            or isinstance(claims.get("core_version"), bool)
+            or not isinstance(claims.get("core_version"), int)
+            or claims.get("core_version") <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", claims.get("resource_sha256", ""))
+        ):
+            raise OfflineEntitlementError("离线授权核心字段无效")
     not_before = claims["not_before"]
     expires_at = claims["expires_at"]
     issued_at = claims["issued_at"]
