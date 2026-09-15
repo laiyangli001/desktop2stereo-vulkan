@@ -104,6 +104,19 @@ def require_protected_parallax_core() -> None:
     _PROTECTED_CORE_REQUIRED = True
 
 
+def compute_protected_shift(depth: Any, width: int, params: Any):
+    """Delegate depth-to-disparity computation to the loaded protected core."""
+
+    if _PROTECTED_PARALLAX_CORE is not None:
+        compute = getattr(_PROTECTED_PARALLAX_CORE, "compute_shift_px", None)
+        if not callable(compute):
+            raise RuntimeError("protected parallax core does not expose shift computation")
+        return compute(depth, width, params)
+    if _PROTECTED_CORE_REQUIRED:
+        raise RuntimeError("protected parallax core is required before runtime use")
+    return None
+
+
 def configure_protected_parallax_core(
     resource_path: str,
     grant_jws: str,

@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from .output import ensure_bchw, match_depth
-from .parallax import parallax_debug_info, resolve_parallax_budget
+from .parallax import compute_protected_shift, parallax_debug_info, resolve_parallax_budget
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,9 @@ def _try_triton_shift(
 
 
 def compute_shift_px(depth: torch.Tensor, width: int, params: ShiftParams) -> torch.Tensor:
+    protected_shift = compute_protected_shift(depth, width, params)
+    if protected_shift is not None:
+        return protected_shift
     height = int(depth.shape[-2]) if getattr(depth, "ndim", 0) >= 2 else 1
     budget = resolve_parallax_budget(
         render_width=width,

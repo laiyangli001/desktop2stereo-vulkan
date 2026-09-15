@@ -303,7 +303,7 @@ def load_core_module(
     module = types.ModuleType("desktop2stereo_protected_parallax")
     module.__file__ = "<desktop2stereo-protected-parallax>"
     exec(code, module.__dict__)
-    for name in ("resolve_parallax_budget", "parallax_debug_info"):
+    for name in ("resolve_parallax_budget", "compute_shift_px", "parallax_debug_info"):
         if not callable(getattr(module, name, None)):
             raise ProtectedCoreError("protected core interface is incomplete")
     return grant, module
