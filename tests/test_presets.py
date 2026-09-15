@@ -31,8 +31,7 @@ def test_preset_choices_are_public_and_stable():
 
 
 def test_parallax_budget_presets_are_public():
-    assert PARALLAX_BUDGET_PRESETS["standard"][1080] == 48.0
-    assert PARALLAX_BUDGET_PRESETS["extreme"][2160] == 160.0
+    assert PARALLAX_BUDGET_PRESETS == ("comfort", "standard", "strong", "extreme")
 
 
 def test_stereo_presets_map_to_expected_modes():

@@ -5,12 +5,13 @@ from typing import Any, Literal
 
 from .openxr_render import OpenXRRenderConfig
 from .output import OutputFormat
-from .parallax import PARALLAX_BUDGET_TABLE
 from .synthesis import StereoConfig
 
 StereoModePreset = Literal["auto", "traditional_fastest", "cinema", "game_low_latency", "still_image_hq", "debug_export"]
 
-PARALLAX_BUDGET_PRESETS = PARALLAX_BUDGET_TABLE
+# The numeric budget table lives in the protected core. Public code exposes
+# only stable preset identifiers for configuration and UI selection.
+PARALLAX_BUDGET_PRESETS: tuple[str, ...] = ("comfort", "standard", "strong", "extreme")
 
 PRESET_CHOICES: tuple[StereoModePreset, ...] = (
     "auto",
