@@ -77,9 +77,10 @@
       "descriptor_bindings": [
         {"set": 0, "binding": 0, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null},
-        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 3, "kind": "storage_buffer", "access": "write_only", "format": null},
-        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null}
+        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 5, "kind": "storage_buffer", "access": "write_only", "format": null}
       ],
       "push_constants_size": 40,
       "precision": "fp32"
@@ -94,9 +95,10 @@
       "descriptor_bindings": [
         {"set": 0, "binding": 0, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null},
-        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 3, "kind": "storage_buffer", "access": "write_only", "format": null},
-        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null}
+        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 5, "kind": "storage_buffer", "access": "write_only", "format": null}
       ],
       "push_constants_size": 76,
       "precision": "fp32"
@@ -111,8 +113,9 @@
       "descriptor_bindings": [
         {"set": 0, "binding": 0, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null},
-        {"set": 0, "binding": 2, "kind": "storage_image", "access": "write_only", "format": "rgba8"},
-        {"set": 0, "binding": 3, "kind": "storage_image", "access": "write_only", "format": "rgba8"}
+        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "read_only", "format": null},
+        {"set": 0, "binding": 3, "kind": "storage_image", "access": "write_only", "format": "rgba8"},
+        {"set": 0, "binding": 4, "kind": "storage_image", "access": "write_only", "format": "rgba8"}
       ],
       "push_constants_size": 80,
       "precision": "fp32"
@@ -304,9 +307,10 @@
       "descriptor_bindings": [
         {"set": 0, "binding": 0, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 1, "kind": "storage_buffer", "access": "read_only", "format": null},
-        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 2, "kind": "storage_buffer", "access": "read_only", "format": null},
         {"set": 0, "binding": 3, "kind": "storage_buffer", "access": "write_only", "format": null},
-        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null}
+        {"set": 0, "binding": 4, "kind": "storage_buffer", "access": "write_only", "format": null},
+        {"set": 0, "binding": 5, "kind": "storage_buffer", "access": "write_only", "format": null}
       ],
       "push_constants_size": 76,
       "precision": "fp32",
