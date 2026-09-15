@@ -8,6 +8,7 @@ DepthResponseFn = Callable[[Any], Any]
 
 _PROTECTED_PARALLAX_CORE = None
 _PROTECTED_PARALLAX_GRANT = None
+_PROTECTED_CORE_REQUIRED = False
 
 PARALLAX_RESOLVER_VERSION = 1
 DEPTH_RESPONSE_NAME = "linear_clamp_convergence_v1"
@@ -60,6 +61,8 @@ def resolve_parallax_budget(
             convergence,
             max_disparity_px=max_disparity_px,
         )
+    if _PROTECTED_CORE_REQUIRED:
+        raise RuntimeError("protected parallax core is required before runtime use")
     normalized_preset = _normalize_strength_preset(preset)
     width = max(1, int(render_width))
     height = max(1, int(render_height))
@@ -92,6 +95,13 @@ def parallax_debug_info(budget: ParallaxBudget) -> dict[str, float | int | str]:
         "depth_response": str(budget.depth_response_name),
         "parallax_resolver_version": int(budget.resolver_version),
     }
+
+
+def require_protected_parallax_core() -> None:
+    """Make runtime callers fail closed until the protected core is loaded."""
+
+    global _PROTECTED_CORE_REQUIRED
+    _PROTECTED_CORE_REQUIRED = True
 
 
 def configure_protected_parallax_core(

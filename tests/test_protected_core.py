@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from desktop2stereo.auth.core import ProtectedCoreError, decrypt_core_resource, verify_core_grant
+from desktop2stereo.stereo_runtime import parallax
 
 
 def _b64(value: bytes) -> str:
@@ -89,3 +90,11 @@ def test_protected_core_rejects_resource_tampering(tmp_path: Path, monkeypatch) 
     resource.write_text(resource.read_text(encoding="ascii").replace("parallax-core", "other-core"), encoding="ascii")
     with pytest.raises(ProtectedCoreError, match="resource hash"):
         decrypt_core_resource(resource, grant)
+
+
+def test_runtime_parallax_fails_closed_when_protected_core_is_required(monkeypatch) -> None:
+    monkeypatch.setattr(parallax, "_PROTECTED_PARALLAX_CORE", None)
+    monkeypatch.setattr(parallax, "_PROTECTED_CORE_REQUIRED", False)
+    parallax.require_protected_parallax_core()
+    with pytest.raises(RuntimeError, match="protected parallax core is required"):
+        parallax.resolve_parallax_budget(1920, 1080, "standard")

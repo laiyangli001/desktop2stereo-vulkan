@@ -115,6 +115,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             if lease is not None:
                 lease.start()
+            try:
+                from desktop2stereo.stereo_runtime.parallax import require_protected_parallax_core
+            except ModuleNotFoundError:
+                from stereo_runtime.parallax import require_protected_parallax_core
+            require_protected_parallax_core()
             _configure_protected_parallax_core(session, lease)
             from .runtime_entry import run_processing_runtime
             return run_processing_runtime(
