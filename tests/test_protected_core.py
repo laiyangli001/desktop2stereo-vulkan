@@ -1,12 +1,13 @@
 import base64
 import hashlib
 import json
+import os
 import zlib
 from pathlib import Path
 
 import pytest
 
-from desktop2stereo.auth.core import ProtectedCoreError, decrypt_core_resource, verify_core_grant
+from desktop2stereo.auth.core import ProtectedCoreError, _decrypt_with_native, decrypt_core_resource, verify_core_grant
 from desktop2stereo.stereo_runtime import parallax
 
 
@@ -98,3 +99,12 @@ def test_runtime_parallax_fails_closed_when_protected_core_is_required(monkeypat
     parallax.require_protected_parallax_core()
     with pytest.raises(RuntimeError, match="protected parallax core is required"):
         parallax.resolve_parallax_budget(1920, 1080, "standard")
+
+
+def test_native_protected_core_decrypts_through_the_real_abi(tmp_path: Path, monkeypatch) -> None:
+    native_path = os.environ.get("D2S_PROTECTED_CORE_NATIVE", "").strip()
+    if not native_path:
+        pytest.skip("native protected core artifact is not staged")
+    now, grant_jws, resource, plaintext = _make_grant(tmp_path, monkeypatch)
+    grant = verify_core_grant(grant_jws, now=now, expected_device_hash="a" * 64)
+    assert _decrypt_with_native(resource, grant, native_path, grant_jws) == plaintext
