@@ -99,6 +99,29 @@ def test_release_package_manifest_is_verified_and_detects_tampering(tmp_path: Pa
     assert "hash or size mismatch" in rejected.stderr
 
 
+def test_release_package_protected_core_mode_requires_encrypted_resource_and_native_module(tmp_path: Path):
+    package = tmp_path / "Desktop2Stereo"
+    _make_windows_package(package)
+    resource = package / "src/desktop2stereo/protected/parallax-core.enc"
+    native = package / "src/desktop2stereo/protected/native/windows/d2s_protected_core.dll"
+    resource.parent.mkdir(parents=True, exist_ok=True)
+    native.parent.mkdir(parents=True, exist_ok=True)
+    resource.write_bytes(b'{"cipher":"AES-256-GCM"}')
+    native.write_bytes(b"native-module")
+    written = _run_node(MANIFEST_WRITER, str(package), cwd=ROOT)
+    assert written.returncode == 0, written.stderr
+
+    verified = _run_node(PACKAGE_VERIFIER, str(package), "windows", "--require-protected-core", cwd=ROOT)
+    assert verified.returncode == 0, verified.stderr
+
+    resource.write_bytes(b"PARALLAX_RESOLVER_VERSION = 1")
+    rewritten = _run_node(MANIFEST_WRITER, str(package), cwd=ROOT)
+    assert rewritten.returncode == 0, rewritten.stderr
+    rejected = _run_node(PACKAGE_VERIFIER, str(package), "windows", "--require-protected-core", cwd=ROOT)
+    assert rejected.returncode != 0
+    assert "plaintext formula markers" in rejected.stderr
+
+
 def test_release_package_rejects_private_key_material(tmp_path: Path):
     package = tmp_path / "Desktop2Stereo"
     _make_windows_package(package)

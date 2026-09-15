@@ -4,6 +4,7 @@ import { join, relative, resolve } from "node:path";
 
 const packageRoot = resolve(process.argv[2] || "");
 const platform = String(process.argv[3] || "").trim().toLowerCase();
+const requireProtectedCore = process.argv.includes("--require-protected-core");
 const requiredFiles = {
   windows: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo.exe", "src/python3/python.exe", "src/desktop2stereo/main.py", "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png"],
   linux: ["build-info.json", "runtime-manifest.json", "src/Desktop2Stereo", "src/python3/bin/python", "src/desktop2stereo/main.py", "src/desktop2stereo/icon/icon-256x256.ico", "src/desktop2stereo/icon/icon-256x256.png"],
@@ -12,6 +13,20 @@ const requiredFiles = {
 const textExtensions = new Set([".bat", ".bash", ".cpp", ".h", ".json", ".md", ".mm", ".pem", ".plist", ".py", ".sh", ".txt", ".yml", ".yaml"]);
 const forbiddenPath = /(^|\/)(?:\.env(?:\..*)?|credentials|secrets?|.*\.(?:pfx|p12|p8))$/i;
 const privateKeyMarker = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+const protectedCoreFiles = {
+  windows: [
+    "src/desktop2stereo/protected/parallax-core.enc",
+    "src/desktop2stereo/protected/native/windows/d2s_protected_core.dll",
+  ],
+  linux: [
+    "src/desktop2stereo/protected/parallax-core.enc",
+    "src/desktop2stereo/protected/native/linux/libd2s_protected_core.so",
+  ],
+  macos: [
+    "src/desktop2stereo/protected/parallax-core.enc",
+    "src/desktop2stereo/protected/native/macos/libd2s_protected_core.dylib",
+  ],
+};
 
 function fail(message) {
   throw new Error(`Release package verification failed: ${message}`);
@@ -122,6 +137,15 @@ async function main() {
   for (const name of manifestPaths) if (!actualPaths.has(name)) fail(`manifest covers a missing file: ${name}`);
   for (const name of requiredFiles[platform]) {
     if (!actualPaths.has(name)) fail(`required ${platform} release file is missing: ${name}`);
+  }
+  if (requireProtectedCore) {
+    for (const name of protectedCoreFiles[platform]) {
+      if (!actualPaths.has(name)) fail(`required protected core file is missing: ${name}`);
+    }
+    const encryptedResource = await readFile(join(packageRoot, protectedCoreFiles[platform][0]));
+    if (encryptedResource.includes(Buffer.from("PARALLAX_RESOLVER_VERSION"))) {
+      fail("protected core resource contains plaintext formula markers");
+    }
   }
   console.log(`Release package verification passed: ${platform}, ${manifest.files.length} files`);
 }
