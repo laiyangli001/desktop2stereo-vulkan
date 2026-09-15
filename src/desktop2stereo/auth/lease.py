@@ -88,11 +88,7 @@ class RuntimeLease:
         self.heartbeat_interval = _response_heartbeat_interval(result, self.heartbeat_interval)
         self.lease_token = _response_lease_token(result)
         self.lease_expires_at = self._response_lease_expiry(result)
-        self.core_grant = self.client.core_grant(
-            self.session.access_token,
-            self.license_id,
-            self.device,
-        )
+        self._refresh_core_grant()
         self._thread = threading.Thread(target=self._run, name="D2SOnlineLease", daemon=True)
         self._thread.start()
 
@@ -108,11 +104,7 @@ class RuntimeLease:
             try:
                 result = self.client.online_heartbeat(self.session.access_token, self.license_id, self.device, self.lease_token)
                 self._apply_heartbeat_result(result)
-                self.core_grant = self.client.core_grant(
-                    self.session.access_token,
-                    self.license_id,
-                    self.device,
-                )
+                self._refresh_core_grant()
             except AuthError as error:
                 if not self._retry_until_expiry(error):
                     self.lost.set()
@@ -176,6 +168,19 @@ class RuntimeLease:
         self.lease_token = _response_lease_token(result)
         self.lease_expires_at = self._response_lease_expiry(result)
 
+    def _refresh_core_grant(self) -> None:
+        """Refresh the protected-core grant when supported by the auth client."""
+
+        request_grant = getattr(self.client, "core_grant", None)
+        if not callable(request_grant):
+            self.core_grant = None
+            return
+        self.core_grant = request_grant(
+            self.session.access_token,
+            self.license_id,
+            self.device,
+        )
+
     def _observe_server_time(self, payload: dict) -> None:
         if not isinstance(payload, dict) or "server_time" not in payload:
             return
@@ -222,11 +227,7 @@ class RuntimeLease:
                     self.lease_token,
                 )
                 self._apply_heartbeat_result(result)
-                self.core_grant = self.client.core_grant(
-                    self.session.access_token,
-                    self.license_id,
-                    self.device,
-                )
+                self._refresh_core_grant()
                 return True
             except AuthError as retry_error:
                 if not _heartbeat_error_retryable(retry_error):

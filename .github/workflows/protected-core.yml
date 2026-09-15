@@ -37,7 +37,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install protected-core verification dependencies
-        run: python -m pip install cryptography pytest PyYAML truststore httpx
+        run: python -m pip install cryptography pytest PyYAML truststore httpx flet
 
       - name: Stage encrypted resource and verify manifest
         if: env.D2S_CORE_REPO_TOKEN != ''
