@@ -2,6 +2,12 @@ name: Verify protected core integration
 
 on:
   workflow_dispatch:
+    inputs:
+      require_private_core:
+        description: "Fail unless the private core repository is downloaded and tested"
+        required: false
+        type: boolean
+        default: true
   push:
     paths:
       - "scripts/stage-protected-core.py"
@@ -22,6 +28,13 @@ jobs:
     steps:
       - name: Checkout public source
         uses: actions/checkout@v4
+
+      - name: Require private-core token for strict verification
+        if: inputs.require_private_core && env.D2S_CORE_REPO_TOKEN == ''
+        shell: bash
+        run: |
+          echo "D2S_CORE_REPO_TOKEN is required for strict protected-core verification."
+          exit 1
 
       - name: Checkout private core assets
         if: env.D2S_CORE_REPO_TOKEN != ''
@@ -73,4 +86,4 @@ jobs:
 
       - name: Report private-core integration status
         if: env.D2S_CORE_REPO_TOKEN == ''
-        run: echo "D2S_CORE_REPO_TOKEN is not configured; private-core staging was skipped."
+        run: echo "::warning::D2S_CORE_REPO_TOKEN is not configured; private-core staging and native integration were skipped."

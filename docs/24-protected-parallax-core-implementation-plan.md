@@ -266,3 +266,17 @@ CORE_NATIVE_MODULE_MISSING
 7. 用户只看到“3D 功能未开启”，不会看到保护实现细节。
 8. 不影响现有 GitHub 更新、构建和跨平台运行流程。
 9. 测试覆盖跳过登录界面、直接启动运行子进程和篡改核心资源等场景。
+
+## 10. GitHub 私有核心集成配置
+
+公共仓库的保护核心 CI 默认允许在没有私有仓库令牌时运行公开契约测试；这不代表私有核心已经下载或完成原生集成验证。
+正式集成验证必须在公共仓库配置以下 GitHub Actions Secret：
+
+- Secret 名称：`D2S_CORE_REPO_TOKEN`；
+- 权限范围：仅允许读取 `laiyangli001/desktop2stereo-vulkan-core` 的 Contents；
+- 保存位置：公开仓库 Settings → Secrets and variables → Actions；
+- 不得把令牌写入源码、工作流文件、日志或发布包。
+
+在 GitHub Actions 手动运行 `Verify protected core integration` 时，保持 `require_private_core=true`。
+该模式会下载私有仓库、编译当前平台原生模块、暂存加密资源并执行真实原生 ABI 解密测试；令牌缺失时必须失败。
+公开推送触发的默认检查可以在令牌缺失时跳过私有资产步骤，但工作流会明确报告跳过原因。
