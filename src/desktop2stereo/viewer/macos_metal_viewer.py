@@ -77,9 +77,8 @@ fragment float4 quad_fragment(
 }
 """
 
-# Deferred stereo warp (ported from proven Desktop2Stereo v2.5 metal_viewer):
-# the fragment shader samples the depth texture per-pixel and displaces each
-# eye at draw time, so no SBS tensor is ever synthesized or uploaded.
+# Legacy deferred viewer shader. Protected per-pixel shifts must be generated
+# by the protected core before a future Metal handoff is enabled.
 WARP_SHADER = r"""
 #include <metal_stdlib>
 using namespace metal;
@@ -121,19 +120,10 @@ vertex VertexOut vertex_main(uint vid [[vertex_id]]) {
 }
 
 static float2 displaced_uv(float2 uv, float eye, texture2d<float> depthTex, sampler s, constant Uniforms& u) {
-    // 3-tap Gaussian depth smoothing along horizontal parallax
-    float2 ds_dir = float2(sign(eye) / float(depthTex.get_width()) * 1.5, 0.0);
-    float d0 = depthTex.sample(s, uv).r;
-    float dm = depthTex.sample(s, uv - ds_dir).r;
-    float dp = depthTex.sample(s, uv + ds_dir).r;
-    float d = clamp(d0 * 0.7 + dm * 0.15 + dp * 0.15, 0.0, 1.0);
-    // Asymmetric depth shaping: boosts near-object pop ~35%
-    float depth_shaped = d * (1.0 + 0.35 * (1.0 - d));
-    float shift = (depth_shaped - u.convergence) * u.depthStrength * eye;
-    // Edge falloff: reduce parallax at image borders to prevent sampling artifacts
-    float edge_falloff = smoothstep(0.0, 0.05, uv.x) * smoothstep(1.0, 0.95, uv.x);
-    shift *= edge_falloff;
-    return float2(clamp(uv.x + shift, 0.0, 1.0), uv.y);
+    // Protected per-pixel shifts are not available in this legacy viewer
+    // shader. Keep this emergency path visually flat instead of deriving
+    // disparity from public depth/uniform data.
+    return uv;
 }
 
 static float3 spectral_r_ultrafast(float t) {
