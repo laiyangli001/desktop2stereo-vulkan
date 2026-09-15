@@ -9,6 +9,7 @@ from path_config import APP_ROOT
 import torch
 
 import stereo_runtime.runtime as runtime_module
+import stereo_runtime.parallax as parallax_module
 from stereo_runtime import StereoRuntime, StereoRuntimeConfig
 from stereo_runtime.depth_provider import DepthProfileResult
 from stereo_runtime.openxr_render import OpenXRRenderConfig
@@ -52,6 +53,45 @@ class _FakeVulkanBackend:
 
     def close(self):
         return None
+
+
+@pytest.fixture(autouse=True)
+def protected_core_test_double(monkeypatch):
+    """Provide an explicit protected-core double for Vulkan routing tests."""
+
+    from stereo_runtime.parallax import ParallaxBudget
+
+    def resolve(_width, _height, preset, convergence=0.0, *, max_disparity_px=None):
+        def depth_response(depth):
+            return depth.clamp(0, 1) - convergence
+
+        return ParallaxBudget(
+            max_disparity_px=float(max_disparity_px if max_disparity_px is not None else 32.0),
+            depth_response=depth_response,
+            preset=str(preset or "standard"),
+        )
+
+    def compute(depth, _width, params):
+        budget = resolve(
+            depth.shape[-1],
+            depth.shape[-2],
+            getattr(params, "preset", "standard"),
+            getattr(params, "convergence", 0.0),
+            max_disparity_px=getattr(params, "max_disparity_px", None),
+        )
+        return budget.depth_response(depth) * budget.max_disparity_px
+
+    core = type(
+        "ProtectedCoreTestDouble",
+        (),
+        {
+            "resolve_parallax_budget": staticmethod(resolve),
+            "compute_shift_px": staticmethod(compute),
+            "parallax_debug_info": staticmethod(lambda budget: {}),
+        },
+    )()
+    monkeypatch.setattr(parallax_module, "_PROTECTED_PARALLAX_CORE", core)
+    monkeypatch.setattr(parallax_module, "_PROTECTED_CORE_REQUIRED", True)
 
 
 def test_openxr_prewarp_is_enabled_by_default_for_presenter_owned_output(monkeypatch):
@@ -299,7 +339,7 @@ def test_vulkan_tiled_reference_shader_keeps_layered_pass_abi():
 
     assert "layout(local_size_x = 16, local_size_y = 16" in shader
     assert "shared float shared_depth" in shader
-    assert "layout(set = 0, binding = 4, std430) writeonly buffer MaskBuffer" in shader
+    assert "layout(set = 0, binding = 5, std430) writeonly buffer MaskBuffer" in shader
     assert "layered_shader_path" in backend_source
     assert "d2s_stereo_layered.spv" in backend_source
 

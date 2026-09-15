@@ -8,6 +8,7 @@ import logging
 import pytest
 import torch
 import stereo_runtime.runtime as runtime_module
+import stereo_runtime.parallax as parallax_module
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(APP_ROOT))
@@ -59,6 +60,50 @@ class FakeDepthProvider:
 
     def close(self) -> None:
         self.close_count += 1
+
+
+@pytest.fixture(autouse=True)
+def protected_core_test_double(monkeypatch):
+    """Provide an explicit protected-core double for runtime behavior tests."""
+
+    from stereo_runtime.parallax import ParallaxBudget
+
+    def resolve(_width, _height, preset, convergence=0.0, *, max_disparity_px=None):
+        def depth_response(depth):
+            return depth.clamp(0, 1) - convergence
+
+        return ParallaxBudget(
+            max_disparity_px=float(max_disparity_px if max_disparity_px is not None else 32.0),
+            depth_response=depth_response,
+            preset=str(preset or "standard"),
+        )
+
+    def compute(depth, _width, params):
+        budget = resolve(
+            depth.shape[-1],
+            depth.shape[-2],
+            getattr(params, "preset", "standard"),
+            getattr(params, "convergence", 0.0),
+            max_disparity_px=getattr(params, "max_disparity_px", None),
+        )
+        return budget.depth_response(depth) * budget.max_disparity_px
+
+    core = type(
+        "ProtectedCoreTestDouble",
+        (),
+        {
+            "resolve_parallax_budget": staticmethod(resolve),
+            "compute_shift_px": staticmethod(compute),
+            "parallax_debug_info": staticmethod(lambda budget: {
+                "resolved_max_disparity_px": float(budget.max_disparity_px),
+                "parallax_budget_preset": str(budget.preset),
+                "depth_response": budget.depth_response_name,
+                "parallax_resolver_version": budget.resolver_version,
+            }),
+        },
+    )()
+    monkeypatch.setattr(parallax_module, "_PROTECTED_PARALLAX_CORE", core)
+    monkeypatch.setattr(parallax_module, "_PROTECTED_CORE_REQUIRED", True)
 
 
 def test_runtime_process_rgb_frame_uses_persistent_provider_and_returns_report():

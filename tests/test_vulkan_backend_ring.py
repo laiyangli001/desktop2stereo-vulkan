@@ -57,7 +57,7 @@ def test_host_input_ring_waits_only_when_its_slot_is_reused(monkeypatch) -> None
 
         def submit(self, rgb, depth, shift, left, right, **kwargs):
             timeline = len(submissions) + 1
-            submissions.append((rgb, depth, left, right, kwargs))
+            submissions.append((rgb, depth, shift, left, right, kwargs))
             return timeline
 
         def close(self):
@@ -88,10 +88,10 @@ def test_host_input_ring_waits_only_when_its_slot_is_reused(monkeypatch) -> None
     assert slots == [0, 1, 2, 0]
     assert len(created_buffers) == 9
     assert waits == [1]
-    assert submissions[0][0:2] == tuple(backend._host_input_slots[0])
-    assert submissions[3][0:2] == tuple(backend._host_input_slots[0])
-    assert all(item[4]["signal_semaphore"] is None for item in submissions)
-    assert all(item[4]["wait_semaphore"] is None for item in submissions)
+    assert submissions[0][0:3] == tuple(backend._host_input_slots[0])
+    assert submissions[3][0:3] == tuple(backend._host_input_slots[0])
+    assert all(item[5]["signal_semaphore"] is None for item in submissions)
+    assert all(item[5]["wait_semaphore"] is None for item in submissions)
 
     backend.close()
     assert waits[-1] == 4
@@ -131,7 +131,7 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
 
         def submit(self, rgb, depth, shift, left, right, **kwargs):
             timeline = len(submissions) + 1
-            submissions.append((rgb, depth, left, right, kwargs))
+            submissions.append((rgb, depth, shift, left, right, kwargs))
             return timeline
 
         def close(self):
@@ -205,6 +205,7 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
         is_contiguous=lambda: True,
         shape=(1, 1, 2, 2),
     )
+    monkeypatch.setattr(backend_module.torch, "Tensor", SimpleNamespace)
     left = SimpleNamespace(context=context, width=2, height=2, image="left")
     right = SimpleNamespace(context=context, width=2, height=2, image="right")
 
@@ -221,10 +222,10 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
     assert waits == []
     assert events.count(("wait", "released-0", 77)) == 1
     assert events.count(("wait", "released-1", 77)) == 0
-    assert submissions[0][4]["wait_semaphore"] == "vk:ready-0"
-    assert submissions[0][4]["signal_semaphore"] == "vk:released-0"
-    assert submissions[3][4]["wait_semaphore"] == "vk:ready-0"
-    assert submissions[3][4]["signal_semaphore"] == "vk:released-0"
+    assert submissions[0][5]["wait_semaphore"] == "vk:ready-0"
+    assert submissions[0][5]["signal_semaphore"] == "vk:released-0"
+    assert submissions[3][5]["wait_semaphore"] == "vk:ready-0"
+    assert submissions[3][5]["signal_semaphore"] == "vk:released-0"
 
     backend.close()
     assert waits == [4]

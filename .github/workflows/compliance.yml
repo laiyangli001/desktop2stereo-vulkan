@@ -46,7 +46,7 @@ jobs:
 
       - name: Install matrix test dependencies
         run: |
-          python -m pip install --disable-pip-version-check pytest numpy pillow opencv-python-headless pyopenxr vulkan pyyaml truststore==0.10.4
+          python -m pip install --disable-pip-version-check pytest numpy pillow opencv-python-headless pyopenxr vulkan pyyaml truststore==0.10.4 huggingface_hub==1.20.1
           python -m pip install --disable-pip-version-check torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Validate requirements traceability
