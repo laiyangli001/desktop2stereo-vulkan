@@ -25,13 +25,31 @@ def stage(source_root: Path, target_root: Path) -> Path:
     return target
 
 
+def stage_native(source: Path, target_root: Path, platform_name: str) -> Path:
+    if not source.is_file():
+        raise FileNotFoundError(f"native protected core module is missing: {source}")
+    if platform_name not in {"windows", "linux", "macos"}:
+        raise ValueError("native platform must be windows, linux, or macos")
+    target = target_root / "protected" / "native" / platform_name / source.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    return target
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--private-core", type=Path, required=True)
     parser.add_argument("--target-root", type=Path, default=Path("src/desktop2stereo"))
+    parser.add_argument("--native-core", type=Path)
+    parser.add_argument("--native-platform", choices=("windows", "linux", "macos"))
     args = parser.parse_args()
     target = stage(args.private_core, args.target_root)
     print(f"staged protected core resource: {target}")
+    if args.native_core is not None:
+        if args.native_platform is None:
+            parser.error("--native-platform is required with --native-core")
+        native_target = stage_native(args.native_core, args.target_root, args.native_platform)
+        print(f"staged native protected core module: {native_target}")
     return 0
 
 

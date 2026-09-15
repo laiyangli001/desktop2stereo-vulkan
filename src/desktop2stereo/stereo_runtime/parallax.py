@@ -100,6 +100,8 @@ def configure_protected_parallax_core(
     *,
     now: int,
     expected_device_hash: str | None = None,
+    native_path: str | None = None,
+    require_native: bool = False,
 ) -> dict[str, Any]:
     """Load the authorized parallax implementation before runtime imports it."""
 
@@ -111,6 +113,8 @@ def configure_protected_parallax_core(
         grant_jws,
         now=now,
         expected_device_hash=expected_device_hash,
+        native_path=native_path,
+        require_native=require_native,
     )
     _PROTECTED_PARALLAX_GRANT = grant
     _PROTECTED_PARALLAX_CORE = module

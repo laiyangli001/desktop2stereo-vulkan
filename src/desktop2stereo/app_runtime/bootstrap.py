@@ -234,6 +234,8 @@ def _configure_protected_parallax_core(session, lease) -> None:
             grant_jws,
             now=TrustedClock().now(),
             expected_device_hash=expected_device_hash,
+            native_path=os.environ.get("D2S_PARALLAX_CORE_NATIVE", "").strip() or None,
+            require_native=True,
         )
     except ProtectedCoreError as exc:
         raise AuthError("3D 核心未开启", "core_unavailable") from exc

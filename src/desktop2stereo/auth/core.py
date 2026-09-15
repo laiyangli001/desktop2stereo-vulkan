@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
+import os
+import sys
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,13 +154,100 @@ def verify_core_grant(jws: str, *, now: int, expected_device_hash: str | None = 
     )
 
 
-def load_core_module(resource_path: str | Path, grant_jws: str, *, now: int, expected_device_hash: str | None = None):
+class _NativeResourceInfo(ctypes.Structure):
+    _fields_ = [
+        ("core_version", ctypes.c_int),
+        ("core_id", ctypes.c_char * 64),
+        ("plaintext_sha256", ctypes.c_char * 65),
+    ]
+
+
+def _native_library_candidates(resource_path: Path, native_path: str | Path | None) -> list[Path]:
+    if native_path is not None and str(native_path).strip():
+        return [Path(native_path)]
+    if sys.platform == "win32":
+        names = ("d2s_protected_core.dll", "libd2s_protected_core.dll")
+        platform_name = "windows"
+    elif sys.platform == "darwin":
+        names = ("libd2s_protected_core.dylib", "d2s_protected_core.dylib")
+        platform_name = "macos"
+    else:
+        names = ("libd2s_protected_core.so", "d2s_protected_core.so")
+        platform_name = "linux"
+    roots = (resource_path.parent, resource_path.parent / "native" / platform_name)
+    return [root / name for root in roots for name in names]
+
+
+def _decrypt_with_native(resource_path: Path, grant: CoreGrant, native_path: str | Path | None) -> bytes:
+    library_path = next((candidate for candidate in _native_library_candidates(resource_path, native_path) if candidate.is_file()), None)
+    if library_path is None:
+        raise ProtectedCoreError("protected core native module is unavailable")
+    try:
+        library = ctypes.WinDLL(str(library_path)) if sys.platform == "win32" else ctypes.CDLL(str(library_path))
+        decrypt = library.d2s_core_decrypt_resource
+        decrypt.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_size_t,
+            ctypes.POINTER(_NativeResourceInfo),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        decrypt.restype = ctypes.c_int
+        release = library.d2s_core_free
+        release.argtypes = [ctypes.c_void_p]
+        release.restype = None
+        key = (ctypes.c_ubyte * len(grant.core_key)).from_buffer_copy(grant.core_key)
+        info = _NativeResourceInfo()
+        plaintext_ptr = ctypes.c_void_p()
+        plaintext_size = ctypes.c_size_t()
+        resource_hash = hashlib.sha256(resource_path.read_bytes()).hexdigest().encode("ascii")
+        result = decrypt(
+            os.fsencode(resource_path),
+            resource_hash,
+            key,
+            len(grant.core_key),
+            ctypes.byref(info),
+            ctypes.byref(plaintext_ptr),
+            ctypes.byref(plaintext_size),
+        )
+        if result != 0 or not plaintext_ptr.value:
+            raise ProtectedCoreError("protected core native decryption failed")
+        try:
+            plaintext = ctypes.string_at(plaintext_ptr, plaintext_size.value)
+        finally:
+            release(plaintext_ptr)
+        if info.core_version != grant.core_version or info.core_id.rstrip(b"\0").decode("ascii") != grant.core_id:
+            raise ProtectedCoreError("protected core native metadata does not match")
+        if info.plaintext_sha256.rstrip(b"\0").decode("ascii") != hashlib.sha256(plaintext).hexdigest():
+            raise ProtectedCoreError("protected core native plaintext hash does not match")
+        return plaintext
+    except ProtectedCoreError:
+        raise
+    except (OSError, ValueError, TypeError, UnicodeError, AttributeError) as exc:
+        raise ProtectedCoreError("protected core native module is invalid") from exc
+
+
+def load_core_module(
+    resource_path: str | Path,
+    grant_jws: str,
+    *,
+    now: int,
+    expected_device_hash: str | None = None,
+    native_path: str | Path | None = None,
+    require_native: bool = False,
+):
     """Decrypt and compile the protected formula in memory for runtime use."""
 
     import types
 
     grant = verify_core_grant(grant_jws, now=now, expected_device_hash=expected_device_hash)
-    source = decrypt_core_resource(resource_path, grant)
+    resource = Path(resource_path)
+    if native_path is not None or require_native or os.environ.get("D2S_PARALLAX_CORE_NATIVE", "").strip():
+        source = _decrypt_with_native(resource, grant, native_path or os.environ.get("D2S_PARALLAX_CORE_NATIVE"))
+    else:
+        source = decrypt_core_resource(resource, grant)
     try:
         code = compile(source, "<desktop2stereo-protected-parallax>", "exec")
     except (SyntaxError, TypeError) as exc:
