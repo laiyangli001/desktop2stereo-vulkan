@@ -121,6 +121,20 @@ def _run_vulkan_output_image_stage(
     from viewer.vulkan_context import VulkanContext, VulkanContextConfig
     from viewer.vulkan_resources import VulkanExportableImage, VulkanHostImage
     from .vulkan_backend import VulkanStereoImageComputeBackend
+    from .baseline_shift import ShiftParams, compute_shift_px
+
+    shift = compute_shift_px(
+        prepared_depth,
+        int(rgb.shape[-1]),
+        ShiftParams(
+            depth_strength=params.depth_strength,
+            convergence=params.convergence,
+            max_disparity_px=params.max_disparity_px,
+            foreground_shift_scale=params.foreground_scale,
+            midground_shift_scale=params.midground_scale,
+            background_shift_scale=params.background_scale,
+        ),
+    )
 
     context = VulkanContext.create(
         VulkanContextConfig(
@@ -165,6 +179,7 @@ def _run_vulkan_output_image_stage(
             timeline, debug = backend.submit_to_images(
                 rgb,
                 prepared_depth,
+                shift,
                 left_image,
                 right_image,
                 params=params,
@@ -281,11 +296,26 @@ def run_stage_visual_regression(
         vulkan_mask = None
     except Exception as exc:
         from .vulkan_backend import VulkanStereoComputeBackend
+        from .baseline_shift import ShiftParams, compute_shift_px
+
+        shift = compute_shift_px(
+            prepared_depth,
+            int(rgb.shape[-1]),
+            ShiftParams(
+                depth_strength=vulkan_params.depth_strength,
+                convergence=vulkan_params.convergence,
+                max_disparity_px=vulkan_params.max_disparity_px,
+                foreground_shift_scale=vulkan_params.foreground_scale,
+                midground_shift_scale=vulkan_params.midground_scale,
+                background_shift_scale=vulkan_params.background_scale,
+            ),
+        )
 
         with VulkanStereoComputeBackend() as vulkan_backend:
             vulkan_left, vulkan_right, vulkan_mask, vulkan_debug = vulkan_backend.submit_layered_frame(
                 rgb,
                 prepared_depth,
+                shift,
                 params=vulkan_params,
             )
         vulkan_debug = dict(vulkan_debug)

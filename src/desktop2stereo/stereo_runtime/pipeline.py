@@ -107,14 +107,9 @@ def _env_flag(name: str) -> bool:
 
 def _native_coreml_capture_enabled(ctx) -> bool:
     """Allow native SCK only for Darwin viewers and opted-in stream sinks."""
-    if platform.system() != "Darwin":
-        return False
-    if ctx.run_mode in {"Local Viewer", "Viewer"}:
-        return True
-    return bool(
-        getattr(ctx, "application_runtime_target", None) == "network_stream"
-        and _env_flag("D2S_MAC_STREAM_NATIVE_IO")
-    )
+    # Native Metal warp has not yet received the protected per-pixel shift
+    # handoff. Use the regular protected-core synthesis path until it does.
+    return False
 
 
 def _runtime_diag_stage() -> str:

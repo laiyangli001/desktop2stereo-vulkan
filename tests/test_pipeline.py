@@ -71,17 +71,17 @@ def test_attach_capture_debug_marks_depth_complete_for_current_frame():
     assert result.debug_info["depth_nonfinite_count"] == 0
 
 
-def test_native_coreml_capture_is_enabled_for_macos_network_stream(monkeypatch):
+def test_native_coreml_capture_is_disabled_until_protected_shift_handoff(monkeypatch):
     monkeypatch.setattr("stereo_runtime.pipeline.platform.system", lambda: "Darwin")
     monkeypatch.setenv("D2S_MAC_STREAM_NATIVE_IO", "1")
 
-    assert _native_coreml_capture_enabled(
+    assert not _native_coreml_capture_enabled(
         SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="network_stream")
     )
     assert not _native_coreml_capture_enabled(
         SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="local_viewer")
     )
-    assert _native_coreml_capture_enabled(
+    assert not _native_coreml_capture_enabled(
         SimpleNamespace(run_mode="Local Viewer", application_runtime_target="local_viewer")
     )
 

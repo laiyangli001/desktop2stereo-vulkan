@@ -4,8 +4,9 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer RgbBuffer { float rgb[]; };
 layout(set = 0, binding = 1, std430) readonly buffer DepthBuffer { float depth[]; };
-layout(set = 0, binding = 2, rgba8) uniform writeonly image2D left_eye;
-layout(set = 0, binding = 3, rgba8) uniform writeonly image2D right_eye;
+layout(set = 0, binding = 2, std430) readonly buffer ShiftBuffer { float shift_px[]; };
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D left_eye;
+layout(set = 0, binding = 4, rgba8) uniform writeonly image2D right_eye;
 
 layout(push_constant) uniform LayeredStereoParams {
     uint width;
@@ -40,19 +41,8 @@ int clamp_y(int y) { return clamp(y, 0, int(params.height) - 1); }
 uint pixel_index(int x, int y) { return uint(clamp_y(y)) * params.width + uint(clamp_x(x)); }
 float depth_at(int x, int y) { return clamp(depth[pixel_index(x, y)], 0.0, 1.0); }
 
-float depth_scale(float value) {
-    float normalized = clamp(value, 0.0, 1.0);
-    float background_weight = clamp((0.5 - normalized) * 2.0, 0.0, 1.0);
-    float foreground_weight = clamp((normalized - 0.5) * 2.0, 0.0, 1.0);
-    float midground_weight = clamp(1.0 - background_weight - foreground_weight, 0.0, 1.0);
-    return background_weight * max(params.background_scale, 0.0)
-        + midground_weight * max(params.midground_scale, 0.0)
-        + foreground_weight * max(params.foreground_scale, 0.0);
-}
-
 float base_shift_at(int x, int y) {
-    float response = (depth_at(x, y) - params.convergence) * depth_scale(depth_at(x, y));
-    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
+    return shift_px[pixel_index(x, y)];
 }
 
 float layer_weight(float value, uint layer_index) {

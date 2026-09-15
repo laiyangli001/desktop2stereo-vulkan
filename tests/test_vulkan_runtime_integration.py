@@ -30,7 +30,8 @@ class _Provider:
 
 
 class _FakeVulkanBackend:
-    def submit_frame(self, rgb, depth, *, params):
+    def submit_frame(self, rgb, depth, shift, *, params):
+        assert shift.shape == depth.shape
         self.last_fused_params = params
         mask = torch.zeros_like(depth)
         return rgb, rgb.clone(), mask, {
@@ -39,7 +40,8 @@ class _FakeVulkanBackend:
             "vulkan_readback": "host_visible_storage_buffer",
         }
 
-    def submit_layered_frame(self, rgb, depth, *, params):
+    def submit_layered_frame(self, rgb, depth, shift, *, params):
+        assert shift.shape == depth.shape
         del params
         mask = torch.zeros_like(depth)
         return rgb, rgb.clone(), mask, {

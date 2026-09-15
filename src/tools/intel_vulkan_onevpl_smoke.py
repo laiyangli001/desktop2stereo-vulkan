@@ -75,6 +75,7 @@ def run_smoke(
         request = VulkanComputeRequest(
             rgb=torch.rand((1, 3, height, width), device=device, dtype=torch.float32),
             depth=torch.rand((1, 1, height, width), device=device, dtype=torch.float32),
+            shift=torch.rand((1, 1, height, width), device=device, dtype=torch.float32),
             params=VulkanStereoFusedParams(),
         )
         for _ in range(max(1, frames)):

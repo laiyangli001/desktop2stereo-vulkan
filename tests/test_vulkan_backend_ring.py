@@ -49,13 +49,13 @@ def test_host_input_ring_waits_only_when_its_slot_is_reused(monkeypatch) -> None
             self.closed = True
 
     class FakePass:
-        input_buffer_sizes = {"rgb": 48, "depth": 16}
+        input_buffer_sizes = {"rgb": 48, "depth": 16, "shift": 16}
 
         def __init__(self, context, **_kwargs):
             self.context = context
             self.closed = False
 
-        def submit(self, rgb, depth, left, right, **kwargs):
+        def submit(self, rgb, depth, shift, left, right, **kwargs):
             timeline = len(submissions) + 1
             submissions.append((rgb, depth, left, right, kwargs))
             return timeline
@@ -78,6 +78,7 @@ def test_host_input_ring_waits_only_when_its_slot_is_reused(monkeypatch) -> None
         _timeline, debug = backend.submit_to_images(
             rgb,
             depth,
+            depth,
             left,
             right,
             params=VulkanLayeredStereoParams(),
@@ -85,7 +86,7 @@ def test_host_input_ring_waits_only_when_its_slot_is_reused(monkeypatch) -> None
         slots.append(debug["vulkan_input_ring_slot"])
 
     assert slots == [0, 1, 2, 0]
-    assert len(created_buffers) == 6
+    assert len(created_buffers) == 9
     assert waits == [1]
     assert submissions[0][0:2] == tuple(backend._host_input_slots[0])
     assert submissions[3][0:2] == tuple(backend._host_input_slots[0])
@@ -123,12 +124,12 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
             return None
 
     class FakePass:
-        input_buffer_sizes = {"rgb": 48, "depth": 16}
+        input_buffer_sizes = {"rgb": 48, "depth": 16, "shift": 16}
 
         def __init__(self, context, **_kwargs):
             self.context = context
 
-        def submit(self, rgb, depth, left, right, **kwargs):
+        def submit(self, rgb, depth, shift, left, right, **kwargs):
             timeline = len(submissions) + 1
             submissions.append((rgb, depth, left, right, kwargs))
             return timeline
@@ -184,6 +185,9 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
                 SimpleNamespace(
                     context=context, size=16, label=f"depth-{index}", close=lambda: None
                 ),
+                SimpleNamespace(
+                    context=context, size=16, label=f"shift-{index}", close=lambda: None
+                ),
             )
             for index in range(3)
         )
@@ -199,12 +203,14 @@ def test_cuda_input_ring_reuses_slots_with_device_side_semaphores(monkeypatch) -
         device=SimpleNamespace(type="cuda"),
         dtype=torch.float32,
         is_contiguous=lambda: True,
+        shape=(1, 1, 2, 2),
     )
     left = SimpleNamespace(context=context, width=2, height=2, image="left")
     right = SimpleNamespace(context=context, width=2, height=2, image="right")
 
     for _index in range(4):
         backend.submit_to_images(
+            tensor,
             tensor,
             tensor,
             left,

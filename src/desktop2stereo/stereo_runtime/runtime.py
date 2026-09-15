@@ -303,6 +303,7 @@ class VulkanComputeRequest:
 
     rgb: torch.Tensor
     depth: torch.Tensor
+    shift: torch.Tensor
     params: Any
 
 
@@ -1322,17 +1323,9 @@ class StereoRuntime:
             raise RuntimeError("StereoRuntime inference is paused")
         self.load()
 
-        # Owned zero-copy capture frame (SCK): either ship it to the warp
-        # viewer or release it here — never leak it.
+        # Native Metal warp is disabled until it accepts the protected shift
+        # handoff. The regular synthesis path owns the capture lifecycle.
         viewer_bgra = None
-        if pixel_buffer is not None:
-            if (
-                not skip_sbs_output
-                and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
-                and _viewer_color_adjustments_neutral(self.config)
-                and hasattr(pixel_buffer, "mtl_texture")
-            ):
-                viewer_bgra = pixel_buffer
 
         self._reset_cuda_peak_if_needed()
         rgb_frame = _validate_runtime_rgb_frame(rgb_frame)
@@ -1543,15 +1536,9 @@ class StereoRuntime:
         synth_start = time.perf_counter()
         deferred_vulkan_request = None
         deferred_vulkan_reason = "disabled"
-        # Deferred Metal shader warp (macOS Local Viewer): skip torch-side
-        # synthesis entirely; the viewer's fragment shader samples rgb+depth
-        # at draw time (v2.5 approach). runtime_entry sets the env default to
-        # "1" only for Darwin Local Viewer, so stream/OpenXR paths never see
-        # it unless a user opts in explicitly.
-        deferred_warp = (
-            not skip_sbs_output
-            and os.environ.get("D2S_METAL_SHADER_WARP", "0") == "1"
-        )
+        # Deferred Metal shader warp is disabled until the viewer receives the
+        # protected per-pixel shift handoff.
+        deferred_warp = False
         # Advanced macOS streaming has no native Metal-to-encoder texture
         # bridge in this output path. Use the same synthesis contract as
         # CUDA/ROCm rather than the Vulkan layered pass, which currently
@@ -2268,6 +2255,19 @@ class StereoRuntime:
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
             )
+            shift = compute_shift_px(
+                processed_depth,
+                int(rgb_frame.shape[-1]),
+                ShiftParams(
+                    depth_strength=float(getattr(stereo_config, "depth_strength", 1.0)),
+                    convergence=getattr(stereo_config, "convergence", 0.0),
+                    max_disparity_px=getattr(stereo_config, "max_disparity_px", None),
+                    parallax_preset=str(getattr(stereo_config, "parallax_preset", "standard")),
+                    foreground_shift_scale=float(getattr(stereo_config, "foreground_shift_scale", 1.0)),
+                    midground_shift_scale=float(getattr(stereo_config, "midground_shift_scale", 1.0)),
+                    background_shift_scale=float(getattr(stereo_config, "background_shift_scale", 1.0)),
+                ),
+            )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
                 render_height=int(rgb_frame.shape[-2]),
@@ -2308,7 +2308,7 @@ class StereoRuntime:
                 hole_fill_mode=vulkan_hole_fill_mode,
                 occlusion_enabled=bool(getattr(stereo_config, "occlusion", True)),
             )
-            return VulkanComputeRequest(rgb=rgb_frame, depth=processed_depth, params=params), "ready"
+            return VulkanComputeRequest(rgb=rgb_frame, depth=processed_depth, shift=shift, params=params), "ready"
         except Exception as exc:
             return None, f"request_failed:{type(exc).__name__}"
 
@@ -2437,6 +2437,9 @@ class StereoRuntime:
 
 
     def _try_fast_plus_fused_sbs(self, rgb_frame: torch.Tensor, depth: torch.Tensor, stereo_config: Any) -> tuple[torch.Tensor | None, str]:
+        # The fused kernel still derives disparity internally. Keep it out of
+        # production until it accepts the protected per-pixel shift buffer.
+        return None, "protected_core_shift_buffer_required"
         if not _fast_plus_fused_enabled():
             return None, "disabled"
         if stereo_config.backend != "fast_plus":
@@ -2607,6 +2610,19 @@ class StereoRuntime:
                 convergence=float(getattr(stereo_config, "convergence", 0.0)),
                 max_disparity_px=getattr(stereo_config, "max_disparity_px", None),
             )
+            shift = compute_shift_px(
+                processed_depth,
+                int(rgb_frame.shape[-1]),
+                ShiftParams(
+                    depth_strength=float(getattr(stereo_config, "depth_strength", 1.0)),
+                    convergence=getattr(stereo_config, "convergence", 0.0),
+                    max_disparity_px=getattr(stereo_config, "max_disparity_px", None),
+                    parallax_preset=str(getattr(stereo_config, "parallax_preset", "standard")),
+                    foreground_shift_scale=float(getattr(stereo_config, "foreground_shift_scale", 1.0)),
+                    midground_shift_scale=float(getattr(stereo_config, "midground_shift_scale", 1.0)),
+                    background_shift_scale=float(getattr(stereo_config, "background_shift_scale", 1.0)),
+                ),
+            )
             from .vulkan_stereo_pass import (
                 VulkanStereoFusedParams,
                 resolve_vulkan_hole_fill_mode,
@@ -2633,6 +2649,7 @@ class StereoRuntime:
             left, right, mask, backend_debug = self._vulkan_stereo_backend.submit_frame(
                 rgb_frame,
                 processed_depth,
+                shift,
                 params=VulkanStereoFusedParams(
                     depth_strength=max(0.0, float(getattr(stereo_config, "depth_strength", 1.0))),
                     max_disparity_px=float(budget.max_disparity_px),
@@ -2710,6 +2727,19 @@ class StereoRuntime:
                 depth_pop=float(getattr(stereo_config, "depth_pop", 0.0)),
                 antialias_strength=float(getattr(stereo_config, "depth_antialias_strength", 0.0)),
             )
+            shift = compute_shift_px(
+                processed_depth,
+                int(rgb_frame.shape[-1]),
+                ShiftParams(
+                    depth_strength=float(getattr(stereo_config, "depth_strength", 1.0)),
+                    convergence=getattr(stereo_config, "convergence", 0.0),
+                    max_disparity_px=getattr(stereo_config, "max_disparity_px", None),
+                    parallax_preset=str(getattr(stereo_config, "parallax_preset", "standard")),
+                    foreground_shift_scale=float(getattr(stereo_config, "foreground_shift_scale", 1.0)),
+                    midground_shift_scale=float(getattr(stereo_config, "midground_shift_scale", 1.0)),
+                    background_shift_scale=float(getattr(stereo_config, "background_shift_scale", 1.0)),
+                ),
+            )
             budget = resolve_parallax_budget(
                 render_width=int(rgb_frame.shape[-1]),
                 render_height=int(rgb_frame.shape[-2]),
@@ -2735,6 +2765,7 @@ class StereoRuntime:
             left, right, mask, backend_debug = self._vulkan_stereo_backend.submit_layered_frame(
                 rgb_frame,
                 processed_depth,
+                shift,
                 params=VulkanLayeredStereoParams(
                     depth_strength=max(0.0, float(getattr(stereo_config, "depth_strength", 1.0))),
                     max_disparity_px=float(budget.max_disparity_px),

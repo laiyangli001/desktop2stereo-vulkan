@@ -152,8 +152,9 @@ class IntelVulkanSbsRuntimeBridge:
     def submit(self, request: Any) -> IntelVulkanSbsFrame:
         rgb = getattr(request, "rgb", None)
         depth = getattr(request, "depth", None)
+        shift = getattr(request, "shift", None)
         params = getattr(request, "params", None)
-        if rgb is None or depth is None or params is None:
+        if rgb is None or depth is None or shift is None or params is None:
             raise ValueError("Vulkan Intel SBS request is incomplete")
         height = int(getattr(rgb, "shape", (0, 0, 0, 0))[-2])
         width = int(getattr(rgb, "shape", (0, 0, 0, 0))[-1])
@@ -168,6 +169,7 @@ class IntelVulkanSbsRuntimeBridge:
         timeline, _debug = self.backend.submit_to_images(
             rgb,
             depth,
+            shift,
             destination,
             destination,
             params=params,

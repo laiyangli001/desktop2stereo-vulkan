@@ -2062,6 +2062,7 @@ class VulkanZeroCopyOutputAdapter(CudaVulkanOutputAdapter):
             raise ValueError("Vulkan zero-copy output requires a deferred Compute request")
         rgb = request.rgb
         depth = request.depth
+        shift = request.shift
         shape = tuple(int(value) for value in getattr(rgb, "shape", ()))
         if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
             raise ValueError(f"Vulkan zero-copy RGB request requires [1,3,H,W], got {shape}")
@@ -2077,6 +2078,7 @@ class VulkanZeroCopyOutputAdapter(CudaVulkanOutputAdapter):
             compute_timeline, backend_debug = self._compute_backend.submit_to_images(
                 rgb,
                 depth,
+                shift,
                 left_slot.resource,
                 right_slot.resource,
                 params=request.params,

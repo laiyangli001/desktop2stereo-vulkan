@@ -160,7 +160,7 @@ class VulkanStereoFusedPass:
 
     WORKGROUP_SIZE = 16
     PUSH_CONSTANTS_SIZE = 44
-    BUFFER_COUNT = 5
+    BUFFER_COUNT = 6
 
     def __init__(
         self,
@@ -224,6 +224,7 @@ class VulkanStereoFusedPass:
         return {
             "rgb": pixels * 3 * 4,
             "depth": pixels * 4,
+            "shift": pixels * 4,
             "left_eye": pixels * 3 * 4,
             "right_eye": pixels * 3 * 4,
             "occlusion_mask": pixels * 4,
@@ -258,6 +259,7 @@ class VulkanStereoFusedPass:
         self,
         rgb: Any,
         depth: Any,
+        shift: Any,
         left_eye: Any,
         right_eye: Any,
         occlusion_mask: Any,
@@ -269,7 +271,7 @@ class VulkanStereoFusedPass:
     ) -> int:
         if self.descriptor_arena is None or self.pipeline is None:
             raise RuntimeError("Vulkan stereo pass is closed")
-        buffers = (rgb, depth, left_eye, right_eye, occlusion_mask)
+        buffers = (rgb, depth, shift, left_eye, right_eye, occlusion_mask)
         self._validate_buffers(buffers)
         descriptor_set = self.descriptor_sets[self._descriptor_index]
         self._descriptor_index = (self._descriptor_index + 1) % len(self.descriptor_sets)
@@ -321,6 +323,7 @@ class VulkanLayeredStereoPass(VulkanStereoFusedPass):
         self,
         rgb: Any,
         depth: Any,
+        shift: Any,
         left_eye: Any,
         right_eye: Any,
         occlusion_mask: Any,
@@ -333,6 +336,7 @@ class VulkanLayeredStereoPass(VulkanStereoFusedPass):
         return super().submit(
             rgb,
             depth,
+            shift,
             left_eye,
             right_eye,
             occlusion_mask,

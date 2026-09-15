@@ -1,7 +1,7 @@
 #version 450
 
 // Reference tiled implementation for the generic quality_4k Vulkan SBS path.
-// It keeps the original buffer and push-constant ABI, but caches the depth
+// It receives the protected per-pixel shift map and caches the depth
 // neighborhood used by edge, dilation, feathering, and fill decisions in a
 // workgroup tile. RGB samples remain global because disparity can be wide.
 
@@ -15,15 +15,19 @@ layout(set = 0, binding = 1, std430) readonly buffer DepthBuffer {
     float depth[];
 };
 
-layout(set = 0, binding = 2, std430) writeonly buffer LeftBuffer {
+layout(set = 0, binding = 2, std430) readonly buffer ShiftBuffer {
+    float shift_px[];
+};
+
+layout(set = 0, binding = 3, std430) writeonly buffer LeftBuffer {
     float left_eye[];
 };
 
-layout(set = 0, binding = 3, std430) writeonly buffer RightBuffer {
+layout(set = 0, binding = 4, std430) writeonly buffer RightBuffer {
     float right_eye[];
 };
 
-layout(set = 0, binding = 4, std430) writeonly buffer MaskBuffer {
+layout(set = 0, binding = 5, std430) writeonly buffer MaskBuffer {
     float occlusion_mask[];
 };
 
@@ -82,24 +86,10 @@ float tile_depth_at(int sx, int sy) {
     return clamp(shared_depth[sy][sx], 0.0, 1.0);
 }
 
-float layered_depth_scale(float value) {
-    float normalized = clamp(value, 0.0, 1.0);
-    float background_weight = clamp((0.5 - normalized) * 2.0, 0.0, 1.0);
-    float foreground_weight = clamp((normalized - 0.5) * 2.0, 0.0, 1.0);
-    float midground_weight = clamp(1.0 - background_weight - foreground_weight, 0.0, 1.0);
-    return background_weight * max(params.background_scale, 0.0)
-        + midground_weight * max(params.midground_scale, 0.0)
-        + foreground_weight * max(params.foreground_scale, 0.0);
-}
-
-float shift_from_depth(float value) {
-    float response = value - params.convergence;
-    response *= layered_depth_scale(value);
-    return -response * max(params.depth_strength, 0.0) * params.max_disparity_px * 0.5;
-}
-
 float tile_shift_at(int sx, int sy) {
-    return shift_from_depth(tile_depth_at(sx, sy));
+    int x = int(gl_WorkGroupID.x) * TILE_SIZE + sx - TILE_HALO;
+    int y = int(gl_WorkGroupID.y) * TILE_SIZE + sy - TILE_HALO;
+    return shift_px[pixel_index(x, y)];
 }
 
 float layer_weight(float value, uint layer_index) {

@@ -212,7 +212,7 @@ def test_vulkan_stereo_image_pass_writes_two_storage_images(monkeypatch):
             self.descriptor_set_layout = "layout"
             self.calls = []
             assert kwargs["push_constants_size"] == 80
-            assert [item.descriptor_type for item in kwargs["descriptor_bindings"]] == [7, 7, 8, 8]
+            assert [item.descriptor_type for item in kwargs["descriptor_bindings"]] == [7, 7, 7, 8, 8]
 
         def record_dispatch(self, command_buffer, **kwargs):
             self.calls.append((command_buffer, kwargs))
@@ -223,7 +223,7 @@ def test_vulkan_stereo_image_pass_writes_two_storage_images(monkeypatch):
     class FakeArena:
         def __init__(self, context, budget):
             self.sets = []
-            assert budget.storage_buffers_per_set == 2
+            assert budget.storage_buffers_per_set == 3
             assert budget.storage_images_per_set == 2
 
         def allocate(self, layout):
@@ -258,7 +258,7 @@ def test_vulkan_stereo_image_pass_writes_two_storage_images(monkeypatch):
     )
     stereo_pass = image_module.VulkanStereoImagePass(context, width=32, height=24)
     sizes = stereo_pass.input_buffer_sizes
-    buffers = tuple(SimpleNamespace(context=context, size=sizes[name]) for name in ("rgb", "depth"))
+    buffers = tuple(SimpleNamespace(context=context, size=sizes[name]) for name in ("rgb", "depth", "shift"))
     images = tuple(
         SimpleNamespace(context=context, width=32, height=24, image=object())
         for _ in range(2)

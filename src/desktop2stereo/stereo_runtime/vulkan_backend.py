@@ -107,6 +107,7 @@ class VulkanStereoImageComputeBackend:
             (
                 VulkanStorageBuffer(self.context, sizes["rgb"]),
                 VulkanStorageBuffer(self.context, sizes["depth"]),
+                VulkanStorageBuffer(self.context, sizes["shift"]),
             )
             for _index in range(self._input_slot_count)
         )
@@ -117,6 +118,7 @@ class VulkanStereoImageComputeBackend:
         self,
         rgb: torch.Tensor,
         depth: torch.Tensor,
+        shift: torch.Tensor,
         left_eye: Any,
         right_eye: Any,
         *,
@@ -127,6 +129,8 @@ class VulkanStereoImageComputeBackend:
         if self._closed:
             raise VulkanStereoBackendUnavailable("Vulkan stereo image backend is closed")
         height, width = self._validate_inputs(rgb, depth)
+        if not isinstance(shift, torch.Tensor) or tuple(shift.shape[-2:]) != (height, width):
+            raise ValueError("Vulkan stereo shift and RGB dimensions must match")
         self._ensure_shape(height, width, packed_output=packed_output)
         if self._pass is None:
             raise VulkanStereoBackendUnavailable("Vulkan stereo image pass is unavailable")
@@ -153,6 +157,9 @@ class VulkanStereoImageComputeBackend:
             and str(getattr(getattr(depth, "device", None), "type", "")) == "cuda"
             and str(getattr(depth, "dtype", "")) == "torch.float32"
             and bool(getattr(depth, "is_contiguous", lambda: False)())
+            and str(getattr(getattr(shift, "device", None), "type", "")) == "cuda"
+            and str(getattr(shift, "dtype", "")) == "torch.float32"
+            and bool(getattr(shift, "is_contiguous", lambda: False)())
         )
         if use_cuda_input:
             try:
@@ -180,6 +187,9 @@ class VulkanStereoImageComputeBackend:
                 )
                 importer.copy_tensor_to_buffer(
                     depth, buffers[1], stream=stream
+                )
+                importer.copy_tensor_to_buffer(
+                    shift, buffers[2], stream=stream
                 )
                 importer.signal_semaphore(ready, stream=stream)
                 wait_semaphore = ready.semaphore
@@ -211,10 +221,14 @@ class VulkanStereoImageComputeBackend:
             input_buffers[1].write_bytes(
                 VulkanStereoComputeBackend._planar_bytes(depth, channels=1)
             )
+            input_buffers[2].write_bytes(
+                VulkanStereoComputeBackend._planar_bytes(shift, channels=1)
+            )
             input_upload_ms = (time.perf_counter() - input_upload_start) * 1000.0
         timeline = self._pass.submit(
             input_buffers[0],
             input_buffers[1],
+            input_buffers[2],
             left_eye,
             right_eye,
             params=params,
@@ -297,7 +311,7 @@ class VulkanStereoImageComputeBackend:
                     int(sizes[name]),
                     label=f"stereo-input-{name}-{index}",
                 )
-                for name in ("rgb", "depth")
+                for name in ("rgb", "depth", "shift")
             )
             for index in range(self._input_slot_count)
         )
@@ -442,7 +456,7 @@ class VulkanStereoComputeBackend:
         sizes = self._pass.buffer_sizes
         self._buffers = tuple(
             VulkanStorageBuffer(self.context, sizes[name])
-            for name in ("rgb", "depth", "left_eye", "right_eye", "occlusion_mask")
+            for name in ("rgb", "depth", "shift", "left_eye", "right_eye", "occlusion_mask")
         )
         self._shape = shape
 
@@ -462,7 +476,7 @@ class VulkanStereoComputeBackend:
         sizes = self._layered_pass.buffer_sizes
         self._layered_buffers = tuple(
             VulkanStorageBuffer(self.context, sizes[name])
-            for name in ("rgb", "depth", "left_eye", "right_eye", "occlusion_mask")
+            for name in ("rgb", "depth", "shift", "left_eye", "right_eye", "occlusion_mask")
         )
         self._layered_shape = shape
 
@@ -488,6 +502,7 @@ class VulkanStereoComputeBackend:
         self,
         rgb: torch.Tensor,
         depth: torch.Tensor,
+        shift: torch.Tensor,
         *,
         params: VulkanStereoFusedParams,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
@@ -501,6 +516,8 @@ class VulkanStereoComputeBackend:
             raise ValueError(f"Vulkan stereo backend requires depth shape [1,1,H,W], got {tuple(depth.shape)}")
         if tuple(rgb.shape[-2:]) != tuple(depth.shape[-2:]):
             raise ValueError("Vulkan stereo RGB and depth dimensions must match")
+        if not isinstance(shift, torch.Tensor) or tuple(shift.shape[-2:]) != tuple(rgb.shape[-2:]):
+            raise ValueError("Vulkan stereo shift and RGB dimensions must match")
 
         height, width = (int(rgb.shape[-2]), int(rgb.shape[-1]))
         self._ensure_shape(height, width)
@@ -508,8 +525,10 @@ class VulkanStereoComputeBackend:
         upload_start = time.perf_counter()
         rgb_bytes = self._planar_bytes(rgb, channels=3)
         depth_bytes = self._planar_bytes(depth, channels=1)
+        shift_bytes = self._planar_bytes(shift, channels=1)
         self._buffers[0].write_bytes(rgb_bytes)
         self._buffers[1].write_bytes(depth_bytes)
+        self._buffers[2].write_bytes(shift_bytes)
         upload_ms = (time.perf_counter() - upload_start) * 1000.0
         timeline = self._pass.submit(
             *self._buffers,
@@ -525,9 +544,9 @@ class VulkanStereoComputeBackend:
         submit_wait_ms = (time.perf_counter() - wait_start) * 1000.0
         readback_start = time.perf_counter()
         pixel_count = width * height
-        left = self._read_float_buffer(self._buffers[2], 3 * pixel_count).reshape(1, 3, height, width)
-        right = self._read_float_buffer(self._buffers[3], 3 * pixel_count).reshape(1, 3, height, width)
-        mask = self._read_float_buffer(self._buffers[4], pixel_count).reshape(1, 1, height, width)
+        left = self._read_float_buffer(self._buffers[3], 3 * pixel_count).reshape(1, 3, height, width)
+        right = self._read_float_buffer(self._buffers[4], 3 * pixel_count).reshape(1, 3, height, width)
+        mask = self._read_float_buffer(self._buffers[5], pixel_count).reshape(1, 1, height, width)
         left = left.to(device=rgb.device)
         right = right.to(device=rgb.device)
         mask = mask.to(device=rgb.device)
@@ -551,6 +570,7 @@ class VulkanStereoComputeBackend:
         self,
         rgb: torch.Tensor,
         depth: torch.Tensor,
+        shift: torch.Tensor,
         *,
         params: VulkanLayeredStereoParams,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
@@ -564,6 +584,8 @@ class VulkanStereoComputeBackend:
             raise ValueError(f"Vulkan stereo backend requires depth shape [1,1,H,W], got {tuple(depth.shape)}")
         if tuple(rgb.shape[-2:]) != tuple(depth.shape[-2:]):
             raise ValueError("Vulkan stereo RGB and depth dimensions must match")
+        if not isinstance(shift, torch.Tensor) or tuple(shift.shape[-2:]) != tuple(rgb.shape[-2:]):
+            raise ValueError("Vulkan stereo shift and RGB dimensions must match")
 
         height, width = (int(rgb.shape[-2]), int(rgb.shape[-1]))
         self._ensure_layered_shape(height, width)
@@ -571,8 +593,10 @@ class VulkanStereoComputeBackend:
         upload_start = time.perf_counter()
         rgb_bytes = self._planar_bytes(rgb, channels=3)
         depth_bytes = self._planar_bytes(depth, channels=1)
+        shift_bytes = self._planar_bytes(shift, channels=1)
         self._layered_buffers[0].write_bytes(rgb_bytes)
         self._layered_buffers[1].write_bytes(depth_bytes)
+        self._layered_buffers[2].write_bytes(shift_bytes)
         upload_ms = (time.perf_counter() - upload_start) * 1000.0
         timeline = self._layered_pass.submit(
             *self._layered_buffers,
@@ -586,9 +610,9 @@ class VulkanStereoComputeBackend:
         submit_wait_ms = (time.perf_counter() - wait_start) * 1000.0
         readback_start = time.perf_counter()
         pixel_count = width * height
-        left = self._read_float_buffer(self._layered_buffers[2], 3 * pixel_count).reshape(1, 3, height, width)
-        right = self._read_float_buffer(self._layered_buffers[3], 3 * pixel_count).reshape(1, 3, height, width)
-        mask = self._read_float_buffer(self._layered_buffers[4], pixel_count).reshape(1, 1, height, width)
+        left = self._read_float_buffer(self._layered_buffers[3], 3 * pixel_count).reshape(1, 3, height, width)
+        right = self._read_float_buffer(self._layered_buffers[4], 3 * pixel_count).reshape(1, 3, height, width)
+        mask = self._read_float_buffer(self._layered_buffers[5], pixel_count).reshape(1, 1, height, width)
         left = left.to(device=rgb.device)
         right = right.to(device=rgb.device)
         mask = mask.to(device=rgb.device)

@@ -614,18 +614,9 @@ def test_fast_plus_fused_uses_resolved_parallax_budget_contract():
     fused_source = (APP_ROOT / "stereo_runtime" / "fast_plus_fused_triton.py").read_text(encoding="utf-8")
     runtime_source = (APP_ROOT / "stereo_runtime" / "runtime.py").read_text(encoding="utf-8")
 
-    assert "max_disparity_px: tl.constexpr" in fused_source
-    assert "max_disparity_px: float" in fused_source
-    assert "depth_strength: tl.constexpr" in fused_source
-    assert "depth_strength: float" in fused_source
-    assert "max_disparity_px * depth_strength * 0.5" in fused_source
-    assert "effective_ipd_m" not in fused_source
-    assert "max_shift_ratio" not in fused_source
-    assert "width *" not in fused_source
-    assert "_fast_plus_hole_ratio_probe_kernel" in fused_source
-    assert "_fast_plus_active_mask_kernel" in fused_source
-    assert "_fast_plus_sparse_fill_kernel" in fused_source
-    assert "D2S_TRITON_SPARSE_HOLE_THRESHOLD" in fused_source
+    assert "protected core" in fused_source
+    assert "_shift_from_depth" not in fused_source
+    assert "max_disparity_px * depth_strength" not in fused_source
     assert "max_disparity_px=float(budget.max_disparity_px)" in runtime_source
     assert 'depth_strength=max(0.0, float(getattr(stereo_config, "depth_strength", 1.0)))' in runtime_source
 
@@ -642,7 +633,7 @@ def test_fast_plus_fused_runtime_is_bypassed_when_hole_fill_is_disabled(monkeypa
     )
 
     assert result is None
-    assert reason == "hole_fill_disabled"
+    assert reason == "protected_core_shift_buffer_required"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_plus_fused Triton")

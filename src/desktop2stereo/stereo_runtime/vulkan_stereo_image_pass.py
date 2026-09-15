@@ -18,7 +18,7 @@ class VulkanStereoImagePass:
 
     WORKGROUP_SIZE = 16
     PUSH_CONSTANTS_SIZE = 80
-    BUFFER_COUNT = 4
+    BUFFER_COUNT = 5
 
     def __init__(
         self,
@@ -49,8 +49,9 @@ class VulkanStereoImagePass:
                 descriptor_bindings=[
                     DescriptorBinding(binding=0, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
                     DescriptorBinding(binding=1, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
-                    DescriptorBinding(binding=2, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                    DescriptorBinding(binding=2, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
                     DescriptorBinding(binding=3, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+                    DescriptorBinding(binding=4, descriptor_type=vk.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
                 ],
                 push_constants_size=self.PUSH_CONSTANTS_SIZE,
             )
@@ -59,7 +60,7 @@ class VulkanStereoImagePass:
                 context,
                 DescriptorBudget(
                     max_sets=frame_count,
-                    storage_buffers_per_set=2,
+                    storage_buffers_per_set=3,
                     storage_images_per_set=2,
                 ),
             )
@@ -82,7 +83,7 @@ class VulkanStereoImagePass:
     @property
     def input_buffer_sizes(self) -> dict[str, int]:
         pixels = self.width * self.height
-        return {"rgb": pixels * 3 * 4, "depth": pixels * 4}
+        return {"rgb": pixels * 3 * 4, "depth": pixels * 4, "shift": pixels * 4}
 
     def _record_active(self, command_buffer: Any) -> None:
         if self.pipeline is None or self._active_descriptor_set is None:
@@ -100,6 +101,7 @@ class VulkanStereoImagePass:
         self,
         rgb: Any,
         depth: Any,
+        shift: Any,
         left_eye: Any,
         right_eye: Any,
         *,
@@ -112,10 +114,10 @@ class VulkanStereoImagePass:
     ) -> int:
         if self.pipeline is None or self.descriptor_arena is None:
             raise RuntimeError("Vulkan stereo image pass is closed")
-        buffers = (rgb, depth)
+        buffers = (rgb, depth, shift)
         images = (left_eye, right_eye)
         expected = self.input_buffer_sizes
-        for name, buffer in zip(("rgb", "depth"), buffers):
+        for name, buffer in zip(("rgb", "depth", "shift"), buffers):
             if getattr(buffer, "context", None) is not self.context:
                 raise ValueError(f"{name} buffer belongs to a different Vulkan context")
             if int(getattr(buffer, "size", 0)) < expected[name]:
@@ -134,8 +136,9 @@ class VulkanStereoImagePass:
         self._descriptor_index = (self._descriptor_index + 1) % len(self.descriptor_sets)
         self.descriptor_arena.update_storage_buffer(descriptor_set, 0, buffers[0])
         self.descriptor_arena.update_storage_buffer(descriptor_set, 1, buffers[1])
-        self.descriptor_arena.update_storage_image(descriptor_set, 2, images[0])
-        self.descriptor_arena.update_storage_image(descriptor_set, 3, images[1])
+        self.descriptor_arena.update_storage_buffer(descriptor_set, 2, buffers[2])
+        self.descriptor_arena.update_storage_image(descriptor_set, 3, images[0])
+        self.descriptor_arena.update_storage_image(descriptor_set, 4, images[1])
         self._active_descriptor_set = descriptor_set
         self._active_push_constants = params.pack_image(
             self.width,
