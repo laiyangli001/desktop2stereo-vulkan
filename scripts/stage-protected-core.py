@@ -21,7 +21,8 @@ def stage(source_root: Path, target_root: Path) -> Path:
         raise ValueError("private core resource hash does not match its manifest")
     target = target_root / "protected" / source.name
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target)
+    if source.resolve() != target.resolve():
+        shutil.copyfile(source, target)
     return target
 
 
@@ -32,7 +33,8 @@ def stage_native(source: Path, target_root: Path, platform_name: str) -> Path:
         raise ValueError("native platform must be windows, linux, or macos")
     target = target_root / "protected" / "native" / platform_name / source.name
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target)
+    if source.resolve() != target.resolve():
+        shutil.copyfile(source, target)
     return target
 
 
