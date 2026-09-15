@@ -61,6 +61,50 @@ def test_auth_client_login_maps_success_response(monkeypatch):
     assert session.licenses[0]["license_code"] == "D2S-1"
 
 
+def test_auth_client_requests_protected_core_grant(monkeypatch):
+    calls = []
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs["json"], kwargs["headers"]))
+        return httpx.Response(
+            200,
+            json=_d2s({"grant": "header.payload.signature", "claims": {"core_id": "parallax-core"}}),
+        )
+
+    monkeypatch.setattr("desktop2stereo.auth.client.httpx.post", fake_post)
+    result = AuthClient("https://example.test/api/v1").core_grant(
+        "access", "license-1", "a" * 64
+    )
+
+    assert result["grant"] == "header.payload.signature"
+    assert calls == [
+        (
+            "https://example.test/api/v1/license/core/grant",
+            {
+                "license_id": "license-1",
+                "device_hash": "a" * 64,
+                "core_id": "parallax-core",
+                "core_version": 1,
+                "device_public_key": calls[0][1]["device_public_key"],
+            },
+            {"Authorization": "Bearer access"},
+        )
+    ]
+
+
+def test_auth_client_rejects_malformed_protected_core_grant(monkeypatch):
+    monkeypatch.setattr(
+        "desktop2stereo.auth.client.httpx.post",
+        lambda *args, **kwargs: httpx.Response(200, json=_d2s({"grant": "not-a-jws", "claims": {}})),
+    )
+
+    with pytest.raises(AuthError) as raised:
+        AuthClient("https://example.test/api/v1").core_grant(
+            "access", "license-1", "a" * 64
+        )
+    assert raised.value.code == "invalid_response"
+
+
 def test_auth_client_bypasses_environment_proxy_for_loopback_only():
     assert AuthClient("http://127.0.0.1:3000/api/v1")._http_options() == {"trust_env": False}
     assert AuthClient("https://100393.com/api/v1")._http_options() == {}
@@ -1452,7 +1496,11 @@ def test_auth_client_exposes_renew_permanent_and_paid_revoke(monkeypatch):
     client.renew_offline("access", "license-1", "a" * 64, 14)
     client.confirm_permanent("access", "license-1", "a" * 64)
     client.revoke_paid("access", "license-1", "a" * 64, "paymentfm")
-    assert calls[0] == ("https://example.test/license/renew", {"license_id": "license-1", "device_hash": "a" * 64, "offline_period_days": 14})
+    assert calls[0][0] == "https://example.test/license/renew"
+    assert calls[0][1]["license_id"] == "license-1"
+    assert calls[0][1]["device_hash"] == "a" * 64
+    assert calls[0][1]["offline_period_days"] == 14
+    assert isinstance(calls[0][1]["device_public_key"], str)
     assert calls[1][0].endswith("/license/permanent/confirm")
     assert calls[1][1]["confirmation"] == "PERMANENT"
     assert calls[2][0].endswith("/license/revoke/paid")

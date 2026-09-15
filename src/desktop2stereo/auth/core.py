@@ -105,21 +105,24 @@ def verify_core_grant(jws: str, *, now: int, expected_device_hash: str | None = 
     _verify_signature(header_part, payload_part, signature, key_id)
     required = {
         "version", "key_id", "grant_id", "license_id", "product", "device_hash",
-        "core_id", "core_version", "resource_sha256", "core_key", "issued_at",
+        "core_id", "core_version", "resource_sha256", "wrapped_core_key",
+        "key_wrap_ephemeral_public_key", "key_wrap_nonce", "issued_at",
         "not_before", "expires_at",
     }
     if "grant_id" not in claims and "entitlement_id" in claims:
         claims["grant_id"] = claims["entitlement_id"]
     if not required.issubset(claims) or claims.get("version") != 1 or claims.get("key_id") != key_id:
         raise ProtectedCoreError("protected core authorization fields are invalid")
-    string_fields = ("key_id", "grant_id", "license_id", "product", "device_hash", "core_id", "resource_sha256", "core_key")
+    string_fields = (
+        "key_id", "grant_id", "license_id", "product", "device_hash", "core_id", "resource_sha256",
+        "wrapped_core_key", "key_wrap_ephemeral_public_key", "key_wrap_nonce",
+    )
     if any(not isinstance(claims.get(field), str) or not claims[field].strip() for field in string_fields):
         raise ProtectedCoreError("protected core authorization fields are invalid")
     if claims["product"] != "desktop2stereo" or claims["core_id"] != CORE_ID or claims["core_version"] != CORE_VERSION:
         raise ProtectedCoreError("protected core version is unsupported")
     device_hash = claims["device_hash"]
     resource_hash = claims["resource_sha256"]
-    core_key_hex = claims["core_key"]
     if len(device_hash) != 64 or any(character not in "0123456789abcdef" for character in device_hash):
         raise ProtectedCoreError("protected core device binding is invalid")
     if expected_device_hash is not None and device_hash != expected_device_hash:
@@ -127,11 +130,11 @@ def verify_core_grant(jws: str, *, now: int, expected_device_hash: str | None = 
     if len(resource_hash) != 64 or any(character not in "0123456789abcdef" for character in resource_hash):
         raise ProtectedCoreError("protected core resource hash is invalid")
     try:
-        core_key = bytes.fromhex(core_key_hex)
-    except ValueError as exc:
+        from .core_device import unwrap_core_key
+
+        core_key = unwrap_core_key(claims)
+    except Exception as exc:
         raise ProtectedCoreError("protected core key is invalid") from exc
-    if len(core_key) != 32:
-        raise ProtectedCoreError("protected core key is invalid")
     times = (claims["issued_at"], claims["not_before"], claims["expires_at"])
     if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in times):
         raise ProtectedCoreError("protected core authorization time is invalid")

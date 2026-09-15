@@ -423,10 +423,16 @@ class AuthClient:
         if not self._is_offline_period(offline_period_days):
             raise AuthError("离线授权时长必须为 7、14 或 30 天", "invalid_input")
         try:
+            from .core_device import get_core_device_key
+
+            device_public_key = get_core_device_key().public_key_b64
+        except Exception as exc:
+            raise AuthError("设备核心密钥不可用", "secure_storage_unavailable") from exc
+        try:
             response = httpx.post(
                 f"{self.base_url}/license/renew",
                 headers={"Authorization": f"Bearer {access_token}"},
-                json={"license_id": license_id, "device_hash": device_hash, "offline_period_days": offline_period_days},
+                json={"license_id": license_id, "device_hash": device_hash, "device_public_key": device_public_key, "offline_period_days": offline_period_days},
                 timeout=self.timeout,
                 **self._http_options(),
             )
@@ -518,6 +524,12 @@ class AuthClient:
         if isinstance(core_version, bool) or not isinstance(core_version, int) or core_version <= 0:
             raise AuthError("受保护核心版本无效", "invalid_input")
         try:
+            from .core_device import get_core_device_key
+
+            device_public_key = get_core_device_key().public_key_b64
+        except Exception as exc:
+            raise AuthError("设备核心密钥不可用", "secure_storage_unavailable") from exc
+        try:
             response = httpx.post(
                 f"{self.base_url}/license/core/grant",
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -526,6 +538,7 @@ class AuthClient:
                     "device_hash": device_hash,
                     "core_id": core_id.strip(),
                     "core_version": core_version,
+                    "device_public_key": device_public_key,
                 },
                 timeout=self.timeout,
                 **self._http_options(),
@@ -563,7 +576,13 @@ class AuthClient:
         if not isinstance(offline_period_days, int) or isinstance(offline_period_days, bool) or offline_period_days not in {0, 7, 14, 30}:
             raise AuthError("离线授权时长无效", "invalid_input")
         try:
-            response = httpx.post(f"{self.base_url}/license/offline/issue", headers={"Authorization": f"Bearer {access_token}"}, json={"license_id": license_id, "device_hash": device_hash, "offline_period_days": offline_period_days}, timeout=self.timeout, **self._http_options())
+            from .core_device import get_core_device_key
+
+            device_public_key = get_core_device_key().public_key_b64
+        except Exception as exc:
+            raise AuthError("设备核心密钥不可用", "secure_storage_unavailable") from exc
+        try:
+            response = httpx.post(f"{self.base_url}/license/offline/issue", headers={"Authorization": f"Bearer {access_token}"}, json={"license_id": license_id, "device_hash": device_hash, "device_public_key": device_public_key, "offline_period_days": offline_period_days}, timeout=self.timeout, **self._http_options())
         except httpx.HTTPError as exc:
             raise AuthError(f"无法连接授权服务器：{exc}", "network_error") from exc
         try:
