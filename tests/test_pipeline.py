@@ -78,6 +78,20 @@ def test_native_coreml_capture_is_disabled_until_protected_shift_handoff(monkeyp
     assert not _native_coreml_capture_enabled(
         SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="network_stream")
     )
+
+
+def test_legacy_metal_bridge_contains_no_public_shift_formula():
+    source = (
+        APP_ROOT
+        / "stereo_runtime"
+        / "providers"
+        / "apple"
+        / "native"
+        / "macos_coreml_io.mm"
+    ).read_text(encoding="utf-8")
+
+    assert "shift_from_depth" not in source
+    assert "Protected per-pixel shifts are unavailable" in source
     assert not _native_coreml_capture_enabled(
         SimpleNamespace(run_mode="RTMP Streamer", application_runtime_target="local_viewer")
     )

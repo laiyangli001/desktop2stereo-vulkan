@@ -54,17 +54,7 @@ def compute_shift_px(depth: torch.Tensor, width: int, params: ShiftParams) -> to
     protected_shift = compute_protected_shift(depth, width, params)
     if protected_shift is not None:
         return protected_shift
-    height = int(depth.shape[-2]) if getattr(depth, "ndim", 0) >= 2 else 1
-    budget = resolve_parallax_budget(
-        render_width=width,
-        render_height=height,
-        preset=params.parallax_preset,
-        convergence=params.convergence,
-        max_disparity_px=params.max_disparity_px,
-    )
-    depth_strength = max(0.0, float(params.depth_strength))
-    output_scale = -depth_strength * budget.max_disparity_px * 0.5
-    return budget.depth_response(depth) * output_scale
+    raise RuntimeError("protected parallax core did not return a shift map")
 
 
 def shift_debug_info(depth: torch.Tensor, width: int, params: ShiftParams) -> dict[str, float | int | str]:

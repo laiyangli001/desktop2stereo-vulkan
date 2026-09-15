@@ -30,20 +30,8 @@ def resolve_parallax_budget(
     *,
     max_disparity_px: float | None = None,
 ) -> ParallaxBudget:
-    if _PROTECTED_PARALLAX_CORE is None and (_PROTECTED_CORE_REQUIRED or max_disparity_px is None):
-        raise RuntimeError("protected parallax core is required before runtime use")
     if _PROTECTED_PARALLAX_CORE is None:
-        def depth_response(depth):
-            conv = convergence
-            if hasattr(conv, "to") and hasattr(depth, "device"):
-                conv = conv.to(device=depth.device, dtype=depth.dtype)
-            return depth.clamp(0, 1) - conv
-
-        return ParallaxBudget(
-            max_disparity_px=max(0.0, float(max_disparity_px)),
-            depth_response=depth_response,
-            preset=str(preset or "standard"),
-        )
+        raise RuntimeError("protected parallax core is required before runtime use")
     return _PROTECTED_PARALLAX_CORE.resolve_parallax_budget(
         render_width,
         render_height,

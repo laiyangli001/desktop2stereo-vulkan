@@ -28,6 +28,36 @@ from stereo_runtime.synthesis import StereoConfig, _try_fused_warp_composite2, s
 from stereo_runtime.temporal import TemporalState, _scene_sample
 
 
+@pytest.fixture(autouse=True)
+def protected_core_test_double(monkeypatch):
+    from stereo_runtime.parallax import ParallaxBudget
+
+    def resolve(_width, _height, preset, convergence=0.0, *, max_disparity_px=None):
+        def depth_response(depth):
+            return depth.clamp(0, 1) - convergence
+
+        return ParallaxBudget(
+            max_disparity_px=float(max_disparity_px if max_disparity_px is not None else 40.0),
+            depth_response=depth_response,
+            preset=str(preset or "standard"),
+        )
+
+    def compute(depth, _width, params):
+        budget = resolve(
+            depth.shape[-1], depth.shape[-2], params.parallax_preset,
+            params.convergence, max_disparity_px=params.max_disparity_px,
+        )
+        return budget.depth_response(depth) * budget.max_disparity_px * max(params.depth_strength, 0.0) * -0.5
+
+    core = type("ProtectedCoreTestDouble", (), {
+        "resolve_parallax_budget": staticmethod(resolve),
+        "compute_shift_px": staticmethod(compute),
+        "parallax_debug_info": staticmethod(lambda budget: {}),
+    })()
+    monkeypatch.setattr("stereo_runtime.parallax._PROTECTED_PARALLAX_CORE", core)
+    monkeypatch.setattr("stereo_runtime.parallax._PROTECTED_CORE_REQUIRED", True)
+
+
 def test_triton_occlusion_hot_path_has_no_cpu_scalar_sync():
     source = (APP_ROOT / "stereo_runtime" / "occlusion_triton.py").read_text(encoding="utf-8")
     assert ".item()" not in source

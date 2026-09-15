@@ -7,8 +7,48 @@ from stereo_runtime.baseline_shift import ShiftParams, compute_shift_px
 from stereo_runtime.parallax import parallax_debug_info, resolve_parallax_budget
 
 
+@pytest.fixture(autouse=True)
+def protected_core_test_double(monkeypatch):
+    from stereo_runtime.parallax import ParallaxBudget
+
+    def resolve(_width, _height, preset, convergence=0.0, *, max_disparity_px=None):
+        def depth_response(depth):
+            return depth.clamp(0, 1) - convergence
+
+        return ParallaxBudget(
+            max_disparity_px=float(max_disparity_px if max_disparity_px is not None else 40.0),
+            depth_response=depth_response,
+            preset=str(preset or "standard"),
+        )
+
+    def compute(depth, _width, params):
+        budget = resolve(
+            depth.shape[-1], depth.shape[-2], params.parallax_preset,
+            params.convergence, max_disparity_px=params.max_disparity_px,
+        )
+        value = depth.clamp(0, 1)
+        background = ((0.5 - value) * 2.0).clamp(0, 1)
+        foreground = ((value - 0.5) * 2.0).clamp(0, 1)
+        midground = (1.0 - background - foreground).clamp(0, 1)
+        scale = (
+            background * params.background_shift_scale
+            + midground * params.midground_shift_scale
+            + foreground * params.foreground_shift_scale
+        )
+        return budget.depth_response(depth) * scale * budget.max_disparity_px * max(params.depth_strength, 0.0) * -0.5
+
+    core = type("ProtectedCoreTestDouble", (), {
+        "resolve_parallax_budget": staticmethod(resolve),
+        "compute_shift_px": staticmethod(compute),
+        "parallax_debug_info": staticmethod(lambda budget: {}),
+    })()
+    monkeypatch.setattr("stereo_runtime.parallax._PROTECTED_PARALLAX_CORE", core)
+    monkeypatch.setattr("stereo_runtime.parallax._PROTECTED_CORE_REQUIRED", True)
+
+
 @pytest.mark.parametrize("preset", ["standard", None])
-def test_budget_table_is_not_available_without_protected_core(preset):
+def test_budget_table_is_not_available_without_protected_core(preset, monkeypatch):
+    monkeypatch.setattr("stereo_runtime.parallax._PROTECTED_PARALLAX_CORE", None)
     with pytest.raises(RuntimeError, match="protected parallax core is required"):
         resolve_parallax_budget(1920, 1080, preset, convergence=0.0)
 

@@ -226,22 +226,6 @@ static inline float processed_depth_at(device float *depth, float x, float y,
     return clamp(total / max(weight_total, 1.0e-6f), 0.0f, 1.0f);
 }
 
-static inline float layered_depth_scale(float value, constant WarpParams& p) {
-    float normalized = clamp(value, 0.0f, 1.0f);
-    float background_weight = clamp((0.5f - normalized) * 2.0f, 0.0f, 1.0f);
-    float foreground_weight = clamp((normalized - 0.5f) * 2.0f, 0.0f, 1.0f);
-    float midground_weight = clamp(1.0f - background_weight - foreground_weight,
-                                   0.0f, 1.0f);
-    return background_weight * max(p.background_scale, 0.0f) +
-           midground_weight * max(p.midground_scale, 0.0f) +
-           foreground_weight * max(p.foreground_scale, 0.0f);
-}
-
-static inline float shift_from_depth(float value, constant WarpParams& p) {
-    return -(value - p.convergence) * layered_depth_scale(value, p) *
-           max(p.depth_strength, 0.0f) * p.max_disparity_px * 0.5f;
-}
-
 static inline float layer_weight(float value, int layer_index,
                                  constant WarpParams& p) {
     int count = clamp(p.layers, 1, 4);
@@ -275,7 +259,8 @@ static inline float3 layered_warp_at(
     texture2d<float, access::sample> color, device float *depth,
     float x, float y, float eye_sign, constant WarpParams& p) {
     float value = processed_depth_at(depth, x, y, p);
-    float shift = shift_from_depth(value, p);
+    // Protected per-pixel shifts are unavailable in this legacy bridge.
+    float shift = 0.0f;
     int count = clamp(p.layers, 1, 4);
     float3 total = float3(0.0f);
     float total_weight = 0.0f;
@@ -291,9 +276,8 @@ static inline float3 layered_warp_at(
 }
 
 static inline float max_shift_magnitude(constant WarpParams& p) {
-    float scale = max(p.depth_strength, 0.0f) * p.max_disparity_px * 0.5f;
-    return max(max(abs(p.convergence * scale),
-                   abs((1.0f - p.convergence) * scale)), 1.0e-6f);
+    (void)p;
+    return 1.0e-6f;
 }
 
 static inline float edge_at(device float *depth, float x, float y,
@@ -301,9 +285,8 @@ static inline float edge_at(device float *depth, float x, float y,
     float center_depth = processed_depth_at(depth, x, y, p);
     float depth_edge = abs(processed_depth_at(depth, x + 1.0f, y, p) - center_depth) +
                        abs(processed_depth_at(depth, x, y + 1.0f, p) - center_depth);
-    float center_shift = abs(shift_from_depth(center_depth, p));
-    float shift_edge = abs(abs(shift_from_depth(processed_depth_at(depth, x + 1.0f, y, p), p)) - center_shift) +
-                       abs(abs(shift_from_depth(processed_depth_at(depth, x, y + 1.0f, p), p)) - center_shift);
+    float center_shift = 0.0f;
+    float shift_edge = 0.0f;
     return (depth_edge > p.edge_threshold ||
             shift_edge / max_shift_magnitude(p) > 0.05f) ? 1.0f : 0.0f;
 }
@@ -371,8 +354,8 @@ static inline float3 fill_eye(texture2d<float, access::sample> color,
     }
     float left_depth = processed_depth_at(depth, x - 1.0f, y, p);
     float right_depth = processed_depth_at(depth, x + 1.0f, y, p);
-    float left_shift = shift_from_depth(left_depth, p);
-    float right_shift = shift_from_depth(right_depth, p);
+    float left_shift = 0.0f;
+    float right_shift = 0.0f;
     bool reliable = abs(right_depth - left_depth) > p.edge_threshold ||
                     abs(right_shift - left_shift) > 0.05f;
     int direction = right_depth < left_depth ? 1 : -1;
