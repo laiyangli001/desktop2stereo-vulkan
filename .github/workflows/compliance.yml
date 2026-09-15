@@ -86,5 +86,9 @@ jobs:
           tests/test_vulkan_resources.py
           tests/test_output_contract.py
           tests/test_runtime_output.py
+          tests/test_runtime.py
           tests/test_pipeline.py
+          tests/test_vulkan_stereo_pass.py
+          tests/test_vulkan_backend_ring.py
+          tests/test_vulkan_runtime_integration.py
           tests/test_openxr_vulkan.py
