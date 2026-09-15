@@ -280,3 +280,16 @@ CORE_NATIVE_MODULE_MISSING
 在 GitHub Actions 手动运行 `Verify protected core integration` 时，保持 `require_private_core=true`。
 该模式会下载私有仓库、编译当前平台原生模块、暂存加密资源并执行真实原生 ABI 解密测试；令牌缺失时必须失败。
 公开推送触发的默认检查可以在令牌缺失时跳过私有资产步骤，但工作流会明确报告跳过原因。
+
+对于已有完整平台安装包的正式发布作业，使用统一组装入口：
+
+```text
+python scripts/assemble-protected-release.py \
+  --package-root <package-root> \
+  --private-core <private-core-checkout> \
+  --native-core <platform-native-module> \
+  --platform windows|linux|macos
+```
+
+该入口会暂存加密资源和平台 DLL/SO/DYLIB，生成构建信息与 release manifest，并强制执行
+`verify-release-package.mjs --require-protected-core`。组装失败不得上传或发布安装包。
