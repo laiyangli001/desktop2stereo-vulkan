@@ -282,10 +282,14 @@ class LoginLauncher:
                 ft.Row([ft.Text(self._t("captcha_target")), captcha_thumb, captcha_progress], alignment=ft.MainAxisAlignment.CENTER),
                 captcha_image_detector,
         ], tight=True)
+
+        async def handle_captcha_click(event):
+            await self._open_captcha(status, captcha_button, captcha_state, captcha_image, captcha_progress, captcha_dialog)
+
         captcha_button = ft.OutlinedButton(
             content=self._t("captcha_button"),
-            on_click=lambda e: self._open_captcha(status, captcha_button, captcha_state, captcha_image, captcha_progress, captcha_dialog),
         )
+        captcha_button.on_click = handle_captcha_click
         license_picker = ft.Dropdown(label=self._t("license"), visible=False, options=[])
         mode_picker = ft.Dropdown(
             label=self._t("mode"),
@@ -312,24 +316,30 @@ class LoginLauncher:
         confirm = ft.Button(
             content=self._t("confirm_license"),
             visible=False,
-            on_click=lambda e: self._confirm_selection(
-                status, license_picker, confirm, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
-            ),
         )
         apply_mode = ft.Button(
             content=self._t("apply_mode"),
             visible=False,
-            on_click=lambda e: self._apply_license_mode(
-                status, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
-            ),
         )
+        async def handle_confirm(event):
+            await self._confirm_selection(
+                status, license_picker, confirm, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
+            )
+
+        async def handle_apply_mode(event):
+            await self._apply_license_mode(
+                status, mode_picker, offline_period_picker, permanent_confirmation, apply_mode
+            )
+
+        confirm.on_click = handle_confirm
+        apply_mode.on_click = handle_apply_mode
         self._mode_controls = (mode_picker, offline_period_picker, permanent_confirmation, apply_mode)
         retry_action = ft.TextButton(content=self._t("retry"), visible=False)
         relogin_action = ft.TextButton(content=self._t("relogin"), visible=False)
         website_action = ft.TextButton(content=self._t("open_website", host=_configured_website_label()), visible=False)
         copy_request_action = ft.TextButton(content=self._t("copy_request"), visible=False)
         diagnostic_action = ft.TextButton(content=self._t("copy_diagnostics"), visible=False)
-        exit_action = ft.TextButton(content=self._t("exit"), on_click=lambda e: self._exit_launcher())
+        exit_action = ft.TextButton(content=self._t("exit"))
         self._error_controls = (
             retry_action,
             relogin_action,
@@ -339,34 +349,51 @@ class LoginLauncher:
             exit_action,
         )
         self._selection_controls = (license_picker, confirm)
-        login = ft.Button(content=self._t("sign_in"), on_click=lambda e: self._login(
-            e,
-            email,
-            password,
-            status,
-            license_picker,
-            confirm,
-            captcha_state,
-            captcha_button,
-            mode_picker,
-            offline_period_picker,
-            permanent_confirmation,
-            apply_mode,
-        ))
-        device_login = ft.OutlinedButton(content=self._t("browser_sign_in"), on_click=lambda e: self._device_login(
-            status,
-            license_picker,
-            confirm,
-            mode_picker,
-            offline_period_picker,
-            permanent_confirmation,
-            apply_mode,
-            device_qr,
-            device_code_label,
-            device_uri_label,
-            device_login_info,
-        ))
-        logout = ft.TextButton(content=self._t("clear_login"), on_click=lambda e: self._logout_saved(status))
+        login = ft.Button(content=self._t("sign_in"))
+        device_login = ft.OutlinedButton(content=self._t("browser_sign_in"))
+        logout = ft.TextButton(content=self._t("clear_login"))
+
+        async def handle_login(event):
+            await self._login(
+                event,
+                email,
+                password,
+                status,
+                license_picker,
+                confirm,
+                captcha_state,
+                captcha_button,
+                mode_picker,
+                offline_period_picker,
+                permanent_confirmation,
+                apply_mode,
+            )
+
+        async def handle_device_login(event):
+            await self._device_login(
+                status,
+                license_picker,
+                confirm,
+                mode_picker,
+                offline_period_picker,
+                permanent_confirmation,
+                apply_mode,
+                device_qr,
+                device_code_label,
+                device_uri_label,
+                device_login_info,
+            )
+
+        async def handle_logout(event):
+            await self._logout_saved(status)
+
+        async def handle_exit(event):
+            await self._exit_launcher()
+
+        login.on_click = handle_login
+        device_login.on_click = handle_device_login
+        logout.on_click = handle_logout
+        exit_action.on_click = handle_exit
 
         diagnostic = authorization_diagnostics()
         version = ft.Text(
@@ -490,12 +517,19 @@ class LoginLauncher:
     async def _open_captcha(self, status: ft.Text, button: ft.Control, state: dict, image: ft.Image, progress: ft.Text, dialog: ft.AlertDialog):
         if self._busy:
             return
+        self._busy = True
+        button.disabled = True
+        status.value = self._t("loading_captcha")
+        status.color = ft.Colors.BLUE
+        self._page.update()
         try:
             challenge = await asyncio.to_thread(self.client.get_captcha)
         except AuthError as exc:
             self._show_error(status, exc, retry=lambda event: self._open_captcha(
                 status, button, state, image, progress, dialog
             ))
+            self._busy = False
+            button.disabled = False
             self._page.update()
             return
         state["challenge"] = challenge
@@ -510,6 +544,9 @@ class LoginLauncher:
         button.content = f"{self._t('captcha_button')} (0/{challenge.required_clicks})"
         dialog.open = True
         self._page.show_dialog(dialog)
+        self._page.update()
+        self._busy = False
+        button.disabled = False
 
     def _captcha_click(self, event, state: dict, progress: ft.Text, dialog: ft.AlertDialog, button: ft.Control):
         challenge = state.get("challenge")
@@ -897,9 +934,18 @@ class LoginLauncher:
         diagnostic_button = controls[4] if len(controls) > 5 else None
         _exit_button = controls[-1]
         retry_button.visible = retry is not None
-        retry_button.on_click = retry
+        if retry is not None:
+            async def handle_retry(event):
+                await retry(event)
+
+            retry_button.on_click = handle_retry
+        else:
+            retry_button.on_click = None
         relogin_button.visible = True
-        relogin_button.on_click = lambda event: self._relogin_from_error(event, status)
+        async def handle_relogin(event):
+            await self._relogin_from_error(event, status)
+
+        relogin_button.on_click = handle_relogin
         website_button.visible = error.code not in {
             "invalid_input",
             "license_selection_required",
@@ -908,14 +954,19 @@ class LoginLauncher:
         }
         website_button.on_click = lambda _event: self._open_website()
         copy_button.visible = bool(error.request_id)
-        copy_button.on_click = (
-            lambda _event: self._copy_request_id(status, error.request_id)
-            if error.request_id
-            else None
-        )
+        if error.request_id:
+            async def handle_copy_request(event):
+                await self._copy_request_id(status, error.request_id)
+
+            copy_button.on_click = handle_copy_request
+        else:
+            copy_button.on_click = None
         if diagnostic_button is not None:
             diagnostic_button.visible = True
-            diagnostic_button.on_click = lambda _event: self._copy_diagnostics(status, error)
+            async def handle_copy_diagnostics(event):
+                await self._copy_diagnostics(status, error)
+
+            diagnostic_button.on_click = handle_copy_diagnostics
 
     def _clear_error_actions(self) -> None:
         controls = getattr(self, "_error_controls", None)

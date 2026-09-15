@@ -331,17 +331,20 @@ def test_login_launcher_formats_request_id_for_user_support():
 
 def test_login_launcher_error_actions_expose_retry_support_and_exit():
     from desktop2stereo.auth.gui import LoginLauncher
+    import inspect
 
     launcher = LoginLauncher()
     controls = tuple(types.SimpleNamespace(visible=False, on_click=None) for _ in range(5))
     launcher._error_controls = controls
     status = types.SimpleNamespace(value=None, color=None)
-    retry = lambda _event: None
+    async def retry(_event):
+        return None
 
     launcher._show_error(status, AuthError("服务不可用", "server_unavailable", "req-3"), retry=retry)
 
     assert controls[0].visible is True
-    assert controls[0].on_click is retry
+    assert controls[0].on_click is not retry
+    assert inspect.iscoroutinefunction(controls[0].on_click)
     assert controls[1].visible is True
     assert controls[2].visible is True
     assert controls[3].visible is True
@@ -1590,7 +1593,8 @@ def test_auth_client_rejects_malformed_license_status(licenses):
 
 def test_login_gui_passes_captcha_button_to_login_error_handler():
     source = (Path(__file__).resolve().parents[1] / "src/desktop2stereo/auth/gui.py").read_text(encoding="utf-8")
-    assert "captcha_state,\n            captcha_button,\n            mode_picker," in source
+    assert "async def handle_captcha_click" in source
+    assert "captcha_button.on_click = handle_captcha_click" in source
     assert "captcha_button: ft.Control" in source
     assert "self._reset_captcha(captcha_state, captcha_button)" in source
 
@@ -1759,6 +1763,9 @@ def test_runtime_lease_retries_transient_heartbeat_before_expiry(monkeypatch):
             if self.calls == 1:
                 raise AuthError("temporary outage", "network_error")
             return {"lease_token": "renewed-token", "expires_at": int(time.time()) + 3600, "heartbeat_interval": 900}
+
+        def core_grant(self, *args):
+            return {"grant": "header.payload.signature", "claims": {}}
 
     monkeypatch.setattr(
         "desktop2stereo.auth.lease.device_identity",
