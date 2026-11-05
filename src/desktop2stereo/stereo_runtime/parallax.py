@@ -9,6 +9,7 @@ DepthResponseFn = Callable[[Any], Any]
 _PROTECTED_PARALLAX_CORE = None
 _PROTECTED_PARALLAX_GRANT = None
 _PROTECTED_CORE_REQUIRED = False
+_PROTECTED_RUNTIME_GUARD: Callable[[], bool] | None = None
 
 PARALLAX_RESOLVER_VERSION = 1
 DEPTH_RESPONSE_NAME = "linear_clamp_convergence_v1"
@@ -30,6 +31,7 @@ def resolve_parallax_budget(
     *,
     max_disparity_px: float | None = None,
 ) -> ParallaxBudget:
+    _assert_runtime_authorization()
     if _PROTECTED_PARALLAX_CORE is None:
         raise RuntimeError("protected parallax core is required before runtime use")
     return _PROTECTED_PARALLAX_CORE.resolve_parallax_budget(
@@ -42,6 +44,7 @@ def resolve_parallax_budget(
 
 
 def parallax_debug_info(budget: ParallaxBudget) -> dict[str, float | int | str]:
+    _assert_runtime_authorization()
     if _PROTECTED_PARALLAX_CORE is None and _PROTECTED_CORE_REQUIRED:
         raise RuntimeError("protected parallax core is required before runtime use")
     if _PROTECTED_PARALLAX_CORE is None:
@@ -54,6 +57,34 @@ def parallax_debug_info(budget: ParallaxBudget) -> dict[str, float | int | str]:
     return _PROTECTED_PARALLAX_CORE.parallax_debug_info(budget)
 
 
+def set_protected_runtime_guard(guard: Callable[[], bool] | None) -> None:
+    """Install the runtime authorization predicate without loading a GPU backend."""
+    global _PROTECTED_RUNTIME_GUARD
+    if guard is not None and not callable(guard):
+        raise TypeError("runtime guard must be callable")
+    _PROTECTED_RUNTIME_GUARD = guard
+
+
+def clear_protected_parallax_core() -> None:
+    """Drop delegated core references and retain the fail-closed requirement."""
+    global _PROTECTED_PARALLAX_CORE, _PROTECTED_PARALLAX_GRANT, _PROTECTED_CORE_REQUIRED
+    _PROTECTED_PARALLAX_CORE = None
+    _PROTECTED_PARALLAX_GRANT = None
+    _PROTECTED_CORE_REQUIRED = True
+
+
+def _assert_runtime_authorization() -> None:
+    guard = _PROTECTED_RUNTIME_GUARD
+    if guard is None:
+        return
+    try:
+        valid = guard() is True
+    except Exception:
+        valid = False
+    if not valid:
+        raise RuntimeError("runtime authorization unavailable")
+
+
 def require_protected_parallax_core() -> None:
     """Make runtime callers fail closed until the protected core is loaded."""
 
@@ -64,6 +95,7 @@ def require_protected_parallax_core() -> None:
 def compute_protected_shift(depth: Any, width: int, params: Any):
     """Delegate depth-to-disparity computation to the loaded protected core."""
 
+    _assert_runtime_authorization()
     if _PROTECTED_PARALLAX_CORE is not None:
         compute = getattr(_PROTECTED_PARALLAX_CORE, "compute_shift_px", None)
         if not callable(compute):
@@ -96,6 +128,7 @@ def configure_protected_parallax_core(
         native_path=native_path,
         require_native=require_native,
     )
+    _assert_runtime_authorization()
     _PROTECTED_PARALLAX_GRANT = grant
     _PROTECTED_PARALLAX_CORE = module
     return {
