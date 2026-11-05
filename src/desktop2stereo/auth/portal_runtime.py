@@ -3,10 +3,51 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import importlib
+import sys
 
 from .portal_access import PortalAccess
 from .portal_client import PortalError
 from .portal_lease import PortalLease
+
+
+class _GateGroup:
+    """Cover both supported import spellings when already loaded by legacy modules."""
+    def __init__(self, gates):
+        self.gates = gates
+
+    def require_protected_parallax_core(self):
+        for gate in self.gates:
+            gate.require_protected_parallax_core()
+
+    def set_protected_runtime_guard(self, guard):
+        for gate in self.gates:
+            gate.set_protected_runtime_guard(guard)
+
+    def clear_protected_parallax_core(self):
+        for gate in self.gates:
+            gate.clear_protected_parallax_core()
+
+    def configure_protected_parallax_core(self, *args, **kwargs):
+        result = None
+        for gate in self.gates:
+            result = gate.configure_protected_parallax_core(*args, **kwargs)
+        return result
+
+
+def _runtime_gate():
+    package = importlib.import_module("stereo_runtime")
+    gate = importlib.import_module("stereo_runtime.parallax")
+    canonical = "desktop2stereo.stereo_runtime"
+    parent = importlib.import_module("desktop2stereo")
+    other = sys.modules.get(canonical + ".parallax")
+    if other is None:
+        sys.modules[canonical + ".parallax"] = gate
+        sys.modules.setdefault(canonical, package)
+        setattr(sys.modules[canonical], "parallax", gate)
+        setattr(parent, "stereo_runtime", sys.modules[canonical])
+        return gate
+    return gate if other is gate else _GateGroup([gate, other])
 
 
 class PortalRuntime:
@@ -42,8 +83,7 @@ class PortalRuntime:
 
     def start(self) -> None:
         if self.gate is None:
-            from ..stereo_runtime import parallax
-            self.gate = parallax
+            self.gate = _runtime_gate()
         self.gate.require_protected_parallax_core()
         self.gate.set_protected_runtime_guard(self.lease.is_valid)
         try:
@@ -58,8 +98,7 @@ class PortalRuntime:
             self.start()
             runner = self.runner
             if runner is None:
-                from ..app_runtime.runtime_entry import run_processing_runtime
-                runner = run_processing_runtime
+                runner = importlib.import_module("app_runtime.runtime_entry").run_processing_runtime
             return runner(max_seconds=max_seconds, lease_lost=self.lease.lost, lease_recheck=self.lease.request_recheck)
         finally:
             self.close()

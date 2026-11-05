@@ -1443,6 +1443,14 @@ class GUIProcessMixin:
                 os.path.join(BASE_DIR, "main.py"),
                 "--runtime",
             ]
+            portal_frame = None
+            portal_io = {}
+            if os.environ.get("D2S_AUTH_PROTOCOL", "1") == "2":
+                from desktop2stereo.auth.portal_startup import prepare_runtime_handoff
+                from desktop2stereo.auth.portal_handoff import send_handoff
+
+                portal_frame = await prepare_runtime_handoff()
+                portal_io["stdin"] = asyncio.subprocess.PIPE
             child_env = os.environ.copy()
             child_env["DESKTOP2STEREO_LOCALE"] = self.locale
             child_env["PYTHONIOENCODING"] = "utf-8"
@@ -1466,6 +1474,7 @@ class GUIProcessMixin:
                     stderr=asyncio.subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                     env=child_env,
+                    **portal_io,
                 )
             else:
                 self.process = await asyncio.create_subprocess_exec(
@@ -1474,7 +1483,11 @@ class GUIProcessMixin:
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                     env=child_env,
+                    **portal_io,
                 )
+            if portal_frame is not None:
+                await send_handoff(self.process, portal_frame)
+                portal_frame = None
             self._diag(f"process started, pid={self.process.pid}, log={LOG_FILE}")
             asyncio.create_task(self._pump_child_output(self.process))
             self.set_status(UI_MESSAGES[self.locale]["Running"], key="Running")

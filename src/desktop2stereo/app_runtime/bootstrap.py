@@ -95,6 +95,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.probe:
         print(json.dumps(build_capability_report(), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
+    try:
+        try:
+            from desktop2stereo.auth.portal_startup import enabled as portal_enabled, run as run_portal
+            from desktop2stereo.auth.portal_client import PortalError
+        except ModuleNotFoundError:
+            from auth.portal_startup import enabled as portal_enabled, run as run_portal
+            from auth.portal_client import PortalError
+        if portal_enabled():
+            return run_portal(args)
+    except PortalError as error:
+        print(f"[AUTH] {error.code}", file=sys.stderr, flush=True)
+        return 1
     if args.runtime:
         try:
             from desktop2stereo.auth.gate import validate_saved_authentication
